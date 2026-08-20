@@ -409,6 +409,51 @@ int main()
         Check("P2WSH multisig rejects a bad signature", !okb);
     }
 
+    // (A2) Mixed-scheme 2-of-2: one ML-DSA key and one secp256k1 key in the same
+    // witnessScript. This is the capability that comes from tagging the SCHEME
+    // ON THE KEY rather than on the witness version: CHECKMULTISIG dispatches
+    // per pubkey from its leading byte, so one output can require a signature
+    // from a post-quantum key AND a legacy one. A design that picks the scheme
+    // from the witness version — Bitcoin's — cannot express this at all, since
+    // every key under one version shares one algorithm.
+    {
+        const CKey sk_secp = GenerateRandomKey(SigScheme::SECP256K1);
+        const CPubKey pub_secp = sk_secp.GetPubKey();
+        const valtype pubkey_secp(pub_secp.begin(), pub_secp.end());
+
+        CScript ws = CScript() << OP_2 << pubkey_stack << pubkey_secp << OP_2 << OP_CHECKMULTISIG;
+        CScript spk = p2wsh_spk(ws);
+        CMutableTransaction mtx = make_tx();
+        const uint256 sh = SignatureHash(ws, mtx, 0, SIGHASH_ALL, amt, SigVersion::WITNESS_V0);
+
+        valtype s_mldsa = sign_with(sk, sh, SIGHASH_ALL);
+        std::vector<unsigned char> s_secp;
+        sk_secp.Sign(sh, s_secp);
+        s_secp.push_back(SIGHASH_ALL);
+
+        CScriptWitness w;
+        w.stack.push_back(valtype());                       // NULLDUMMY
+        w.stack.push_back(s_mldsa);                         // must match key order
+        w.stack.push_back(valtype(s_secp.begin(), s_secp.end()));
+        w.stack.emplace_back(ws.begin(), ws.end());
+
+        MutableTransactionSignatureChecker checker(&mtx, 0, amt, MissingDataBehavior::ASSERT_FAIL);
+        ScriptError err = SCRIPT_ERR_OK;
+        const bool ok = VerifyScript(CScript(), spk, &w, wflags, checker, &err);
+        Check("P2WSH 2-of-2 mixing ML-DSA and secp256k1 verifies", ok);
+        if (!ok) std::printf("    mixed multisig error: %s\n", ScriptErrorString(err).c_str());
+
+        // Swapping the two signatures must fail: CHECKMULTISIG requires them in
+        // key order, and neither scheme verifies under the other's key.
+        {
+            CScriptWitness sw = w;
+            std::swap(sw.stack[1], sw.stack[2]);
+            ScriptError e = SCRIPT_ERR_OK;
+            Check("P2WSH mixed multisig rejects swapped signatures",
+                  !VerifyScript(CScript(), spk, &sw, wflags, checker, &e));
+        }
+    }
+
     // (B) HTLC clause: SHA3 hashlock branch + CLTV refund branch, each guarded by
     //     an in-script ML-DSA pubkey. Spend the redeem (preimage) path.
     {
