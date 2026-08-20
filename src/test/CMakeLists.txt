@@ -21,7 +21,3 @@ foreach(t IN LISTS LATTICA_TESTS)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
-# test_falcon512 exercises the vendored library directly, before anything in the
-# node links it. Drop this line once CKey carries the scheme and falcon512 comes
-# in through lattica_consensus like mldsa44 does.
-target_link_libraries(test_falcon512 PRIVATE falcon512)

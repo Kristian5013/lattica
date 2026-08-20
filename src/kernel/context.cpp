@@ -12,8 +12,10 @@ Context::Context()
 {
     static std::once_flag globals_initialized{};
     std::call_once(globals_initialized, []() {
-        // Lattica has no secp256k1 (ML-DSA) and a single SHA3 implementation,
-        // so there is no ECC start or SHA256 auto-detection here — just the RNG.
+        // A single SHA3 implementation, so no SHA256 auto-detection to do. The
+        // secp256k1 signing context is not started here either: it is the
+        // ecc_context member, so its lifetime is the Context's rather than a
+        // once-per-process flag.
         RandomInit();
     });
 }

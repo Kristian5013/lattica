@@ -32,8 +32,7 @@
  *  consensus upgrade. */
 enum class SigScheme : uint8_t {
     ML_DSA_44 = 0x01,
-    //! 0x02 is reserved for FALCON_512 and deliberately left a hole: CKey already
-    //! sizes storage for it, so claiming the tag later moves nothing.
+    FALCON_512 = 0x02,
     SECP256K1 = 0x03,
 };
 

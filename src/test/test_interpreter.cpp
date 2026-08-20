@@ -74,6 +74,9 @@ valtype Hash160Vec(const valtype& data)
 
 int main()
 {
+    // secp256k1 key generation and signing need the global signing context.
+    ECC_Context ecc_context{};
+
     // ---- Stack machine ----
     {
         std::vector<valtype> stack;
@@ -288,6 +291,64 @@ int main()
             wrong.stack.push_back(pubkey_stack);
             Check("P2WPKH secp rejects an ML-DSA key for the same program",
                   !VerifyScript(CScript(), spk, &wrong, flags, checker, &e));
+        }
+    }
+
+    // ---- End-to-end P2WPKH with a Falcon-512 key ----
+    //
+    // The third scheme through the same branch, and the one where the witness
+    // is a compromise rather than an extreme: 1570 bytes against secp's 99 and
+    // ML-DSA's 3741.
+    {
+        const CKey sk_f = GenerateRandomKey(SigScheme::FALCON_512);
+        const CPubKey pub_f = sk_f.GetPubKey();
+        const valtype pubkey_f(pub_f.begin(), pub_f.end());
+        const valtype pkh_f = Hash160Vec(pubkey_f);
+
+        const int64_t amount = 50 * 100000000LL;
+        CScript spk = CScript() << OP_0 << pkh_f;
+        CScript exec_script = CScript() << OP_DUP << OP_HASH160 << pkh_f << OP_EQUALVERIFY << OP_CHECKSIG;
+
+        CMutableTransaction mtx = make_tx();
+        const uint256 sighash = SignatureHash(exec_script, mtx, 0, SIGHASH_ALL, amount, SigVersion::WITNESS_V0);
+        std::vector<unsigned char> sig;
+        sk_f.Sign(sighash, sig);
+        sig.push_back(SIGHASH_ALL);
+
+        CScriptWitness witness;
+        witness.stack.push_back(sig);
+        witness.stack.push_back(pubkey_f);
+
+        const script_verify_flags flags = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS;
+        MutableTransactionSignatureChecker checker(&mtx, 0, amount, MissingDataBehavior::ASSERT_FAIL);
+        ScriptError err = SCRIPT_ERR_OK;
+        const bool ok = VerifyScript(CScript(), spk, &witness, flags, checker, &err);
+        Check("P2WPKH with a Falcon-512 key verifies", ok);
+        if (!ok) std::printf("    witness verify error: %s\n", ScriptErrorString(err).c_str());
+
+        Check("falcon witness is sig 667 + pubkey 898",
+              sig.size() == 667 && pubkey_f.size() == 898);
+
+        // Both items stay under MAX_WITNESS_ITEM, so Falcon needs no change to
+        // the consensus limits that ML-DSA already forced.
+        Check("falcon witness items fit MAX_WITNESS_ITEM",
+              sig.size() <= MAX_WITNESS_ITEM && pubkey_f.size() <= MAX_WITNESS_ITEM);
+
+        {
+            CScriptWitness bad = witness;
+            bad.stack[0][100] ^= 0x01;
+            ScriptError e = SCRIPT_ERR_OK;
+            Check("P2WPKH falcon rejects a tampered signature",
+                  !VerifyScript(CScript(), spk, &bad, flags, checker, &e));
+        }
+        {
+            // Truncating the padding must fail: the fixed length is the whole
+            // reason the padded variant was vendored.
+            CScriptWitness shortened = witness;
+            shortened.stack[0].erase(shortened.stack[0].begin() + 600);
+            ScriptError e = SCRIPT_ERR_OK;
+            Check("P2WPKH falcon rejects a short signature",
+                  !VerifyScript(CScript(), spk, &shortened, flags, checker, &e));
         }
     }
 

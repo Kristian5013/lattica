@@ -16,6 +16,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -47,6 +48,9 @@ std::vector<unsigned char> FromHex(const std::string& h)
 
 int main()
 {
+    // secp256k1 key generation and signing need the global signing context.
+    ECC_Context ecc_context{};
+
     // A freshly generated key is valid and exposes a valid, well-formed pubkey.
     CKey key = GenerateRandomKey();
     Check("generated key is valid", key.IsValid());
@@ -290,6 +294,100 @@ int main()
             Check("secp: out-of-range scalar refused",
                   !bk.Load(CPrivKey(b.begin(), b.end()), any, false));
         }
+    }
+
+    // ---------------------------------------------------------------- Falcon-512
+    {
+        CKey k = GenerateRandomKey(SigScheme::FALCON_512);
+        Check("falcon: generated key is valid", k.IsValid());
+        Check("falcon: scheme tag is FALCON_512", k.GetScheme() == SigScheme::FALCON_512);
+        Check("falcon: secret is 1281 bytes", k.size() == 1281);
+
+        const CPubKey pub = k.GetPubKey();
+        Check("falcon: pubkey is valid", pub.IsValid());
+        Check("falcon: serialized pubkey is 1 + 897 bytes", pub.size() == 898);
+        Check("falcon: leading byte is the scheme tag",
+              pub[0] == static_cast<unsigned char>(SigScheme::FALCON_512));
+        // A Falcon public key is a packed polynomial whose first byte encodes
+        // the degree; 0x09 is n = 512.
+        Check("falcon: raw key says n = 512", pub.RawKey()[0] == 0x09);
+        Check("falcon: VerifyPubKey accepts its own", k.VerifyPubKey(pub));
+
+        const uint256 msg = Hash(std::vector<unsigned char>{'f', 'a', 'l'});
+        std::vector<unsigned char> sig;
+        Check("falcon: Sign succeeds", k.Sign(msg, sig));
+        Check("falcon: signature is exactly 666 bytes",
+              sig.size() == SchemeSignatureSize(SigScheme::FALCON_512));
+        Check("falcon: signature verifies", pub.Verify(msg, sig));
+
+        // Falcon salts every signature, unlike the other two schemes here.
+        std::vector<unsigned char> sig2;
+        k.Sign(msg, sig2);
+        Check("falcon: signing is randomized", sig2 != sig && pub.Verify(msg, sig2));
+
+        {
+            std::vector<unsigned char> bad = sig;
+            bad[100] ^= 0x01;
+            Check("falcon: a tampered signature is rejected", !pub.Verify(msg, bad));
+        }
+        Check("falcon: the wrong message does not verify",
+              !pub.Verify(Hash(std::vector<unsigned char>{'x'}), sig));
+
+        CKey other = GenerateRandomKey(SigScheme::FALCON_512);
+        Check("falcon: two fresh keys differ", !(other == k) && other.GetPubKey() != pub);
+        Check("falcon: a foreign key does not verify it", !other.GetPubKey().Verify(msg, sig));
+
+        // Cross-scheme confusion, in every direction that exists.
+        const CKey mldsa_k = GenerateRandomKey(SigScheme::ML_DSA_44);
+        const CKey secp_k = GenerateRandomKey(SigScheme::SECP256K1);
+        Check("falcon: VerifyPubKey rejects an ML-DSA pubkey", !k.VerifyPubKey(mldsa_k.GetPubKey()));
+        Check("falcon: VerifyPubKey rejects a secp pubkey", !k.VerifyPubKey(secp_k.GetPubKey()));
+        {
+            std::vector<unsigned char> secp_sig;
+            secp_k.Sign(msg, secp_sig);
+            Check("falcon pubkey rejects a secp signature", !pub.Verify(msg, secp_sig));
+            Check("secp pubkey rejects a falcon signature",
+                  !secp_k.GetPubKey().Verify(msg, sig));
+        }
+
+        const CPrivKey priv = k.GetPrivKey();
+        Check("falcon: serialized secret is 1281 bytes", priv.size() == 1281);
+        CKey loaded;
+        Check("falcon: Load round-trips", loaded.Load(priv, pub, /*fSkipCheck=*/false));
+        Check("falcon: loaded key equals original", loaded == k);
+    }
+
+    // Seeded key generation, per scheme. The lattice schemes share one entropy
+    // seam in randombytes; secp256k1 takes the seed as the scalar directly.
+    {
+        std::array<unsigned char, 32> seed;
+        for (unsigned i = 0; i < seed.size(); ++i) seed[i] = static_cast<unsigned char>(0x20 + i);
+
+        for (const SigScheme scheme : {SigScheme::SECP256K1, SigScheme::FALCON_512, SigScheme::ML_DSA_44}) {
+            CKey a, b;
+            Check("seeded keygen succeeds", a.MakeKeyFromSeed(scheme, seed));
+            b.MakeKeyFromSeed(scheme, seed);
+            Check("seeded keygen is deterministic", a == b && a.GetPubKey() == b.GetPubKey());
+            Check("seeded keygen rejects a 31-byte seed",
+                  !CKey{}.MakeKeyFromSeed(scheme, std::span<const unsigned char>(seed.data(), 31)));
+        }
+
+        // The same seed must not produce related keys across schemes.
+        CKey f, m;
+        f.MakeKeyFromSeed(SigScheme::FALCON_512, seed);
+        m.MakeKeyFromSeed(SigScheme::ML_DSA_44, seed);
+        Check("one seed gives unrelated keys in different schemes",
+              f.GetPubKey() != m.GetPubKey());
+
+        // The seam must be OFF again afterwards. If a deterministic seed leaked
+        // past keygen, Falcon's per-signature salt would be fixed — so a
+        // seeded Falcon key must still sign randomly.
+        const uint256 msg = Hash(std::vector<unsigned char>{'s', 'e', 'a', 'm'});
+        std::vector<unsigned char> s1, s2;
+        f.Sign(msg, s1);
+        f.Sign(msg, s2);
+        Check("the deterministic seam is cleared after keygen",
+              s1 != s2 && f.GetPubKey().Verify(msg, s1) && f.GetPubKey().Verify(msg, s2));
     }
 
     // Startup self-test of the signature primitive.

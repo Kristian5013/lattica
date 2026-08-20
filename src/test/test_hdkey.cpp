@@ -45,18 +45,18 @@ int main()
         std::array<unsigned char, 32> ks;
         for (unsigned i = 0; i < ks.size(); ++i) ks[i] = static_cast<unsigned char>(0x40 + i);
         CKey k1, k2;
-        Check("MakeKeyFromSeed succeeds", k1.MakeKeyFromSeed(ks));
-        k2.MakeKeyFromSeed(ks);
+        Check("MakeKeyFromSeed succeeds", k1.MakeKeyFromSeed(SigScheme::ML_DSA_44, ks));
+        k2.MakeKeyFromSeed(SigScheme::ML_DSA_44, ks);
         Check("seeded keygen is deterministic", k1 == k2 && k1.GetPubKey() == k2.GetPubKey());
         Check("seeded key signs and verifies", SignsAndVerifies(k1, h));
         CKey bad;
         Check("seeded keygen rejects wrong-length seed",
-              !bad.MakeKeyFromSeed(std::span<const unsigned char>(ks.data(), 31)) && !bad.IsValid());
+              !bad.MakeKeyFromSeed(SigScheme::ML_DSA_44, std::span<const unsigned char>(ks.data(), 31)) && !bad.IsValid());
         // A different seed yields a different key.
         std::array<unsigned char, 32> ks2 = ks;
         ks2[0] ^= 0xff;
         CKey k3;
-        k3.MakeKeyFromSeed(ks2);
+        k3.MakeKeyFromSeed(SigScheme::ML_DSA_44, ks2);
         Check("different seed -> different key", !(k3 == k1) && k3.GetPubKey() != k1.GetPubKey());
     }
 

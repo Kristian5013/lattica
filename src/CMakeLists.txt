@@ -53,8 +53,11 @@ target_link_libraries(lattica_consensus
   PUBLIC
     # pubkey.cpp verifies ML-DSA-44 (FIPS 204) signatures in CHECKSIG.
     mldsa44
+    # ...Falcon-512 ones...
+    falcon512
     # ...and secp256k1 ones. Verification uses secp256k1_context_static, so this
-    # adds no global initialisation to consensus code.
+    # adds no global initialisation to consensus code: a node that only
+    # validates never starts an ECC_Context.
     secp256k1
 )
 

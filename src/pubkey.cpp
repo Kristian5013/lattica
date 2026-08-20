@@ -7,6 +7,11 @@
 
 extern "C" {
 #include "api.h"
+
+// Falcon-512 (PQClean falcon-padded-512). Declared rather than included, for
+// the reason crypto/mlkem.cpp gives: three PQClean trees ship an "api.h".
+int PQCLEAN_FALCONPADDED512_CLEAN_crypto_sign_verify(
+    const uint8_t* sig, size_t siglen, const uint8_t* m, size_t mlen, const uint8_t* pk);
 }
 
 #include <cstddef>
@@ -17,6 +22,7 @@ bool IsKnownScheme(SigScheme s)
 {
     switch (s) {
         case SigScheme::ML_DSA_44:
+        case SigScheme::FALCON_512:
         case SigScheme::SECP256K1:
             return true;
     }
@@ -28,6 +34,8 @@ size_t SchemePublicKeySize(SigScheme s)
     switch (s) {
         case SigScheme::ML_DSA_44:
             return PQCLEAN_MLDSA44_CLEAN_CRYPTO_PUBLICKEYBYTES;
+        case SigScheme::FALCON_512:
+            return 897;
         case SigScheme::SECP256K1:
             // Compressed SEC only. An uncompressed (65-byte) form cannot exist:
             // GetLen() maps one scheme tag to exactly one length.
@@ -41,6 +49,10 @@ size_t SchemeSignatureSize(SigScheme s)
     switch (s) {
         case SigScheme::ML_DSA_44:
             return PQCLEAN_MLDSA44_CLEAN_CRYPTO_BYTES;
+        case SigScheme::FALCON_512:
+            // PQClean's falcon-PADDED-512: always exactly this, where plain
+            // falcon-512 would be variable up to 752. See cmake/FALCON-512.cmake.
+            return 666;
         case SigScheme::SECP256K1:
             // Fixed 64-byte compact (r||s), not DER. The script engine implements no
             // signature-encoding rules, and a fixed length keeps the whole BIP66
@@ -56,6 +68,8 @@ size_t SchemeSecretKeySize(SigScheme s)
     switch (s) {
         case SigScheme::ML_DSA_44:
             return PQCLEAN_MLDSA44_CLEAN_CRYPTO_SECRETKEYBYTES;
+        case SigScheme::FALCON_512:
+            return 1281;
         case SigScheme::SECP256K1:
             return 32;
     }
@@ -67,6 +81,7 @@ int64_t SchemeSigOpCost(SigScheme s)
     switch (s) {
         case SigScheme::ML_DSA_44:
             return 1;
+        case SigScheme::FALCON_512:
         case SigScheme::SECP256K1:
             // Provisional: ML-DSA-44 is the unit and an ECDSA verify is of the same
             // order. Worth measuring before this counter is actually wired into
@@ -87,6 +102,12 @@ bool CPubKey::Verify(const uint256& hash, std::span<const unsigned char> sig) co
             // (GetLen() requires the scheme's exact 1312-byte key, as the
             // conformance suite requires).
             return PQCLEAN_MLDSA44_CLEAN_crypto_sign_verify(
+                       sig.data(), sig.size(), hash.begin(), hash.size(), RawKey().data()) == 0;
+        case SigScheme::FALCON_512:
+            // PQClean checks the length itself and returns 0 on a valid
+            // signature. The padded variant accepts only its own fixed length,
+            // which the vendored-library test pins.
+            return PQCLEAN_FALCONPADDED512_CLEAN_crypto_sign_verify(
                        sig.data(), sig.size(), hash.begin(), hash.size(), RawKey().data()) == 0;
         case SigScheme::SECP256K1: {
             // Verification only, so the static context is enough — no global

@@ -3,28 +3,46 @@
 //
 // Private key + signing, modeled on Bitcoin Core's key.h (CKey / CPrivKey).
 //
-// Lattica is crypto-agile: a CKey holds the secret of ONE scheme, tagged by the
-// SigScheme byte that also leads its public key. Where Core's CKey is always a
-// 32-byte secp256k1 scalar, ours is a std::variant over the schemes the chain
-// knows — today secp256k1 and ML-DSA-44 (PQClean / FIPS 204), with Falcon-512's
-// storage reserved so adding it does not move the layout.
+// Core's CKey is a secp256k1 key. Not "a key class configured for secp256k1" —
+// the curve is in its data layout and its return types: KeyType is a fixed
+// 32-byte array, GetPubKey() recomputes the public key from the secret with no
+// field to store one, GetPrivKey() emits DER (which is what its SIZE{279} and
+// COMPRESSED_SIZE{214} actually measure), and fCompressed threads a
+// point-serialization concern through Set() and the DER export. None of that
+// survives a second scheme, so this class keeps Core's contract and skeleton
+// while its interior is written for three:
 //
-// Two structural differences from Core are forced by the post-quantum half:
+//     tag    scheme        secret  public  signature
+//     0x01   ML-DSA-44       2560    1312       2420   FIPS 204, lattice
+//     0x02   Falcon-512      1281     897        666   NTRU lattice, padded form
+//     0x03   secp256k1         32      33         64   compact r||s, low-S
 //
-//   * A CKey carries its public key. secp256k1 derives one cheaply from the
-//     secret; ML-DSA cannot — the secret packs t0 while the public key packs t1,
-//     and recovering t1 means re-expanding A and recomputing t = A*s1 + s2, work
-//     the PQClean API does not expose. Rather than branch on storage, the public
-//     key is captured at generation time for every scheme.
+// A CKey holds the secret of exactly one of them, tagged by the same SigScheme
+// byte that leads its public key, so the scheme travels with the key rather
+// than being tracked beside it.
+//
+// Three consequences are worth stating because they are not choices:
+//
+//   * A CKey carries its public key. Only secp256k1 can hand one back on
+//     demand. ML-DSA cannot at all — its secret packs t0 while the public key
+//     packs t1, and recovering t1 means re-expanding A and recomputing
+//     t = A*s1 + s2. Falcon's is recomputable in principle (h = g/f mod q) but
+//     PQClean exposes that only as an internal symbol over unpacked
+//     polynomials, not through its api.h. Rather than branch on storage, every
+//     scheme captures the public key at generation time.
 //
 //   * There is no compression flag. Core's public-key header byte (0x02/0x03 vs
 //     0x04) IS the compression marker; here the leading byte is the scheme tag,
 //     and CPubKey::GetLen() maps one tag to exactly one length. secp256k1 keys
 //     are therefore compressed-only.
 //
+//   * There are no per-class size constants. A CKey has no single size; the
+//     sizes live in pubkey.h as SchemeSecretKeySize() / SchemePublicKeySize() /
+//     SchemeSignatureSize(), keyed by the tag.
+//
 // Parts of Core's key.h with no analog here are not dropped silently — they are
-// enumerated with the reason at the bottom of the CKey class, mirroring how
-// pubkey.h documents the public-key types it omits.
+// enumerated with the reason at the bottom of the class, mirroring how pubkey.h
+// documents the public-key types it omits.
 
 #ifndef LATTICA_KEY_H
 #define LATTICA_KEY_H
@@ -41,80 +59,65 @@
 #include <variant>
 #include <vector>
 
+struct secp256k1_context_struct;
+typedef struct secp256k1_context_struct secp256k1_context;
+
 /**
- * CPrivKey is a serialized private key, with all parameters included.
- * For ML-DSA-44 this is simply the raw 2560-byte secret key; the matching
- * public key (which carries the scheme tag) is stored alongside it in a CKey.
+ * CPrivKey is a serialized private key.
+ *
+ * Core's is DER (SEC 1 ECPrivateKey, curve parameters and all). Here it is the
+ * raw scheme secret: a lattice secret has no DER encoding, and inventing one so
+ * that all three schemes could share a container would add a parser to the
+ * wallet's load path for no gain.
  */
 typedef std::vector<unsigned char, secure_allocator<unsigned char>> CPrivKey;
 
-/** An encapsulated post-quantum (ML-DSA-44) private key. */
+/** An encapsulated private key of one of the supported signature schemes. */
 class CKey
 {
 public:
     /**
-     * The key-generation seed size. It is deliberately NOT per-scheme: ML-DSA's
-     * FIPS 204 xi and a secp256k1 scalar are both 32 bytes, which is what lets
-     * one HD tree carry both.
-     *
-     * The per-scheme secret / public / signature sizes that used to live here as
-     * CKey::SIZE, PUBLIC_KEY_SIZE and SIGNATURE_SIZE are gone: a CKey no longer
-     * has one size. They are SchemeSecretKeySize(), SchemePublicKeySize() and
-     * SchemeSignatureSize() in pubkey.h, keyed by the scheme tag.
+     * The key-generation seed size, and deliberately not per-scheme: ML-DSA's
+     * FIPS 204 xi, Falcon's keygen seed and a secp256k1 scalar are all 32 bytes,
+     * which is what lets one hierarchical tree carry every scheme.
      */
     static constexpr unsigned int SEED_SIZE = 32;
 
 private:
-    //! Per-scheme secret-key buffers. secp256k1 is a 32-byte scalar, ML-DSA-44 a
-    //! 2560-byte packed secret. Falcon-512's 1281-byte NTRU secret is declared
-    //! now, before the scheme itself exists, so that adding it later does not
-    //! move this storage around.
+    //! Per-scheme secret buffers, sized from the schemes' own constants.
     using SecpKey = std::array<unsigned char, 32>;
-    using MLDSAKey = std::array<unsigned char, 2560>;
     using FalconKey = std::array<unsigned char, 1281>;
-    using KeyVariant = std::variant<SecpKey, MLDSAKey, FalconKey>;
+    using MLDSAKey = std::array<unsigned char, 2560>;
+    using KeyVariant = std::variant<SecpKey, FalconKey, MLDSAKey>;
 
-    //! secure_unique_ptr's deleter hands the storage straight back to the locked
-    //! pool without running a destructor, which is sound only while every
-    //! alternative is trivially destructible. A non-trivial one added here would
-    //! leak without any diagnostic.
+    //! secure_unique_ptr's deleter returns the storage to the locked pool
+    //! without running a destructor, which is sound only while every
+    //! alternative is trivially destructible. A non-trivial one added here
+    //! would leak with no diagnostic at all.
     static_assert(std::is_trivially_destructible_v<KeyVariant>,
                   "CKey's secure storage is freed without running a destructor");
 
     /**
-     * The secret-key material. Null means invalid.
+     * The secret material. Null means invalid.
      *
-     * The variant sits INSIDE the secure allocation rather than being a plain
-     * member: secure_allocator draws from the locked pool and memory_cleanse()s
-     * on release, whereas a bare std::variant member would live in ordinary
-     * memory that can be paged to disk and is never wiped. The cost is that the
+     * The variant lives INSIDE the secure allocation rather than beside it:
+     * secure_allocator draws from the locked pool and memory_cleanse()s on
+     * release, whereas a plain std::variant member would sit in ordinary memory
+     * that can be paged to disk and is never wiped. The cost is that the
      * allocation is always the size of the largest alternative, so a 32-byte
-     * secp256k1 scalar still occupies an ML-DSA-sized slot; locked-pool space is
-     * not the scarce resource here.
+     * scalar occupies an ML-DSA-sized slot; locked-pool space is not the scarce
+     * resource here.
      */
     secure_unique_ptr<KeyVariant> m_keydata;
 
-    //! Which scheme m_keydata holds. Only meaningful while m_keydata is non-null.
+    //! Which scheme m_keydata holds. Meaningful only while m_keydata is non-null.
     SigScheme m_scheme{SigScheme::ML_DSA_44};
 
-    /**
-     * The matching public key.
-     *
-     * secp256k1 can recompute this from the secret and ML-DSA cannot — the
-     * secret packs t0 while the public key packs t1, and recovering t1 means
-     * re-expanding A and recomputing t = A*s1 + s2. Rather than branching on
-     * storage, a CKey carries the public key for every scheme; for secp256k1 it
-     * is simply derived once at generation time.
-     *
-     * Note there is no compression flag. Core has one because its public-key
-     * header byte (0x02/0x03 vs 0x04) IS the compression marker; here the
-     * leading byte is the scheme tag, and CPubKey::GetLen() maps one scheme tag
-     * to exactly one length. Two lengths for one tag would break ValidSize(), so
-     * secp256k1 public keys are compressed-only (33 bytes).
-     */
+    //! The matching public key. See the header comment for why it is stored.
     CPubKey m_pubkey;
 
-    //! Allocate (if needed) and select the alternative for `scheme`, zeroed.
+    //! Allocate if needed, then select and zero the alternative for `scheme`.
+    //! Leaves the key invalid if the scheme is not one this build knows.
     void MakeKeyData(SigScheme scheme);
 
     void ClearKeyData()
@@ -123,8 +126,7 @@ private:
         m_pubkey = CPubKey();
     }
 
-    //! Mutable view of the active secret bytes. Undefined unless m_keydata holds
-    //! the alternative matching m_scheme.
+    //! Mutable view of the active secret bytes. Requires m_keydata.
     unsigned char* MutableData();
 
 public:
@@ -134,15 +136,16 @@ public:
 
     CKey& operator=(const CKey& other)
     {
-        if (other.m_keydata) {
-            if (!m_keydata) m_keydata = make_secure_unique<KeyVariant>();
-            *m_keydata = *other.m_keydata;
+        if (this != &other) {
+            if (other.m_keydata) {
+                if (!m_keydata) m_keydata = make_secure_unique<KeyVariant>();
+                *m_keydata = *other.m_keydata;
+            } else {
+                m_keydata.reset();
+            }
             m_scheme = other.m_scheme;
-        } else {
-            ClearKeyData();
-            m_scheme = other.m_scheme;
+            m_pubkey = other.m_pubkey;
         }
-        m_pubkey = other.m_pubkey;
         return *this;
     }
 
@@ -155,12 +158,15 @@ public:
     }
 
     /**
-     * Initialize from a secret and its matching public key. The scheme is taken
-     * from the public key, and the secret must be exactly that scheme's secret
-     * size. This replaces Core's `Set(pbegin, pend, fCompressed)`: the flag it
-     * carried is meaningless here (see m_pubkey), and ML-DSA cannot recompute
-     * the public key from the secret, so it must be supplied rather than derived.
-     * The key is left invalid if the length is wrong or the pair does not match.
+     * Initialize from a secret and its matching public key.
+     *
+     * The scheme comes from the public key, and the secret must be exactly that
+     * scheme's secret length. This is Core's `Set(pbegin, pend, fCompressedIn)`
+     * with the compression flag replaced by the public key: the flag has no
+     * meaning here, and ML-DSA cannot recompute a public key from its secret,
+     * so it has to be supplied rather than derived. The key is left invalid if
+     * the length is wrong, the secret is structurally unacceptable, or the pair
+     * does not match.
      */
     template <typename T>
     void Set(const T sk_begin, const T sk_end, const CPubKey& pubkey)
@@ -176,12 +182,13 @@ public:
             return;
         }
         MakeKeyData(scheme);
+        if (!m_keydata) return;
         std::memcpy(MutableData(), (const unsigned char*)&sk_begin[0], len);
         m_pubkey = pubkey;
         if (!VerifyPubKey(pubkey)) ClearKeyData();
     }
 
-    //! Simple read-only vector-like interface over the active secret-key bytes.
+    //! Simple read-only vector-like interface over the active secret bytes.
     unsigned int size() const;
     const unsigned char* data() const;
     const unsigned char* begin() const { return data(); }
@@ -194,109 +201,158 @@ public:
     SigScheme GetScheme() const { return m_scheme; }
 
     /**
-     * Whether a secret-key buffer is structurally acceptable for `scheme`.
+     * Whether a secret buffer is structurally acceptable for `scheme`.
      *
-     * For secp256k1 this is a real predicate — the scalar must lie in [1, n-1],
-     * and secp256k1_ec_seckey_verify decides it. ML-DSA has no cheap equivalent:
-     * any buffer of the right length is structurally fine, and semantic validity
-     * is established by VerifyPubKey's sign+verify round-trip.
+     * Only secp256k1 has a real predicate: the scalar must lie in [1, n-1], and
+     * secp256k1_ec_seckey_verify decides it. Neither lattice scheme has a cheap
+     * equivalent — any buffer of the right length is structurally fine, and
+     * semantic validity is what VerifyPubKey establishes.
      */
     static bool Check(SigScheme scheme, const unsigned char* vch);
 
-    //! Generate a fresh random keypair for `scheme` (secret + matching public key).
+    //! Generate a fresh random keypair for `scheme`.
+    //! secp256k1 and Falcon need a signing context (see ECC_Context).
     void MakeNewKey(SigScheme scheme = SigScheme::ML_DSA_44);
 
-    //! Deterministically generate an ML-DSA-44 keypair from a SEED_SIZE-byte seed
-    //! (FIPS 204 ML-DSA.KeyGen_internal(xi)). Backs hierarchical-deterministic
-    //! derivation (see CExtKey); the key is left invalid if the seed is the wrong
-    //! length. secp256k1's seed semantics differ (the seed IS the scalar, modulo
-    //! the range check) and are handled when HD derivation grows a secp branch.
-    bool MakeKeyFromSeed(std::span<const unsigned char> seed);
+    /**
+     * Deterministically generate a keypair for `scheme` from a SEED_SIZE-byte
+     * seed. This backs hierarchical derivation; it returns false, leaving the
+     * key invalid, if the seed is the wrong length or unusable for the scheme.
+     *
+     * The seed means something different per scheme, and the difference is real
+     * rather than cosmetic:
+     *
+     *   ML-DSA-44   the FIPS 204 KeyGen_internal(xi) seed, fed to the
+     *               unmodified PQClean keypair through the entropy seam in
+     *               randombytes.h. Every seed is usable.
+     *   Falcon-512  the same seam drives PQClean's Falcon keygen, which also
+     *               draws from randombytes. Every seed is usable, but keygen is
+     *               far more expensive than the other two — an NTRU lattice
+     *               with rejection sampling, not one hash.
+     *   secp256k1   the seed IS the scalar. A seed outside [1, n-1] has no key
+     *               and is rejected, which happens with probability about
+     *               2^-128 and must still be handled by the caller.
+     */
+    bool MakeKeyFromSeed(SigScheme scheme, std::span<const unsigned char> seed);
 
-    //! Convert the private key to a serialized (raw secret-key byte) form.
+    //! Serialize the private key (the raw scheme secret; see CPrivKey).
     CPrivKey GetPrivKey() const;
 
     //! The public key matching this private key.
     CPubKey GetPubKey() const { return m_pubkey; }
 
     /**
-     * Sign the 32-byte message `hash` (a sighash). The produced signature is the
-     * bare scheme signature; callers building a witness append the one-byte
-     * sighash type themselves.
+     * Sign the 32-byte message `hash` (a sighash). The result is the bare scheme
+     * signature; callers building a witness append the sighash-type byte.
      *
-     * Core's `grind` / `test_case` parameters drive low-R grinding of a DER
-     * ECDSA signature and are not reproduced: the DER encoding rules they serve
-     * are exactly what this chain's script engine does not implement.
+     * Determinism differs by scheme and callers must not assume it: secp256k1
+     * uses RFC6979 and ML-DSA-44 is hedged-but-fixed here, so both reproduce,
+     * while Falcon salts every signature and does not.
+     *
+     * Core's `grind` and `test_case` parameters are absent. They exist to shave
+     * a byte off a DER ECDSA signature, and this chain has no DER: the script
+     * engine implements no signature-encoding rules at all.
      */
     bool Sign(const uint256& hash, std::vector<unsigned char>& vchSig) const;
 
     /**
      * Verify that a candidate public key is the one matching this private key.
      *
-     * secp256k1 derives the public key and compares it. ML-DSA cannot derive,
-     * so it signs a random challenge and checks it verifies under the candidate.
+     * secp256k1 derives the public key and compares it. Neither lattice scheme
+     * can: ML-DSA's secret packs t0 rather than t1, and while a Falcon public
+     * key is recomputable from its secret, PQClean exposes that only as an
+     * internal symbol over unpacked polynomials. Both therefore sign a random
+     * challenge and check it verifies under the candidate.
      */
     bool VerifyPubKey(const CPubKey& vchPubKey) const;
 
-    //! Load a private key and (re)build the CKey. The public key must be supplied
+    //! Load a private key and rebuild the CKey. The public key must be supplied
     //! because ML-DSA cannot recompute it from the secret alone.
     bool Load(const CPrivKey& privkey, const CPubKey& vchPubKey, bool fSkipCheck);
 
     // --- Surface of Core's CKey not reproduced here ---------------------------
     //
-    //   IsCompressed()                    secp256k1 keys are compressed-only in
-    //                                     Lattica; see m_pubkey for why the flag
-    //                                     cannot exist alongside a scheme tag.
+    //   IsCompressed()                    secp256k1 keys are compressed-only;
+    //                                     see the header comment for why the
+    //                                     flag cannot coexist with a scheme tag.
     //   SignCompact()                     65-byte recoverable ECDSA for public-key
-    //                                     recovery; the recovery module is not
-    //                                     built (see cmake/secp256k1.cmake), and
-    //                                     ML-DSA has no key recovery at all. Note
-    //                                     Lattica's secp256k1 signature is also
-    //                                     "compact" in libsecp256k1's sense (64
-    //                                     bytes, r||s) — that is the ordinary
-    //                                     encoding here, not a recoverable one.
-    //   SignSchnorr() / ComputeKeyPair()  BIP-340 / Taproot key-path; Lattica has
-    //                                     no witness v1, and schnorrsig/extrakeys
-    //                                     are not built.
-    //   EllSwiftCreate() /                BIP-324 transport; this transport is
-    //   ComputeBIP324ECDHSecret()         ML-KEM-768 (see v2cipher.h).
-
+    //                                     recovery. The recovery module is not
+    //                                     built (cmake/secp256k1.cmake) and
+    //                                     neither lattice scheme recovers a key
+    //                                     from a signature. Note the ordinary
+    //                                     secp256k1 signature here is "compact"
+    //                                     in libsecp256k1's sense — 64 bytes,
+    //                                     r||s — which is a different thing.
+    //   SignSchnorr() / ComputeKeyPair()  BIP-340 and Taproot key-path. There is
+    //                                     no witness v1, and schnorrsig and
+    //                                     extrakeys are not built.
+    //   Derive()                          BIP32 child derivation by additive
+    //                                     scalar tweak. Portable verbatim for
+    //                                     secp256k1 and impossible for either
+    //                                     lattice scheme, so it belongs to a
+    //                                     scheme-aware CExtKey rather than here.
+    //   EllSwiftCreate() /                BIP-324 transport. This transport is
+    //   ComputeBIP324ECDHSecret()         ML-KEM-768; see v2cipher.h.
 };
 
-//! Produce a fresh random private key of `scheme` (with its matching public key).
+//! Produce a fresh random private key of `scheme`, with its matching public key.
 CKey GenerateRandomKey(SigScheme scheme = SigScheme::ML_DSA_44) noexcept;
 
 /**
- * Self-test the key primitives at startup, once per implemented scheme. This is
- * the analog of Core's ECC_InitSanityCheck(), widened because there is now more
- * than one scheme to get wrong.
- *
- * ML-DSA-44 gets a full generate/sign/verify round-trip. secp256k1 gets
- * generate + public-key derivation + a serialize/parse round-trip; it does not
- * sign yet (see CKey::Sign), so there is nothing further to check.
+ * Self-test every implemented scheme at startup: generate, sign, verify, and
+ * confirm the key agrees with its own public key. Core's ECC_InitSanityCheck()
+ * with more than one primitive to get wrong.
  */
 bool KeyCryptoSanityCheck();
 
-//! A BIP32-style chain code: 256 bits of derivation entropy carried alongside a key.
+/**
+ * The secp256k1 signing context, or nullptr if none has been started.
+ *
+ * Only key generation and signing need it — secp256k1_ec_pubkey_create and
+ * secp256k1_ecdsa_sign refuse the static context. Verification does not:
+ * CPubKey::Verify uses secp256k1_context_static, so validating a block requires
+ * no global setup at all and consensus code never touches this.
+ */
+secp256k1_context* GetSecp256k1SignContext();
+
+/**
+ * RAII class initializing and deinitializing global state for elliptic curve
+ * support. Only one instance may be initialized at a time.
+ *
+ * A process that generates or signs with secp256k1 keys must hold one; a
+ * process that only validates need not. The lattice schemes need no context.
+ */
+class ECC_Context
+{
+public:
+    ECC_Context();
+    ~ECC_Context();
+};
+
+//! A BIP32-style chain code: 256 bits of derivation entropy carried with a key.
 using ChainCode = uint256;
 
 /**
  * A hierarchical-deterministic extended private key, the Lattica analog of
- * Core's CExtKey (BIP32). Because ML-DSA has no additive key tweak, the chainable
- * secret is NOT the (2560-byte) signing key but the 32-byte key-generation seed
- * that deterministically expands to it (FIPS 204 KeyGen_internal). A child is
- * derived by mixing the parent's secret node seed into a SHA3-512 PRF keyed by
- * the chain code, so derivation is HARDENED-ONLY: a parent extended *public* key
- * cannot derive child public keys (there is no key homomorphism for a lattice
- * scheme), which is why there is no Neuter() / CExtPubKey here. One master seed
- * still backs up and recovers the whole tree.
+ * Core's CExtKey (BIP32).
+ *
+ * Still ML-DSA-only, and still hardened-only with it. Because a lattice scheme
+ * has no additive key tweak, the chainable secret is not the signing key but
+ * the 32-byte seed that deterministically expands to one, and a child is
+ * derived by mixing the parent's node seed into a SHA3-512 PRF keyed by the
+ * chain code. A parent extended *public* key therefore cannot derive child
+ * public keys, which is why there is no Neuter() / CExtPubKey.
+ *
+ * secp256k1 changes that: Core's BIP32 tweak is portable verbatim and would
+ * give real non-hardened derivation and a working Neuter(). Making this
+ * scheme-aware the way CKey now is, is the next step rather than this one.
  */
 struct CExtKey {
     unsigned char nDepth{0};
     unsigned char vchFingerprint[4]{0, 0, 0, 0};
     unsigned int nChild{0};
     ChainCode chaincode;
-    uint256 nodeseed;  //!< the 32-byte ML-DSA key-generation seed (the chainable secret)
+    uint256 nodeseed;  //!< the 32-byte key-generation seed (the chainable secret)
     CKey key;          //!< signing key, expanded from nodeseed
 
     //! Serialized size: depth(1) + fingerprint(4) + child(4) + chaincode(32) + nodeseed(32).
@@ -315,20 +371,16 @@ struct CExtKey {
     //! Initialize as the master extended key from a wallet seed (any length).
     void SetSeed(std::span<const unsigned char> seed);
 
-
-    //! Compute the master node from a seed and a personalization tag (shared by the two above).
+    //! Compute the master node from a seed and a personalization tag.
     void SetSeedFromTag(std::span<const unsigned char> seed, const unsigned char* tag, size_t taglen);
 
-    //! Derive the hardened child at index nChild. Returns false if this key is invalid.
+    //! Derive the hardened child at index nChild. False if this key is invalid.
     [[nodiscard]] bool Derive(CExtKey& out, unsigned int nChild) const;
 
-    //! Serialize / deserialize the extended key to a fixed SIZE-byte form. Decode
-    //! re-expands the signing key from the stored node seed.
+    //! Serialize / deserialize to a fixed SIZE-byte form. Decode re-expands the
+    //! signing key from the stored node seed.
     void Encode(unsigned char code[SIZE]) const;
     void Decode(const unsigned char code[SIZE]);
-
-    // No Neuter() / CExtPubKey: child public keys cannot be derived from a parent
-    // public key under ML-DSA (no key homomorphism). HD here is hardened-only.
 };
 
 #endif // LATTICA_KEY_H
