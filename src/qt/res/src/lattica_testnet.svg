@@ -1,16 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
-    <radialGradient id="d" cx="34%" cy="28%" r="95%">
-      <stop offset="0" stop-color="#9a3c12"/>
-      <stop offset="0.55" stop-color="#7c2d12"/>
-      <stop offset="1" stop-color="#2a0f05"/>
+    <radialGradient id="v" cx="34%" cy="28%" r="82%">
+      <stop offset="0" stop-color="#7ff2e3"/>
+      <stop offset="0.52" stop-color="#0ea597"/>
+      <stop offset="1" stop-color="#0b6b62"/>
     </radialGradient>
   </defs>
-  <circle cx="128" cy="128" r="125" fill="url(#d)"/>
-  <circle cx="128" cy="128" r="125" fill="none" stroke="#ffffff" stroke-opacity="0.18" stroke-width="3.5"/>
-  <polygon points="128,44 117,117 44,128" fill="#f7f5f0"/>
-  <polygon points="128,44 139,117 212,128" fill="#f5b12f"/>
-  <polygon points="44,128 117,139 128,212" fill="#f5b12f"/>
-  <polygon points="212,128 139,139 128,212" fill="#f7f5f0"/>
+  <circle cx="128" cy="128" r="120" fill="url(#v)"/>
+  <circle cx="128" cy="128" r="120" fill="none" stroke="#ffffff" stroke-opacity="0.16" stroke-width="4"/>
+  <g stroke="#ffffff" stroke-width="4.5" stroke-linecap="round">
+    <path fill="none" d="M66 84 158 84 M82 128 174 128 M98 172 190 172 M66 84 98 172 M112 84 144 172 M158 84 190 172"/>
+    <g fill="#ffffff" stroke="none">
+      <circle cx="66" cy="84" r="7.5"/><circle cx="112" cy="84" r="7.5"/><circle cx="158" cy="84" r="7.5"/>
+      <circle cx="82" cy="128" r="7.5"/><circle cx="128" cy="128" r="10.5"/><circle cx="174" cy="128" r="7.5"/>
+      <circle cx="98" cy="172" r="7.5"/><circle cx="144" cy="172" r="7.5"/><circle cx="190" cy="172" r="7.5"/>
+    </g>
+  </g>
 </svg>
