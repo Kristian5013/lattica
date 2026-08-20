@@ -250,7 +250,11 @@ public:
     //   SignCompact()                     65-byte recoverable ECDSA for public-key
     //                                     recovery; the recovery module is not
     //                                     built (see cmake/secp256k1.cmake), and
-    //                                     ML-DSA has no key recovery at all.
+    //                                     ML-DSA has no key recovery at all. Note
+    //                                     Lattica's secp256k1 signature is also
+    //                                     "compact" in libsecp256k1's sense (64
+    //                                     bytes, r||s) — that is the ordinary
+    //                                     encoding here, not a recoverable one.
     //   SignSchnorr() / ComputeKeyPair()  BIP-340 / Taproot key-path; Lattica has
     //                                     no witness v1, and schnorrsig/extrakeys
     //                                     are not built.

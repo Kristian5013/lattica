@@ -11,6 +11,7 @@
 #include <script/interpreter.h>
 #include <script/script.h>
 #include <script/script_error.h>
+#include <key.h>
 #include <pubkey.h>
 #include <primitives/transaction.h>
 #include <hash.h>
@@ -214,6 +215,80 @@ int main()
         ScriptError err3 = SCRIPT_ERR_OK;
         bool amt_ok = VerifyScript(CScript(), spk, &witness, flags, checker_badamt, &err3);
         Check("P2WPKH binds the input amount", !amt_ok);
+    }
+
+    // ---- End-to-end P2WPKH with a secp256k1 key ----
+    //
+    // The same output type and the same branch of the interpreter, with a
+    // different scheme: the witness program is Hash160(scheme byte || key), and
+    // CheckSig picks the verifier from that leading byte. This exercises
+    // crypto-agility through the consensus engine rather than at the primitive.
+    {
+        const CKey sk_secp = GenerateRandomKey(SigScheme::SECP256K1);
+        const CPubKey pub_secp = sk_secp.GetPubKey();
+        const valtype pubkey_secp(pub_secp.begin(), pub_secp.end());
+        const valtype pkh_secp = Hash160Vec(pubkey_secp);
+
+        const int64_t amount = 50 * 100000000LL;
+        CScript spk = CScript() << OP_0 << pkh_secp;
+        CScript exec_script = CScript() << OP_DUP << OP_HASH160 << pkh_secp << OP_EQUALVERIFY << OP_CHECKSIG;
+
+        CMutableTransaction mtx = make_tx();
+        const uint256 sighash = SignatureHash(exec_script, mtx, 0, SIGHASH_ALL, amount, SigVersion::WITNESS_V0);
+        std::vector<unsigned char> sig;
+        sk_secp.Sign(sighash, sig);
+        sig.push_back(SIGHASH_ALL);
+
+        CScriptWitness witness;
+        witness.stack.push_back(sig);
+        witness.stack.push_back(pubkey_secp);
+
+        const script_verify_flags flags = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS;
+        MutableTransactionSignatureChecker checker(&mtx, 0, amount, MissingDataBehavior::ASSERT_FAIL);
+        ScriptError err = SCRIPT_ERR_OK;
+        const bool ok = VerifyScript(CScript(), spk, &witness, flags, checker, &err);
+        Check("P2WPKH with a secp256k1 key verifies", ok);
+        if (!ok) std::printf("    witness verify error: %s\n", ScriptErrorString(err).c_str());
+
+        // 99 bytes of witness against ML-DSA's 3741 for the same spend.
+        Check("secp witness is sig 65 + pubkey 34",
+              sig.size() == 65 && pubkey_secp.size() == 34);
+
+        {
+            CScriptWitness bad = witness;
+            bad.stack[0][5] ^= 0x01;
+            ScriptError e = SCRIPT_ERR_OK;
+            Check("P2WPKH secp rejects a tampered signature",
+                  !VerifyScript(CScript(), spk, &bad, flags, checker, &e));
+        }
+
+        // Malleating s to n-s keeps the signature mathematically valid but must
+        // be refused by consensus, so a third party cannot rewrite the txid.
+        {
+            static const unsigned char N[32] = {
+                0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,
+                0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B, 0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41};
+            CScriptWitness mal = witness;
+            int borrow = 0;
+            for (int i = 31; i >= 0; --i) {
+                const int d = int(N[i]) - int(sig[32 + i]) - borrow;
+                mal.stack[0][32 + i] = static_cast<unsigned char>(d & 0xff);
+                borrow = (d < 0) ? 1 : 0;
+            }
+            ScriptError e = SCRIPT_ERR_OK;
+            Check("P2WPKH secp rejects the high-S malleation",
+                  !VerifyScript(CScript(), spk, &mal, flags, checker, &e));
+        }
+
+        // An ML-DSA key hashes to a different program, so it cannot spend this one.
+        {
+            ScriptError e = SCRIPT_ERR_OK;
+            CScriptWitness wrong;
+            wrong.stack.push_back(sign(sighash, SIGHASH_ALL));
+            wrong.stack.push_back(pubkey_stack);
+            Check("P2WPKH secp rejects an ML-DSA key for the same program",
+                  !VerifyScript(CScript(), spk, &wrong, flags, checker, &e));
+        }
     }
 
     // ---- P2WSH scripts with in-script ML-DSA keys (multisig, HTLC) ----

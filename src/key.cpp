@@ -202,12 +202,28 @@ bool CKey::Sign(const uint256& hash, std::vector<unsigned char>& vchSig) const
         vchSig.resize(siglen);
         return true;
     }
-    case SigScheme::SECP256K1:
-        // Not yet implemented. Signing lands with the wallet changes that follow;
-        // failing here rather than asserting keeps a wallet holding a secp key
-        // usable for everything except spending from it.
-        vchSig.clear();
-        return false;
+    case SigScheme::SECP256K1: {
+        secp256k1_ecdsa_signature sig;
+        // Nonce generation is libsecp256k1's default, RFC6979: derived from the
+        // secret and the message, so signing is deterministic and needs no
+        // entropy at all. Core additionally grinds the nonce for a low R to save
+        // a DER byte; with a fixed 64-byte encoding there is no byte to save.
+        if (!secp256k1_ecdsa_sign(SigningContext(), &sig, hash.begin(), data(),
+                                  nullptr, nullptr)) {
+            vchSig.clear();
+            return false;
+        }
+        // libsecp256k1 already returns a low-S signature. Normalizing anyway
+        // makes the invariant something this function enforces rather than
+        // something it inherits, and CPubKey::Verify rejects high-S outright.
+        secp256k1_ecdsa_signature_normalize(secp256k1_context_static, &sig, &sig);
+        vchSig.resize(SchemeSignatureSize(SigScheme::SECP256K1));
+        const int ok = secp256k1_ecdsa_signature_serialize_compact(
+            secp256k1_context_static, vchSig.data(), &sig);
+        assert(ok);
+        (void)ok;
+        return true;
+    }
     }
     return false;
 }
@@ -279,8 +295,7 @@ bool KeyCryptoSanityCheck()
         if (!pubkey.Verify(hash, sig) || !key.VerifyPubKey(pubkey)) return false;
     }
 
-    // secp256k1: generate, derive, and confirm the serialized key round-trips
-    // through the library's own parser. There is no signing to check yet.
+    // secp256k1: the same generate / sign / verify round-trip.
     {
         const CKey key = GenerateRandomKey(SigScheme::SECP256K1);
         if (!key.IsValid() || key.size() != SchemeSecretKeySize(SigScheme::SECP256K1)) return false;
@@ -288,11 +303,13 @@ bool KeyCryptoSanityCheck()
         if (!pubkey.IsValid() || pubkey.GetScheme() != SigScheme::SECP256K1) return false;
         if (!key.VerifyPubKey(pubkey)) return false;
 
-        secp256k1_pubkey parsed;
-        if (!secp256k1_ec_pubkey_parse(secp256k1_context_static, &parsed,
-                                       pubkey.RawKey().data(), pubkey.RawKey().size())) {
-            return false;
-        }
+        static const std::string test{"Lattica secp256k1 sanity check"};
+        const uint256 hash = Hash(std::span<const unsigned char>(
+            reinterpret_cast<const unsigned char*>(test.data()), test.size()));
+        std::vector<unsigned char> sig;
+        if (!key.Sign(hash, sig)) return false;
+        if (sig.size() != SchemeSignatureSize(SigScheme::SECP256K1)) return false;
+        if (!pubkey.Verify(hash, sig)) return false;
     }
     return true;
 }

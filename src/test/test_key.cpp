@@ -15,6 +15,7 @@
 #include <hash.h>
 
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -180,9 +181,67 @@ int main()
         Check("secp: VerifyPubKey rejects an ML-DSA pubkey", !k.VerifyPubKey(mldsa.GetPubKey()));
         Check("ML-DSA: VerifyPubKey rejects a secp pubkey", !mldsa.VerifyPubKey(pub));
 
-        // Signing is deliberately absent for now.
+        // --- Signing ---
+        const uint256 msg = Hash(std::vector<unsigned char>{'s', 'e', 'c', 'p'});
         std::vector<unsigned char> sig;
-        Check("secp: Sign() reports unimplemented", !k.Sign(uint256::ONE, sig) && sig.empty());
+        Check("secp: Sign succeeds", k.Sign(msg, sig));
+        Check("secp: signature is 64 bytes (compact r||s)",
+              sig.size() == SchemeSignatureSize(SigScheme::SECP256K1));
+        Check("secp: signature verifies", pub.Verify(msg, sig));
+
+        // RFC6979: the nonce comes from the key and the message, so a second
+        // signature over the same input is byte-identical. No entropy involved.
+        std::vector<unsigned char> sig2;
+        k.Sign(msg, sig2);
+        Check("secp: signing is deterministic", sig2 == sig);
+
+        std::vector<unsigned char> sig_other;
+        k.Sign(Hash(std::vector<unsigned char>{'o', 't', 'h', 'e', 'r'}), sig_other);
+        Check("secp: a different message gives a different signature", sig_other != sig);
+
+        Check("secp: a foreign key does not verify it", !other.GetPubKey().Verify(msg, sig));
+        Check("secp: the wrong message does not verify",
+              !pub.Verify(Hash(std::vector<unsigned char>{'x'}), sig));
+        {
+            std::vector<unsigned char> bad = sig;
+            bad[10] ^= 0x01;
+            Check("secp: a tampered signature is rejected", !pub.Verify(msg, bad));
+        }
+        {
+            std::vector<unsigned char> truncated(sig.begin(), sig.end() - 1);
+            Check("secp: a 63-byte signature is rejected", !pub.Verify(msg, truncated));
+            std::vector<unsigned char> padded = sig;
+            padded.push_back(0x00);
+            Check("secp: a 65-byte signature is rejected", !pub.Verify(msg, padded));
+        }
+
+        // Low-S is a rule, not a habit. Flip s to n-s: the result is still a
+        // mathematically valid ECDSA signature for the same key and message —
+        // that is exactly the classic malleability — and it must be refused.
+        {
+            static const unsigned char N[32] = {
+                0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,
+                0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B, 0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41};
+            std::vector<unsigned char> high = sig;
+            int borrow = 0;
+            for (int i = 31; i >= 0; --i) {
+                const int d = int(N[i]) - int(sig[32 + i]) - borrow;
+                high[32 + i] = static_cast<unsigned char>(d & 0xff);
+                borrow = (d < 0) ? 1 : 0;
+            }
+            Check("secp: n-s differs from s (the flip did something)",
+                  !std::equal(high.begin() + 32, high.end(), sig.begin() + 32));
+            Check("secp: high-S is rejected as non-canonical", !pub.Verify(msg, high));
+        }
+
+        // An ML-DSA public key must not accept a secp signature, or vice versa.
+        {
+            std::vector<unsigned char> mldsa_sig;
+            mldsa.Sign(msg, mldsa_sig);
+            Check("secp pubkey rejects an ML-DSA signature", !pub.Verify(msg, mldsa_sig));
+            Check("ML-DSA pubkey rejects a secp signature",
+                  !mldsa.GetPubKey().Verify(msg, sig));
+        }
 
         // GetPrivKey / Load round-trip.
         const CPrivKey priv = k.GetPrivKey();
