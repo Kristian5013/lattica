@@ -53,11 +53,11 @@ int main()
     const CKey key = GenerateRandomKey();
     const CPubKey pub = key.GetPubKey();
 
-    // P2WPKH round-trip on regtest (hrp "ltart").
+    // P2WPKH round-trip on regtest (hrp "lart").
     {
         const CTxDestination dest = WitnessV0KeyHash(pub);
         const std::string addr = EncodeDestination(dest, *regtest);
-        Check("P2WPKH address is non-empty and uses the regtest HRP", addr.rfind("ltart1", 0) == 0);
+        Check("P2WPKH address is non-empty and uses the regtest HRP", addr.rfind("lart1", 0) == 0);
         const CTxDestination back = DecodeDestination(addr, *regtest);
         Check("P2WPKH decodes back to WitnessV0KeyHash", std::holds_alternative<WitnessV0KeyHash>(back));
         Check("P2WPKH re-encodes to the same address", EncodeDestination(back, *regtest) == addr);
@@ -69,7 +69,7 @@ int main()
         const CScript witnessScript = CScript() << OP_TRUE;
         const CTxDestination dest = WitnessV0ScriptHash(witnessScript);
         const std::string addr = EncodeDestination(dest, *regtest);
-        Check("P2WSH address uses regtest HRP", addr.rfind("ltart1", 0) == 0 && addr.size() > 40);
+        Check("P2WSH address uses regtest HRP", addr.rfind("lart1", 0) == 0 && addr.size() > 40);
         const CTxDestination back = DecodeDestination(addr, *regtest);
         Check("P2WSH decodes back to WitnessV0ScriptHash", std::holds_alternative<WitnessV0ScriptHash>(back));
         Check("P2WSH re-encodes to the same address", EncodeDestination(back, *regtest) == addr);
@@ -78,7 +78,7 @@ int main()
     // Pay-to-anchor (witness v1, bech32m).
     {
         const std::string addr = EncodeDestination(PayToAnchor(), *regtest);
-        Check("anchor address is non-empty (bech32m)", !addr.empty() && addr.rfind("ltart1", 0) == 0);
+        Check("anchor address is non-empty (bech32m)", !addr.empty() && addr.rfind("lart1", 0) == 0);
         const CTxDestination back = DecodeDestination(addr, *regtest);
         Check("anchor decodes back to PayToAnchor", std::holds_alternative<PayToAnchor>(back));
         Check("anchor is a valid destination string", IsValidDestinationString(addr, *regtest));
@@ -87,7 +87,7 @@ int main()
     // A mainnet address must not decode on regtest (HRP mismatch).
     {
         const std::string main_addr = EncodeDestination(WitnessV0KeyHash(pub), *main);
-        Check("mainnet P2WPKH uses the main HRP", main_addr.rfind("lta1", 0) == 0);
+        Check("mainnet P2WPKH uses the main HRP", main_addr.rfind("la1", 0) == 0);
         Check("mainnet address is invalid on regtest", !IsValidDestinationString(main_addr, *regtest));
         Check("decoding cross-network yields CNoDestination",
               std::holds_alternative<CNoDestination>(DecodeDestination(main_addr, *regtest)));

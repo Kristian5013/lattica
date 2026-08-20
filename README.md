@@ -118,7 +118,7 @@ needs at difficulty 1. It is meant for regtest, not for mining.
 | P2P port | 12333 | 22333 | 22444 |
 | RPC port | 12332 | 22332 | 22443 |
 | Address prefix | `L` | `t` | `t` |
-| bech32 prefix | `lta` | `tlta` | `ltart` |
+| bech32 prefix | `la` | `tl` | `lart` |
 | Data directory | `~/.lattica` | | |
 
 ## Repository layout

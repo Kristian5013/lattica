@@ -175,7 +175,7 @@ public:
         base58Prefixes[SECRET_KEY] = std::vector<unsigned char>(1, 176);
         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x36, 0x48, 0x00};
         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x36, 0x44, 0x00};
-        bech32_hrp = "lta";
+        bech32_hrp = "la";
 
         fDefaultConsistencyChecks = false;
         m_is_mockable_chain = false;
@@ -239,7 +239,7 @@ public:
         base58Prefixes[SECRET_KEY] = std::vector<unsigned char>(1, 255);
         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x9A, 0x00};
         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x96, 0x00};
-        bech32_hrp = "tlta";
+        bech32_hrp = "tl";
 
         fDefaultConsistencyChecks = false;
         m_is_mockable_chain = false;
@@ -302,7 +302,7 @@ public:
         base58Prefixes[SECRET_KEY] = std::vector<unsigned char>(1, 255);
         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x9A, 0x00};
         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x96, 0x00};
-        bech32_hrp = "ltart";
+        bech32_hrp = "lart";
 
         fDefaultConsistencyChecks = true;
         m_is_mockable_chain = true;
