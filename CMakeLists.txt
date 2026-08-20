@@ -114,6 +114,7 @@ include(secp256k1)
 # mldsa44 must be included first (mlkem768 depends on it).
 include(ML-DSA-44)
 include(ML-KEM-768)
+include(FALCON-512)
 
 # ---------------------------------------------------------------------------
 # System dependencies.
