@@ -1,0 +1,45 @@
+// Copyright (c) 2026 Kristian Pilatovich
+// See COPYING for license.
+
+#ifndef LATTICA_TEST_UTIL_MINING_H
+#define LATTICA_TEST_UTIL_MINING_H
+
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <vector>
+
+class CBlock;
+class CChainParams;
+class COutPoint;
+namespace node {
+struct BlockCreateOptions;
+struct NodeContext;
+} // namespace node
+
+/** Create a blockchain, starting from genesis */
+std::vector<std::shared_ptr<CBlock>> CreateBlockChain(size_t total_height, const CChainParams& params);
+
+/** Returns the generated coin */
+COutPoint MineBlock(const node::NodeContext&,
+                    const node::BlockCreateOptions& assembler_options);
+
+/**
+ * Returns the generated coin (or Null if the block was invalid).
+ * It is recommended to call RegenerateCommitments before mining the block to avoid merkle tree mismatches.
+ **/
+COutPoint MineBlock(const node::NodeContext&, std::shared_ptr<CBlock>& block);
+
+/**
+ * Returns the generated coin (or Null if the block was invalid).
+ */
+COutPoint ProcessBlock(const node::NodeContext&, const std::shared_ptr<CBlock>& block);
+
+/** Prepare a block to be mined */
+std::shared_ptr<CBlock> PrepareBlock(const node::NodeContext& node,
+                                     const node::BlockCreateOptions& assembler_options);
+
+/** RPC-like helper function, returns the generated coin */
+COutPoint generatetoaddress(const node::NodeContext&, const std::string& address);
+
+#endif // LATTICA_TEST_UTIL_MINING_H

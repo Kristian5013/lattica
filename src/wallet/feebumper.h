@@ -1,0 +1,79 @@
+// Copyright (c) 2026 Kristian Pilatovich
+// See COPYING for license.
+
+#ifndef LATTICA_WALLET_FEEBUMPER_H
+#define LATTICA_WALLET_FEEBUMPER_H
+
+#include <consensus/amount.h>
+#include <primitives/transaction.h>
+
+#include <optional>
+#include <vector>
+
+class uint256;
+enum class FeeEstimateMode;
+struct bilingual_str;
+
+namespace wallet {
+class CCoinControl;
+class CWallet;
+class CWalletTx;
+
+namespace feebumper {
+
+enum class Result
+{
+    OK,
+    INVALID_ADDRESS_OR_KEY,
+    INVALID_REQUEST,
+    INVALID_PARAMETER,
+    WALLET_ERROR,
+    MISC_ERROR,
+};
+
+//! Return whether transaction can be bumped.
+bool TransactionCanBeBumped(const CWallet& wallet, const Txid& txid);
+
+/** Create bumpfee transaction based on feerate estimates.
+ *
+ * @param[in] wallet The wallet to use for this bumping
+ * @param[in] txid The txid of the transaction to bump
+ * @param[in] coin_control A CCoinControl object which provides feerates and other information used for coin selection
+ * @param[out] errors Errors
+ * @param[out] old_fee The fee the original transaction pays
+ * @param[out] new_fee the fee that the bump transaction pays
+ * @param[out] mtx The bump transaction itself
+ * @param[in] require_mine Whether the original transaction must consist of inputs that can be spent by the wallet
+ * @param[in] outputs Vector of new outputs to replace the bumped transaction's outputs
+ * @param[in] original_change_index The position of the change output to deduct the fee from in the transaction being bumped
+ */
+Result CreateRateBumpTransaction(CWallet& wallet,
+    const Txid& txid,
+    const CCoinControl& coin_control,
+    std::vector<bilingual_str>& errors,
+    CAmount& old_fee,
+    CAmount& new_fee,
+    CMutableTransaction& mtx,
+    bool require_mine,
+    const std::vector<CTxOut>& outputs,
+    std::optional<uint32_t> original_change_index = std::nullopt);
+
+//! Sign the new transaction,
+//! @return false if the tx couldn't be found or if it was
+//! impossible to create the signature(s)
+bool SignTransaction(CWallet& wallet, CMutableTransaction& mtx);
+
+//! Commit the bumpfee transaction.
+//! @return success in case of CWallet::CommitTransaction was successful,
+//! but sets errors if the tx could not be added to the mempool (will try later)
+//! or if the old transaction could not be marked as replaced.
+Result CommitTransaction(CWallet& wallet,
+    const Txid& txid,
+    CMutableTransaction&& mtx,
+    std::vector<bilingual_str>& errors,
+    Txid& bumped_txid);
+
+} // namespace feebumper
+} // namespace wallet
+
+#endif // LATTICA_WALLET_FEEBUMPER_H

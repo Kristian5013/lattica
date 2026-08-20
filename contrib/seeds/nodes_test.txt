@@ -1,0 +1,3 @@
+# Lattica testnet fixed seed nodes — none yet (pre-launch).
+# Regenerate this list from a DNS-seeder/crawler dump with makeseeds.py, then
+# bake it into src/chainparamsseeds.h with generate-seeds.py (see README.md).

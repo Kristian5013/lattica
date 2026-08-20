@@ -1,0 +1,17 @@
+// Copyright (c) 2026 Kristian Pilatovich
+// See COPYING for license.
+//
+// Embed the application manifest so Windows runs lattica-qt with a UTF-8 active
+// code page (SetupEnvironment() asserts GetACP() == CP_UTF8).
+
+#include <winuser.h> // for CREATEPROCESS_MANIFEST_RESOURCE_ID and RT_MANIFEST
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "latticad.manifest"
+
+// Application icons shown by Windows for the executable and its shortcuts.
+// The lowest-ID icon (1) is the default exe icon. The installer's per-network
+// shortcuts reference these by 0-based index: 0 = main, 1 = testnet, 2 = regtest
+// (matching the runtime network tints in qt/networkstyle.cpp).
+1 ICON DISCARDABLE "qt/res/icons/lattica.ico"
+2 ICON DISCARDABLE "qt/res/icons/lattica_testnet.ico"
+3 ICON DISCARDABLE "qt/res/icons/lattica_regtest.ico"

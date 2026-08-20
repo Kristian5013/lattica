@@ -1,0 +1,93 @@
+#!/sbin/openrc-run
+
+# backward compatibility for existing gentoo layout
+#
+if [ -d "/var/lib/lattica/.lattica" ]; then
+	LATTICAD_DEFAULT_DATADIR="/var/lib/lattica/.lattica"
+else
+	LATTICAD_DEFAULT_DATADIR="/var/lib/latticad"
+fi
+
+LATTICAD_CONFIGFILE=${LATTICAD_CONFIGFILE:-/etc/lattica/lattica.conf}
+LATTICAD_PIDDIR=${LATTICAD_PIDDIR:-/var/run/latticad}
+LATTICAD_PIDFILE=${LATTICAD_PIDFILE:-${LATTICAD_PIDDIR}/latticad.pid}
+LATTICAD_DATADIR=${LATTICAD_DATADIR:-${LATTICAD_DEFAULT_DATADIR}}
+LATTICAD_USER=${LATTICAD_USER:-${LATTICA_USER:-lattica}}
+LATTICAD_GROUP=${LATTICAD_GROUP:-lattica}
+LATTICAD_BIN=${LATTICAD_BIN:-/usr/bin/latticad}
+LATTICAD_NICE=${LATTICAD_NICE:-${NICELEVEL:-0}}
+LATTICAD_OPTS="${LATTICAD_OPTS:-${LATTICA_OPTS}}"
+
+name="Lattica Core Daemon"
+description="Lattica cryptocurrency P2P network daemon"
+
+command="/usr/bin/latticad"
+command_args="-pid=\"${LATTICAD_PIDFILE}\" \
+		-conf=\"${LATTICAD_CONFIGFILE}\" \
+		-datadir=\"${LATTICAD_DATADIR}\" \
+		-daemon \
+		${LATTICAD_OPTS}"
+
+required_files="${LATTICAD_CONFIGFILE}"
+start_stop_daemon_args="-u ${LATTICAD_USER} \
+			-N ${LATTICAD_NICE} -w 2000"
+pidfile="${LATTICAD_PIDFILE}"
+
+# The retry schedule to use when stopping the daemon. Could be either
+# a timeout in seconds or multiple signal/timeout pairs (like
+# "SIGKILL/180 SIGTERM/300")
+retry="${LATTICAD_SIGTERM_TIMEOUT}"
+
+depend() {
+	need localmount net
+}
+
+# verify
+# 1) that the datadir exists and is writable (or create it)
+# 2) that a directory for the pid exists and is writable
+# 3) ownership and permissions on the config file
+start_pre() {
+	checkpath \
+	-d \
+	--mode 0750 \
+	--owner "${LATTICAD_USER}:${LATTICAD_GROUP}" \
+	"${LATTICAD_DATADIR}"
+
+	checkpath \
+	-d \
+	--mode 0755 \
+	--owner "${LATTICAD_USER}:${LATTICAD_GROUP}" \
+	"${LATTICAD_PIDDIR}"
+
+	checkpath -f \
+	-o "${LATTICAD_USER}:${LATTICAD_GROUP}" \
+	-m 0660 \
+	"${LATTICAD_CONFIGFILE}"
+
+	checkconfig || return 1
+}
+
+checkconfig()
+{
+	if grep -qs '^rpcuser=' "${LATTICAD_CONFIGFILE}" && \
+		! grep -qs '^rpcpassword=' "${LATTICAD_CONFIGFILE}" ; then
+		eerror ""
+		eerror "ERROR: You must set a secure rpcpassword to run latticad."
+		eerror "The setting must appear in ${LATTICAD_CONFIGFILE}"
+		eerror ""
+		eerror "This password is security critical to securing wallets "
+		eerror "and must not be the same as the rpcuser setting."
+		eerror "You can generate a suitable random password using the following "
+		eerror "command from the shell:"
+		eerror ""
+		eerror "bash -c 'tr -dc a-zA-Z0-9 < /dev/urandom | head -c32 && echo'"
+		eerror ""
+		eerror "It is recommended that you also set alertnotify so you are "
+		eerror "notified of problems:"
+		eerror ""
+		eerror "ie: alertnotify=echo %%s | mail -s \"Lattica Alert\"" \
+			"admin@foo.com"
+		eerror ""
+		return 1
+	fi
+}

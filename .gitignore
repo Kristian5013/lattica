@@ -1,0 +1,31 @@
+# Build trees
+/build/
+build/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Compiled output
+*.o
+*.obj
+*.a
+*.exe
+
+# Precompiled headers (e.g. left by tools running g++ -fsyntax-only)
+*.gch
+
+# Windows installer staging + GUI build dir (build artifacts)
+/dist/
+/build-*/
+__pycache__/
+*.pyc
+
+# Editor / agent tooling — not part of the repo
+.claude/
+.vscode/
+
+# vendored research repo, has its own history
+cas-sha256/

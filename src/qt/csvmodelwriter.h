@@ -1,0 +1,45 @@
+// Copyright (c) 2026 Kristian Pilatovich
+// See COPYING for license.
+
+#ifndef LATTICA_QT_CSVMODELWRITER_H
+#define LATTICA_QT_CSVMODELWRITER_H
+
+#include <QList>
+#include <QObject>
+
+QT_BEGIN_NAMESPACE
+class QAbstractItemModel;
+QT_END_NAMESPACE
+
+/** Export a Qt table model to a CSV file. This is useful for analyzing or post-processing the data in
+    a spreadsheet.
+ */
+class CSVModelWriter : public QObject
+{
+    Q_OBJECT
+
+public:
+    explicit CSVModelWriter(const QString &filename, QObject *parent = nullptr);
+
+    void setModel(const QAbstractItemModel *model);
+    void addColumn(const QString &title, int column, int role=Qt::EditRole);
+
+    /** Perform export of the model to CSV.
+        @returns true on success, false otherwise
+    */
+    bool write();
+
+private:
+    QString filename;
+    const QAbstractItemModel* model{nullptr};
+
+    struct Column
+    {
+        QString title;
+        int column;
+        int role;
+    };
+    QList<Column> columns;
+};
+
+#endif // LATTICA_QT_CSVMODELWRITER_H

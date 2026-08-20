@@ -1,0 +1,33 @@
+# /etc/conf.d/latticad: config file for /etc/init.d/latticad
+
+# Config file location
+#LATTICAD_CONFIGFILE="/etc/lattica/lattica.conf"
+
+# What directory to write pidfile to?  (created and owned by $LATTICAD_USER)
+#LATTICAD_PIDDIR="/var/run/latticad"
+
+# What filename to give the pidfile
+#LATTICAD_PIDFILE="${LATTICAD_PIDDIR}/latticad.pid"
+
+# Where to write latticad data (be mindful that the blockchain is large)
+#LATTICAD_DATADIR="/var/lib/latticad"
+
+# User and group to own latticad process
+#LATTICAD_USER="lattica"
+#LATTICAD_GROUP="lattica"
+
+# Path to latticad executable
+#LATTICAD_BIN="/usr/bin/latticad"
+
+# Nice value to run latticad under
+#LATTICAD_NICE=0
+
+# Additional options (avoid -conf and -datadir, use flags above)
+#LATTICAD_OPTS=""
+
+# The timeout in seconds OpenRC will wait for latticad to terminate
+# after a SIGTERM has been raised.
+# Note that this will be mapped as argument to start-stop-daemon's
+# '--retry' option, which means you can specify a retry schedule
+# here. For more information see man 8 start-stop-daemon.
+LATTICAD_SIGTERM_TIMEOUT=600

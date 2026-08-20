@@ -1,0 +1,36 @@
+// Copyright (c) 2026 Kristian Pilatovich
+// See COPYING for license.
+
+#ifndef LATTICA_INTERFACES_HANDLER_H
+#define LATTICA_INTERFACES_HANDLER_H
+
+#include <functional>
+#include <memory>
+
+namespace btcsignals {
+    class connection;
+} // namespace btcsignals
+
+namespace interfaces {
+
+//! Generic interface for managing an event handler or callback function
+//! registered with another interface. Has a single disconnect method to cancel
+//! the registration and prevent any future notifications.
+class Handler
+{
+public:
+    virtual ~Handler() = default;
+
+    //! Disconnect the handler.
+    virtual void disconnect() = 0;
+};
+
+//! Return handler wrapping a btcsignals connection.
+std::unique_ptr<Handler> MakeSignalHandler(btcsignals::connection connection);
+
+//! Return handler wrapping a cleanup function.
+std::unique_ptr<Handler> MakeCleanupHandler(std::function<void()> cleanup);
+
+} // namespace interfaces
+
+#endif // LATTICA_INTERFACES_HANDLER_H

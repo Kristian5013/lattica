@@ -1,0 +1,10 @@
+// Copyright (c) 2026 Kristian Pilatovich
+// See COPYING for license.
+//
+// Embed the application manifest so Windows runs lattica-wallet with a UTF-8
+// active code page (SetupEnvironment() asserts GetACP() == CP_UTF8). Shares the
+// same manifest as latticad.
+
+#include <winuser.h> // for CREATEPROCESS_MANIFEST_RESOURCE_ID and RT_MANIFEST
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "latticad.manifest"

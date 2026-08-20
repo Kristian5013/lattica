@@ -1,0 +1,63 @@
+// Copyright (c) 2026 Kristian Pilatovich
+// See COPYING for license.
+
+#include <common/args.h>
+#include <util/log.h>
+#include <walletinitinterface.h>
+
+class ArgsManager;
+
+namespace interfaces {
+class Chain;
+class Handler;
+class Wallet;
+class WalletLoader;
+}
+
+class DummyWalletInit : public WalletInitInterface {
+public:
+
+    bool HasWalletSupport() const override {return false;}
+    void AddWalletOptions(ArgsManager& argsman) const override;
+    bool ParameterInteraction() const override {return true;}
+    void Construct(node::NodeContext& node) const override { LogInfo("No wallet support compiled in!"); }
+};
+
+void DummyWalletInit::AddWalletOptions(ArgsManager& argsman) const
+{
+    argsman.AddHiddenArgs({
+        "-addresstype",
+        "-avoidpartialspends",
+        "-changetype",
+        "-consolidatefeerate=<amt>",
+        "-disablewallet",
+        "-discardfee=<amt>",
+        "-fallbackfee=<amt>",
+        "-keypool=<n>",
+        "-maxapsfee=<n>",
+        "-maxtxfee=<amt>",
+        "-mintxfee=<amt>",
+        "-signer=<cmd>",
+        "-spendzeroconfchange",
+        "-txconfirmtarget=<n>",
+        "-wallet=<path>",
+        "-walletbroadcast",
+        "-walletdir=<dir>",
+        "-walletnotify=<cmd>",
+        "-walletrbf",
+        "-walletrejectlongchains",
+        "-walletcrosschain",
+        "-unsafesqlitesync",
+    });
+}
+
+const WalletInitInterface& g_wallet_init_interface = DummyWalletInit();
+
+namespace interfaces {
+
+std::unique_ptr<WalletLoader> MakeWalletLoader(Chain& chain, ArgsManager& args)
+{
+    throw std::logic_error("Wallet function called in non-wallet build.");
+}
+
+} // namespace interfaces

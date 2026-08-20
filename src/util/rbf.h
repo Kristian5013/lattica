@@ -1,0 +1,22 @@
+// Copyright (c) 2026 Kristian Pilatovich
+// See COPYING for license.
+
+#ifndef LATTICA_UTIL_RBF_H
+#define LATTICA_UTIL_RBF_H
+
+#include <cstdint>
+
+class CTransaction;
+
+static constexpr uint32_t MAX_BIP125_RBF_SEQUENCE{0xfffffffd};
+
+/** Check whether the sequence numbers on this transaction are signaling opt-in to replace-by-fee,
+ * according to BIP 125.  Allow opt-out of transaction replacement by setting nSequence >
+ * MAX_BIP125_RBF_SEQUENCE (SEQUENCE_FINAL-2) on all inputs.
+*
+* SEQUENCE_FINAL-1 is picked to still allow use of nLockTime by non-replaceable transactions. All
+* inputs rather than just one is for the sake of multi-party protocols, where we don't want a single
+* party to be able to disable replacement by opting out in their own input. */
+bool SignalsOptInRBF(const CTransaction& tx);
+
+#endif // LATTICA_UTIL_RBF_H

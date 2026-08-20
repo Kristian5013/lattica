@@ -1,0 +1,21 @@
+// Copyright (c) 2026 Kristian Pilatovich
+// See COPYING for license.
+
+#include <bench/bench.h>
+#include <test/util/setup_common.h>
+#include <validation.h>
+
+#include <memory>
+
+static void CheckBlockIndex(benchmark::Bench& bench)
+{
+    auto testing_setup{MakeNoLogFileContext<TestChain100Setup>()};
+    // Mine some more blocks
+    testing_setup->mineBlocks(1000);
+    bench.run([&] {
+        testing_setup->m_node.chainman->CheckBlockIndex();
+    });
+}
+
+
+BENCHMARK(CheckBlockIndex);
