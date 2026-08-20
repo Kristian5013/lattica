@@ -18,6 +18,15 @@ int PQCLEAN_FALCONPADDED512_CLEAN_crypto_sign_verify(
 #include <cstdint>
 #include <span>
 
+std::optional<SigScheme> SchemeFromPubKeySize(size_t len)
+{
+    if (len == 0) return std::nullopt;
+    for (const SigScheme s : ALL_SIG_SCHEMES) {
+        if (SchemePublicKeySize(s) == len) return s;
+    }
+    return std::nullopt;
+}
+
 bool IsKnownScheme(SigScheme s)
 {
     switch (s) {
@@ -102,20 +111,20 @@ bool CPubKey::Verify(const uint256& hash, std::span<const unsigned char> sig) co
             // (GetLen() requires the scheme's exact 1312-byte key, as the
             // conformance suite requires).
             return PQCLEAN_MLDSA44_CLEAN_crypto_sign_verify(
-                       sig.data(), sig.size(), hash.begin(), hash.size(), RawKey().data()) == 0;
+                       sig.data(), sig.size(), hash.begin(), hash.size(), data()) == 0;
         case SigScheme::FALCON_512:
             // PQClean checks the length itself and returns 0 on a valid
             // signature. The padded variant accepts only its own fixed length,
             // which the vendored-library test pins.
             return PQCLEAN_FALCONPADDED512_CLEAN_crypto_sign_verify(
-                       sig.data(), sig.size(), hash.begin(), hash.size(), RawKey().data()) == 0;
+                       sig.data(), sig.size(), hash.begin(), hash.size(), data()) == 0;
         case SigScheme::SECP256K1: {
             // Verification only, so the static context is enough — no global
             // signing context is needed anywhere in consensus code.
             if (sig.size() != SchemeSignatureSize(SigScheme::SECP256K1)) return false;
             secp256k1_pubkey pubkey;
             if (!secp256k1_ec_pubkey_parse(secp256k1_context_static, &pubkey,
-                                           RawKey().data(), RawKey().size())) {
+                                           data(), size())) {
                 return false;
             }
             secp256k1_ecdsa_signature parsed;

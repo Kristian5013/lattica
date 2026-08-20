@@ -44,17 +44,31 @@ MessageVerificationResult MessageVerify(
         return MessageVerificationResult::ERR_MALFORMED_SIGNATURE;
     }
 
-    // ML-DSA signatures are not public-key-recoverable (unlike ECDSA's compact form),
-    // so a Lattica signed message carries the public key followed by the signature.
-    // Extract and verify them explicitly instead of recovering the key.
-    if (signature_bytes->size() <= CPubKey::SIZE) {
+    // Post-quantum signatures are not public-key-recoverable (unlike ECDSA's
+    // compact form), so a signed message carries the public key followed by the
+    // signature and both are checked explicitly.
+    //
+    // The boundary between them comes from the total length rather than a fixed
+    // offset: each scheme's (public key + signature) sum is distinct — 97 for
+    // secp256k1, 1563 for Falcon-512, 3732 for ML-DSA-44 — so exactly one split
+    // can be right. A fixed CPubKey::SIZE offset would only ever have worked for
+    // the largest scheme.
+    std::optional<SigScheme> scheme;
+    for (const SigScheme s : ALL_SIG_SCHEMES) {
+        if (signature_bytes->size() == SchemePublicKeySize(s) + SchemeSignatureSize(s)) {
+            scheme = s;
+            break;
+        }
+    }
+    if (!scheme) {
         return MessageVerificationResult::ERR_MALFORMED_SIGNATURE;
     }
-    CPubKey pubkey(signature_bytes->begin(), signature_bytes->begin() + CPubKey::SIZE);
+    const size_t pk_len{SchemePublicKeySize(*scheme)};
+    CPubKey pubkey(signature_bytes->begin(), signature_bytes->begin() + pk_len);
     if (!pubkey.IsValid()) {
         return MessageVerificationResult::ERR_PUBKEY_NOT_RECOVERED;
     }
-    if (!pubkey.Verify(MessageHash(message), std::span<const unsigned char>(*signature_bytes).subspan(CPubKey::SIZE))) {
+    if (!pubkey.Verify(MessageHash(message), std::span<const unsigned char>(*signature_bytes).subspan(pk_len))) {
         return MessageVerificationResult::ERR_NOT_SIGNED;
     }
 

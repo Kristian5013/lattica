@@ -15,6 +15,7 @@ extern "C" {
 #include "api.h"
 }
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <span>
@@ -22,10 +23,11 @@ extern "C" {
 
 namespace {
 int g_fail = 0;
-void Check(const char* name, bool ok)
+bool Check(const char* name, bool ok)
 {
     std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", name);
     if (!ok) ++g_fail;
+    return ok;
 }
 } // namespace
 
@@ -84,10 +86,10 @@ int main()
 
     // GetID = first 20 bytes of SHA3-256(scheme || pubkey), checked independently.
     {
-        const uint8_t sc = (uint8_t)SigScheme::ML_DSA_44;
+        // The key is hashed as it stands: no scheme byte in front of it, since
+        // the scheme is the length.
         unsigned char digest[SHA3_256::OUTPUT_SIZE];
         SHA3_256 h;
-        h.Write(std::span<const unsigned char>(&sc, 1));
         h.Write(std::span<const unsigned char>(pk.data(), pk.size()));
         h.Finalize(digest);
         unsigned char expected[CRIPEMD160::OUTPUT_SIZE];
@@ -95,7 +97,36 @@ int main()
         CKeyID id = key.GetID();
         bool match = true;
         for (size_t i = 0; i < uint160::size(); ++i) if (id.begin()[i] != expected[i]) match = false;
-        Check("GetID == RIPEMD160(SHA3-256(scheme||pubkey))", match);
+        Check("GetID == RIPEMD160(SHA3-256(pubkey))", match);
+    }
+
+    // Length is the whole of the dispatch: no byte in front of the key says
+    // which scheme it is, so the sizes must stay pairwise distinct and nothing
+    // else may be accepted.
+    {
+        Check("33 -> secp256k1", SchemeFromPubKeySize(33) == SigScheme::SECP256K1);
+        Check("897 -> Falcon-512", SchemeFromPubKeySize(897) == SigScheme::FALCON_512);
+        Check("1312 -> ML-DSA-44", SchemeFromPubKeySize(1312) == SigScheme::ML_DSA_44);
+
+        // The rule any future scheme has to obey.
+        std::vector<size_t> sizes;
+        for (const SigScheme sc : ALL_SIG_SCHEMES) sizes.push_back(SchemePublicKeySize(sc));
+        std::sort(sizes.begin(), sizes.end());
+        Check("no two schemes share a public-key length",
+              std::adjacent_find(sizes.begin(), sizes.end()) == sizes.end());
+
+        for (const size_t bad : {size_t{0}, size_t{1}, size_t{32}, size_t{34}, size_t{65},
+                                 size_t{896}, size_t{898}, size_t{1311}, size_t{1313}, size_t{2048}}) {
+            if (!Check("a length no scheme uses is refused", !SchemeFromPubKeySize(bad))) break;
+        }
+
+        // ...and CPubKey agrees, which is what keeps a wrong-length push off the
+        // stack in the first place.
+        Check("CPubKey rejects a 34-byte key (the old tagged secp length)",
+              !CPubKey(std::vector<unsigned char>(34, 0x02)).IsValid());
+        Check("CPubKey rejects a 1313-byte key (the old tagged ML-DSA length)",
+              !CPubKey(std::vector<unsigned char>(1313, 0x01)).IsValid());
+        Check("CPubKey accepts a 33-byte key", CPubKey(std::vector<unsigned char>(33, 0x02)).IsValid());
     }
 
     std::printf("%s\n", g_fail == 0 ? "ALL PASS" : "FAILURES");

@@ -32,11 +32,11 @@ std::string GetTxnOutputType(TxoutType t)
 
 static bool MatchPayToPubkey(const CScript& script, valtype& pubkey)
 {
-    // Lattica: a single ML-DSA public-key size (CPubKey::SIZE), pushed via
-    // OP_PUSHDATA2 — there is no compressed form, and the key exceeds the
-    // single-byte push range, so we parse the push with GetOp rather than the
-    // byte-offset shortcut Core uses for small secp256k1 keys. (Bare P2PK is
-    // unspendable under the witness-only design, but is still classified here.)
+    // A public key here may be any implemented scheme's, and ValidSize() decides
+    // by length. The push is parsed with GetOp rather than Core's byte-offset
+    // shortcut because a lattice key exceeds the single-byte push range and
+    // arrives via OP_PUSHDATA2. (Bare P2PK is unspendable for the lattice
+    // schemes — their signatures do not fit a BASE script — but is classified.)
     opcodetype opcode;
     valtype data;
     CScript::const_iterator it = script.begin();

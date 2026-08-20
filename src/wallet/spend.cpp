@@ -46,8 +46,8 @@ static constexpr size_t OUTPUT_GROUP_MAX_ENTRIES{100};
 
 // Lattica spends are witness-only P2WPKH with ML-DSA-44 signatures: every input
 // carries a fixed two-item witness stack { signature, pubkey }. The witness signature
-// is the ML-DSA signature (CKey::SIGNATURE_SIZE) followed by the one-byte sighash flag;
-// the pubkey is a serialized CPubKey (scheme byte + raw key, CPubKey::SIZE). With
+// is the ML-DSA signature followed by the one-byte sighash flag; the pubkey is the
+// scheme's own 1312 bytes, with nothing in front of it. With
 // WITNESS_SCALE_FACTOR == 1 there is no witness discount, so size == weight == vsize.
 // Unlike Bitcoin there is no descriptor inference and no signature grinding (ML-DSA
 // signatures are deterministic and fixed length), so every wallet input has the same
@@ -60,7 +60,7 @@ static constexpr size_t OUTPUT_GROUP_MAX_ENTRIES{100};
 static int64_t MaxP2WPKHInputWeight()
 {
     const int64_t sig_size = SchemeSignatureSize(SigScheme::ML_DSA_44) + 1; // signature || sighash byte
-    const int64_t pubkey_size = CPubKey::SIZE;         // scheme byte + raw ML-DSA key
+    const int64_t pubkey_size = SchemePublicKeySize(SigScheme::ML_DSA_44);
     const int64_t base = 36 + 1 + 4;
     const int64_t witness = GetSizeOfCompactSize(2)
         + GetSizeOfCompactSize(sig_size) + sig_size

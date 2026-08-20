@@ -40,8 +40,8 @@ int main()
 
     valtype pk(PK), sk(SK);
     PQCLEAN_MLDSA44_CLEAN_crypto_sign_keypair(pk.data(), sk.data());
-    valtype pubkey_stack; pubkey_stack.push_back((unsigned char)SigScheme::ML_DSA_44);
-    pubkey_stack.insert(pubkey_stack.end(), pk.begin(), pk.end());
+    // The on-stack public key is the scheme's own bytes, with nothing prefixed.
+    const valtype pubkey_stack(pk.begin(), pk.end());
     valtype pkh(Hash160(pubkey_stack).begin(), Hash160(pubkey_stack).end());
 
     // A P2WPKH spend: scriptCode is the implied P2PKH script, sighash over BIP-143.

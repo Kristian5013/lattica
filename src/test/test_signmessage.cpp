@@ -10,6 +10,7 @@
 
 #include <chainparams.h>
 #include <key.h>
+#include <util/strencodings.h>
 #include <key_io.h>
 #include <pubkey.h>
 #include <util/chaintype.h>
@@ -54,6 +55,41 @@ int main()
         Check("sign with a second key", MessageSign(other, message, other_sig));
         Check("MessageVerify rejects a foreign key's signature",
               MessageVerify(address, other_sig, message) == MessageVerificationResult::ERR_NOT_SIGNED);
+    }
+
+    // Every scheme, not just ML-DSA. The blob is (public key || signature) with
+    // no length field between them, and the split used to be a fixed
+    // CPubKey::SIZE offset — which only ever landed correctly for the largest
+    // scheme, so secp256k1 and Falcon messages were rejected as malformed. The
+    // boundary now comes from the total length, and each scheme's key+signature
+    // sum is distinct: 97, 1563, 3732.
+    {
+        ECC_Context ecc_context{};
+        for (const SigScheme scheme : ALL_SIG_SCHEMES) {
+            const CKey k = GenerateRandomKey(scheme);
+            const std::string addr = EncodeDestination(WitnessV0KeyHash(k.GetPubKey()), Params());
+            std::string sig;
+            Check("sign a message with this scheme", MessageSign(k, message, sig));
+
+            const auto blob = DecodeBase64(sig);
+            Check("blob is key + signature, no padding",
+                  blob && blob->size() == SchemePublicKeySize(scheme) + SchemeSignatureSize(scheme));
+
+            Check("verify a message with this scheme",
+                  MessageVerify(addr, sig, message) == MessageVerificationResult::OK);
+            Check("a tampered message is rejected",
+                  MessageVerify(addr, sig, message + "!") != MessageVerificationResult::OK);
+
+            // The address commits to the key, so another scheme's address must
+            // not accept this signature.
+            for (const SigScheme other_scheme : ALL_SIG_SCHEMES) {
+                if (other_scheme == scheme) continue;
+                const CKey o = GenerateRandomKey(other_scheme);
+                const std::string oaddr = EncodeDestination(WitnessV0KeyHash(o.GetPubKey()), Params());
+                Check("another scheme's address does not accept it",
+                      MessageVerify(oaddr, sig, message) != MessageVerificationResult::OK);
+            }
+        }
     }
 
     // Garbage / malformed inputs are rejected, not crashed on.

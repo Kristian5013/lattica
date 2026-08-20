@@ -160,14 +160,14 @@ int main()
 
         // Validate the spend size model against the real signed tx: each P2WPKH-ML-DSA
         // input's witness carries { sig (ML-DSA signature + 1 sighash byte), pubkey
-        // (CPubKey::SIZE) } -> the 3782-vbyte/input figure spend.cpp's size model assumes.
+        // (1312) } -> the per-input figure spend.cpp's size model assumes.
         bool witness_sizes_ok = !tx.vin.empty();
         for (const auto& in : tx.vin) {
             if (in.scriptWitness.stack.size() != 2) { witness_sizes_ok = false; continue; }
             if (in.scriptWitness.stack[0].size() != size_t(SchemeSignatureSize(SigScheme::ML_DSA_44) + 1)) witness_sizes_ok = false;
-            if (in.scriptWitness.stack[1].size() != size_t(CPubKey::SIZE)) witness_sizes_ok = false;
+            if (in.scriptWitness.stack[1].size() != SchemePublicKeySize(SigScheme::ML_DSA_44)) witness_sizes_ok = false;
         }
-        Check("ML-DSA witness sizes match the size model (sig 2421 + pubkey 1313)", witness_sizes_ok);
+        Check("ML-DSA witness sizes match the size model (sig 2421 + pubkey 1312)", witness_sizes_ok);
 
         bool all_verify = !tx.vin.empty();
         for (size_t i = 0; i < tx.vin.size(); ++i) {

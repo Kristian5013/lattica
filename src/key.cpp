@@ -367,8 +367,7 @@ bool CKey::VerifyPubKey(const CPubKey& pubkey) const
         // Derivable, so this is an equality test rather than a proof.
         std::array<unsigned char, 33> pk;
         if (!DeriveSecpPubKey(data(), pk)) return false;
-        const auto raw = pubkey.RawKey();
-        return raw.size() == pk.size() && std::memcmp(pk.data(), raw.data(), pk.size()) == 0;
+        return pubkey.size() == pk.size() && std::memcmp(pk.data(), pubkey.data(), pk.size()) == 0;
     }
 
     // Neither lattice scheme hands back a public key, so prove the pairing

@@ -23,6 +23,7 @@ extern "C" {
 #include "api.h"
 }
 
+#include <cassert>
 #include <cstdio>
 #include <cstdint>
 #include <span>
@@ -56,12 +57,13 @@ bool Eval(const CScript& script, std::vector<valtype>& stack, ScriptError* err =
 }
 
 // (scheme byte || raw key) — the on-stack public key form.
+//! A public key as it appears on the stack: the scheme's own bytes, nothing in
+//! front. The scheme follows from the length, so this is now just a copy — kept
+//! as a named helper so the call sites still say which scheme they mean.
 valtype PubkeyStack(SigScheme scheme, const valtype& rawkey)
 {
-    valtype v;
-    v.push_back((unsigned char)scheme);
-    v.insert(v.end(), rawkey.begin(), rawkey.end());
-    return v;
+    assert(rawkey.size() == SchemePublicKeySize(scheme));
+    return rawkey;
 }
 
 valtype Hash160Vec(const valtype& data)
@@ -254,8 +256,8 @@ int main()
         if (!ok) std::printf("    witness verify error: %s\n", ScriptErrorString(err).c_str());
 
         // 99 bytes of witness against ML-DSA's 3741 for the same spend.
-        Check("secp witness is sig 65 + pubkey 34",
-              sig.size() == 65 && pubkey_secp.size() == 34);
+        Check("secp witness is sig 65 + pubkey 33",
+              sig.size() == 65 && pubkey_secp.size() == 33);
 
         {
             CScriptWitness bad = witness;
@@ -326,8 +328,8 @@ int main()
         Check("P2WPKH with a Falcon-512 key verifies", ok);
         if (!ok) std::printf("    witness verify error: %s\n", ScriptErrorString(err).c_str());
 
-        Check("falcon witness is sig 667 + pubkey 898",
-              sig.size() == 667 && pubkey_f.size() == 898);
+        Check("falcon witness is sig 667 + pubkey 897",
+              sig.size() == 667 && pubkey_f.size() == 897);
 
         // Both items stay under MAX_WITNESS_ITEM, so Falcon needs no change to
         // the consensus limits that ML-DSA already forced.

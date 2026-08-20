@@ -59,8 +59,8 @@ int main()
 
     CPubKey pub = key.GetPubKey();
     Check("public key is valid", pub.IsValid());
-    Check("public key size == 1 + 1312", pub.size() == 1 + SchemePublicKeySize(SigScheme::ML_DSA_44));
-    Check("public key scheme tag is ML-DSA-44", pub.GetScheme() == SigScheme::ML_DSA_44);
+    Check("public key size == 1312", pub.size() == SchemePublicKeySize(SigScheme::ML_DSA_44));
+    Check("scheme is read off the length", pub.GetScheme() == SigScheme::ML_DSA_44);
 
     // Sign a sighash and verify it under the public key.
     const uint256 hash = Hash(std::span<const unsigned char>(pub.data(), pub.size()));
@@ -163,16 +163,15 @@ int main()
     {
         CKey k = GenerateRandomKey(SigScheme::SECP256K1);
         Check("secp: generated key is valid", k.IsValid());
-        Check("secp: scheme tag is SECP256K1", k.GetScheme() == SigScheme::SECP256K1);
+        Check("secp: scheme is SECP256K1", k.GetScheme() == SigScheme::SECP256K1);
         Check("secp: secret is 32 bytes", k.size() == 32);
 
         const CPubKey pub = k.GetPubKey();
         Check("secp: pubkey is valid", pub.IsValid());
-        Check("secp: serialized pubkey is 1 + 33 bytes", pub.size() == 34);
-        Check("secp: leading byte is the scheme tag",
-              pub[0] == static_cast<unsigned char>(SigScheme::SECP256K1));
-        Check("secp: raw key is compressed SEC (0x02/0x03)",
-              pub.RawKey()[0] == 0x02 || pub.RawKey()[0] == 0x03);
+        Check("secp: pubkey is 33 bytes, no tag in front", pub.size() == 33);
+        Check("secp: 33 bytes means secp256k1", pub.GetScheme() == SigScheme::SECP256K1);
+        Check("secp: key is compressed SEC (0x02/0x03)",
+              pub[0] == 0x02 || pub[0] == 0x03);
 
         Check("secp: VerifyPubKey accepts its own", k.VerifyPubKey(pub));
 
@@ -300,17 +299,16 @@ int main()
     {
         CKey k = GenerateRandomKey(SigScheme::FALCON_512);
         Check("falcon: generated key is valid", k.IsValid());
-        Check("falcon: scheme tag is FALCON_512", k.GetScheme() == SigScheme::FALCON_512);
+        Check("falcon: scheme is FALCON_512", k.GetScheme() == SigScheme::FALCON_512);
         Check("falcon: secret is 1281 bytes", k.size() == 1281);
 
         const CPubKey pub = k.GetPubKey();
         Check("falcon: pubkey is valid", pub.IsValid());
-        Check("falcon: serialized pubkey is 1 + 897 bytes", pub.size() == 898);
-        Check("falcon: leading byte is the scheme tag",
-              pub[0] == static_cast<unsigned char>(SigScheme::FALCON_512));
+        Check("falcon: pubkey is 897 bytes, no tag in front", pub.size() == 897);
+        Check("falcon: 897 bytes means Falcon-512", pub.GetScheme() == SigScheme::FALCON_512);
         // A Falcon public key is a packed polynomial whose first byte encodes
         // the degree; 0x09 is n = 512.
-        Check("falcon: raw key says n = 512", pub.RawKey()[0] == 0x09);
+        Check("falcon: key says n = 512", pub[0] == 0x09);
         Check("falcon: VerifyPubKey accepts its own", k.VerifyPubKey(pub));
 
         const uint256 msg = Hash(std::vector<unsigned char>{'f', 'a', 'l'});

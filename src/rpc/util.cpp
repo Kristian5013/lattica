@@ -219,9 +219,12 @@ CPubKey HexToPubKey(const std::string& hex_in)
     if (!IsHex(hex_in)) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Pubkey \"" + hex_in + "\" must be a hex string");
     }
-    // Lattica public keys are ML-DSA, a fixed CPubKey::SIZE bytes (not 33/65-byte EC points).
-    if (hex_in.length() != CPubKey::SIZE * 2) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("Pubkey \"%s\" must have a length of %d bytes", hex_in, CPubKey::SIZE));
+    // A public key is whatever length its scheme uses — 33, 897 or 1312 — and
+    // the length is what names the scheme, so any of them is acceptable here and
+    // nothing else is.
+    if (!SchemeFromPubKeySize(hex_in.length() / 2)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                           strprintf("Pubkey \"%s\" is not the length of any supported scheme", hex_in));
     }
     CPubKey vchPubKey(ParseHex(hex_in));
     if (!vchPubKey.IsValid()) {
