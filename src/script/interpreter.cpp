@@ -11,6 +11,7 @@
 #include <script/interpreter.h>
 
 #include <crypto/ripemd160.h>
+#include <crypto/sha256.h>
 #include <crypto/sha3.h>
 #include <prevector.h>
 #include <pubkey.h>
@@ -1080,13 +1081,20 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     valtype& vch = stacktop(-1);
                     // OP_HASH256 is SHA3-256 and OP_HASH160 is RIPEMD160 of it,
                     // both through hash.h so the opcode cannot drift from the
-                    // value the address layer commits to. OP_RIPEMD160, OP_SHA1
-                    // and OP_SHA256 stay disabled: they would put a second and a
-                    // third hash function into consensus.
-                    if (opcode == OP_RIPEMD160 || opcode == OP_SHA1 || opcode == OP_SHA256)
+                    // value the address layer commits to.
+                    //
+                    // OP_SHA256 is Bitcoin's SHA-256. It is not a chain hash
+                    // here, it is the primitive every HTLC is written against,
+                    // and a cross-chain swap needs both sides to hash a preimage
+                    // the same way. OP_RIPEMD160 and OP_SHA1 stay disabled:
+                    // SHA-1 is broken, and RIPEMD-160 is reachable through
+                    // OP_HASH160 wherever it is wanted.
+                    if (opcode == OP_RIPEMD160 || opcode == OP_SHA1)
                         return set_error(serror, SCRIPT_ERR_DISABLED_OPCODE);
                     valtype vchHash(opcode == OP_HASH160 ? 20 : 32);
-                    if (opcode == OP_HASH160)
+                    if (opcode == OP_SHA256)
+                        CSHA256().Write(vch.data(), vch.size()).Finalize(vchHash.data());
+                    else if (opcode == OP_HASH160)
                         CHash160().Write(vch).Finalize(vchHash);
                     else if (opcode == OP_HASH256)
                         CHash256().Write(vch).Finalize(vchHash);

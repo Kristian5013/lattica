@@ -7,7 +7,7 @@ set(LATTICA_TESTS
   test_addresstype test_arith test_bech32 test_block test_chain test_chainparams
   test_chainstate test_check test_clientversion test_coins test_crypter
   test_dbwrapper test_deployment test_falcon512 test_engine_utils test_coinscache test_hash
-  test_key test_key_io test_hdkey test_mlkem test_mempool
+  test_interpreter test_key test_key_io test_hdkey test_mlkem test_mempool
   test_merkle test_mldsa44 test_moneystr test_policy test_pow test_pubkey
   test_random test_retarget test_ripemd160 test_script test_serialize test_sigcache
   test_signingprovider test_sha256 test_signmessage
