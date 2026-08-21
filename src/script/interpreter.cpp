@@ -1479,7 +1479,8 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
             } else {
                 // Treat every spend that's not known to native witness v1 as a Witness v0 spend. This branch may
                 // also be taken for unknown witness versions, but it is harmless, and being precise would require
-                // P2SH evaluation to find the redeemScript.
+                // P2SH evaluation to find the redeemScript. Witness v2 belongs here too: it signs the same BIP143
+                // serialization that v0 does.
                 uses_bip143_segwit = true;
             }
         }
@@ -1624,8 +1625,8 @@ bool SignatureHashSchnorr(uint256& hash_out, ScriptExecutionData& execdata, cons
 
 int SigHashCache::CacheIndex(int32_t hash_type) const noexcept
 {
-    // Note that we do not distinguish between BASE and WITNESS_V0 to determine the cache index,
-    // because no input can simultaneously use both.
+    // Note that we do not distinguish between BASE, WITNESS_V0 and WITNESS_V2 to determine the
+    // cache index, because no input can simultaneously use more than one of them.
     return 3 * !!(hash_type & SIGHASH_ANYONECANPAY) +
            2 * ((hash_type & 0x1f) == SIGHASH_SINGLE) +
            1 * ((hash_type & 0x1f) == SIGHASH_NONE);
@@ -1677,7 +1678,7 @@ uint256 SignatureHash(const CScript& scriptCode, const T& txTo, unsigned int nIn
 
     HashWriter ss{};
 
-    // Try to compute using cached SHA256 midstate.
+    // Try to compute using cached SHA3-256 midstate.
     if (sighash_cache && sighash_cache->Load(nHashType, scriptCode, ss)) {
         // Add sighash type and hash.
         ss << nHashType;
@@ -1987,7 +1988,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
 
     if (witversion == 0) {
         if (program.size() == WITNESS_V0_SCRIPTHASH_SIZE) {
-            // BIP141 P2WSH: 32-byte witness v0 program (which encodes SHA256(script))
+            // BIP141 P2WSH: 32-byte witness v0 program (which encodes SHA3-256(script))
             if (stack.size() == 0) {
                 return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY);
             }
@@ -2224,6 +2225,20 @@ size_t static WitnessSigOps(int witversion, const std::vector<unsigned char>& wi
             return 1;
 
         if (witprogram.size() == WITNESS_V0_SCRIPTHASH_SIZE && witness.stack.size() > 0) {
+            CScript subscript(witness.stack.back().begin(), witness.stack.back().end());
+            return subscript.GetSigOpCount(true);
+        }
+    }
+
+    // Witness v2 is counted the same way. Returning zero for it, as an unknown
+    // version is returned zero, would let a block be filled with post-quantum
+    // spends at no sigop cost at all -- and one of those costs strictly more to
+    // verify than the ECDSA check a v0 spend is charged one sigop for.
+    if (witversion == 2) {
+        if (witprogram.size() == WITNESS_V2_KEYHASH_SIZE)
+            return 1;
+
+        if (witprogram.size() == WITNESS_V2_SCRIPTHASH_SIZE && witness.stack.size() > 0) {
             CScript subscript(witness.stack.back().begin(), witness.stack.back().end());
             return subscript.GetSigOpCount(true);
         }
