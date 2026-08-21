@@ -48,28 +48,23 @@ MessageVerificationResult MessageVerify(
     // compact form), so a signed message carries the public key followed by the
     // signature and both are checked explicitly.
     //
-    // The boundary between them comes from the total length rather than a fixed
-    // offset: each scheme's (public key + signature) sum is distinct — 97 for
-    // secp256k1, 1563 for Falcon-512, 3732 for ML-DSA-44 — so exactly one split
-    // can be right. A fixed CPubKey::SIZE offset would only ever have worked for
-    // the largest scheme.
-    size_t pk_len{0};
+    // The boundary between them is found by trying each public key length and
+    // letting the signature decide. A secp256k1 signature is DER and so has no
+    // fixed length to subtract; the two lattice signatures do, but one rule
+    // covers all three and none of the lengths collide.
+    const uint256 hash{MessageHash(message)};
+    CPubKey pubkey;
     for (const unsigned int n : {CPubKey::SECP256K1_SIZE, CPubKey::FALCON512_SIZE, CPubKey::MLDSA44_SIZE}) {
         if (signature_bytes->size() <= n) continue;
         const CPubKey candidate(signature_bytes->begin(), signature_bytes->begin() + n);
-        if (candidate.IsValid() && signature_bytes->size() == n + candidate.SignatureSize()) {
-            pk_len = n;
+        if (!candidate.IsValid()) continue;
+        const std::vector<unsigned char> sig(signature_bytes->begin() + n, signature_bytes->end());
+        if (candidate.Verify(hash, sig)) {
+            pubkey = candidate;
             break;
         }
     }
-    if (pk_len == 0) {
-        return MessageVerificationResult::ERR_MALFORMED_SIGNATURE;
-    }
-    CPubKey pubkey(signature_bytes->begin(), signature_bytes->begin() + pk_len);
     if (!pubkey.IsValid()) {
-        return MessageVerificationResult::ERR_PUBKEY_NOT_RECOVERED;
-    }
-    if (!pubkey.Verify(MessageHash(message), std::span<const unsigned char>(*signature_bytes).subspan(pk_len))) {
         return MessageVerificationResult::ERR_NOT_SIGNED;
     }
 

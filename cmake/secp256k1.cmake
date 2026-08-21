@@ -11,14 +11,14 @@
 # src/secp256k1 wholesale rather than patching in place, so the diff against
 # upstream stays empty and a new release drops in cleanly.
 #
-# Only the base API is built. Every optional module is off: schnorrsig,
-# extrakeys and musig are Taproot machinery Lattica does not have; ellswift
-# belongs to BIP324, whereas this transport is ML-KEM-768 (see v2cipher.h); and
-# ecdh, recovery and silentpayments have no caller here.
+# schnorrsig and extrakeys are on: Taproot needs BIP-340 signing and
+# verification and the x-only key type they provide. The rest stay off — musig
+# has no caller, ellswift belongs to BIP324 whereas this transport is ML-KEM-768
+# (see v2cipher.h), and ecdh, recovery and silentpayments are unused.
 set(SECP256K1_ENABLE_MODULE_ECDH OFF CACHE BOOL "" FORCE)
-set(SECP256K1_ENABLE_MODULE_RECOVERY OFF CACHE BOOL "" FORCE)
-set(SECP256K1_ENABLE_MODULE_EXTRAKEYS OFF CACHE BOOL "" FORCE)
-set(SECP256K1_ENABLE_MODULE_SCHNORRSIG OFF CACHE BOOL "" FORCE)
+set(SECP256K1_ENABLE_MODULE_RECOVERY ON CACHE BOOL "" FORCE)
+set(SECP256K1_ENABLE_MODULE_EXTRAKEYS ON CACHE BOOL "" FORCE)
+set(SECP256K1_ENABLE_MODULE_SCHNORRSIG ON CACHE BOOL "" FORCE)
 set(SECP256K1_ENABLE_MODULE_MUSIG OFF CACHE BOOL "" FORCE)
 set(SECP256K1_ENABLE_MODULE_ELLSWIFT OFF CACHE BOOL "" FORCE)
 set(SECP256K1_ENABLE_MODULE_SILENTPAYMENTS OFF CACHE BOOL "" FORCE)
