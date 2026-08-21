@@ -4,8 +4,11 @@
 #include <hash.h>
 #include <span.h>
 #include <crypto/common.h>
+#include <crypto/sha3.h>
+#include <crypto/sha3_512.h>
 
 #include <bit>
+#include <string>
 
 unsigned int MurmurHash3(unsigned int nHashSeed, std::span<const unsigned char> vDataToHash)
 {
@@ -63,4 +66,29 @@ unsigned int MurmurHash3(unsigned int nHashSeed, std::span<const unsigned char> 
     h1 ^= h1 >> 16;
 
     return h1;
+}
+
+void BIP32Hash(const ChainCode &chainCode, unsigned int nChild, unsigned char header, const unsigned char data[32], unsigned char output[64])
+{
+    unsigned char num[4];
+    WriteBE32(num, nChild);
+    // Core keys SHA-512 through HMAC; HMAC exists to stop length extension,
+    // so the chain code is a plain prefix to the sponge instead.
+    SHA3_512().Write(chainCode.begin(), chainCode.size()).Write(&header, 1).Write(data, 32).Write(num, 4).Finalize(output);
+}
+
+uint256 SHA256Uint256(const uint256& input)
+{
+    uint256 result;
+    SHA3_256().Write(input).Finalize(result);
+    return result;
+}
+
+HashWriter TaggedHash(const std::string& tag)
+{
+    HashWriter writer{};
+    uint256 taghash;
+    SHA3_256().Write(MakeUCharSpan(tag)).Finalize(taghash);
+    writer << taghash; // once; Core's second copy only fills a SHA-256 block
+    return writer;
 }

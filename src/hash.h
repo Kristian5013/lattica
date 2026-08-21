@@ -1,11 +1,5 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
-//
-// Lattica's consensus hash is SHA3-256 (FIPS 202), not Bitcoin's double
-// SHA-256. SHA3 is a length-extension-safe sponge, so a single pass suffices —
-// there is no second hashing round. CHash256 keeps Bitcoin Core's interface so
-// downstream code (e.g. the Merkle tree) ports unchanged, but computes
-// SHA3-256 underneath.
 
 #ifndef LATTICA_HASH_H
 #define LATTICA_HASH_H
@@ -14,24 +8,35 @@
 #include <crypto/common.h>
 #include <crypto/ripemd160.h>
 #include <crypto/sha3.h>
+#include <prevector.h>
 #include <serialize.h>
 #include <span.h>
+#include <support/cleanse.h>
 #include <uint256.h>
 
-#include <algorithm>
-#include <cassert>
-#include <cstddef>
-#include <cstdint>
+#include <string>
+#include <vector>
 
-/** A hasher class for Lattica's 256-bit consensus hash (SHA3-256, FIPS 202). */
+/** A BIP32 chain code. Cleansed on destruction. */
+class ChainCode : public base_blob<256> {
+public:
+    constexpr ChainCode() = default;
+    constexpr explicit ChainCode(std::span<const unsigned char> vch) : base_blob<256>(vch) {}
+    constexpr explicit ChainCode(const base_blob<256>& b) : base_blob<256>(b) {}
+    ~ChainCode() { memory_cleanse(data(), size()); }
+};
+
+/** A hasher class for Lattica's 256-bit hash (SHA3-256). */
 class CHash256 {
 private:
     SHA3_256 sha;
 public:
-    static const size_t OUTPUT_SIZE = SHA3_256::OUTPUT_SIZE;
+    static constexpr size_t OUTPUT_SIZE{SHA3_256::OUTPUT_SIZE};
 
     void Finalize(std::span<unsigned char> output) {
         assert(output.size() == OUTPUT_SIZE);
+        // Core hashes a second time here, against length extension. A sponge
+        // does not extend, so this is one pass.
         sha.Finalize(output);
     }
 
@@ -41,6 +46,31 @@ public:
     }
 
     CHash256& Reset() {
+        sha.Reset();
+        return *this;
+    }
+};
+
+/** A hasher class for Lattica's 160-bit hash (SHA3-256 + RIPEMD-160). */
+class CHash160 {
+private:
+    SHA3_256 sha;
+public:
+    static constexpr size_t OUTPUT_SIZE{CRIPEMD160::OUTPUT_SIZE};
+
+    void Finalize(std::span<unsigned char> output) {
+        assert(output.size() == OUTPUT_SIZE);
+        unsigned char buf[SHA3_256::OUTPUT_SIZE];
+        sha.Finalize(buf);
+        CRIPEMD160().Write(buf, SHA3_256::OUTPUT_SIZE).Finalize(output.data());
+    }
+
+    CHash160& Write(std::span<const unsigned char> input) {
+        sha.Write(input);
+        return *this;
+    }
+
+    CHash160& Reset() {
         sha.Reset();
         return *this;
     }
@@ -63,26 +93,12 @@ inline uint256 Hash(const T1& in1, const T2& in2) {
     return result;
 }
 
-/** Compute the 160-bit hash of an object: RIPEMD-160 over its SHA3-256.
- *
- * Hash160 = RIPEMD160(SHA3-256(x)). Structurally this is Bitcoin's two-stage
- * Hash160, which is what lets address and script-hash code keep Core's shape,
- * but the inner digest is Lattica's consensus hash rather than SHA-256, so no
- * value here matches Bitcoin's encoding of the same key or script.
- *
- * The second stage is a hash and not a truncation on purpose. Truncating would
- * make the 160-bit value a literal prefix of the 256-bit hash of the same
- * preimage, so a script's P2SH hash would be the first 20 bytes of its P2WSH
- * commitment (script/interpreter.cpp hashes witnessScript with SHA3-256).
- * RIPEMD-160 makes the two commitments independent.
- */
+/** Compute the 160-bit hash an object. */
 template<typename T1>
 inline uint160 Hash160(const T1& in1)
 {
-    uint256 full;
-    CHash256().Write(MakeUCharSpan(in1)).Finalize(full);
     uint160 result;
-    CRIPEMD160().Write(full.begin(), full.size()).Finalize(result.begin());
+    CHash160().Write(MakeUCharSpan(in1)).Finalize(result);
     return result;
 }
 
@@ -103,6 +119,19 @@ public:
      * Invalidates this object.
      */
     uint256 GetHash() {
+        uint256 result;
+        ctx.Finalize(result);
+        return result;
+    }
+
+    /** Compute the SHA3-256 hash of all data written to this object.
+     *
+     * Invalidates this object.
+     *
+     * Core's two differ, a double pass against a single one. Here they are the
+     * same value; both names are kept so its callers port unchanged.
+     */
+    uint256 GetSHA256() {
         uint256 result;
         ctx.Finalize(result);
         return result;
@@ -182,6 +211,29 @@ public:
     }
 };
 
+/** Single-SHA3-256 a 32-byte input (represented as uint256). */
+[[nodiscard]] uint256 SHA256Uint256(const uint256& input);
+
 unsigned int MurmurHash3(unsigned int nHashSeed, std::span<const unsigned char> vDataToHash);
+
+void BIP32Hash(const ChainCode &chainCode, unsigned int nChild, unsigned char header, const unsigned char data[32], unsigned char output[64]);
+
+/** Return a HashWriter primed for tagged hashes (as specified in BIP 340).
+ *
+ * The returned object will have SHA3-256(tag) written to it once. Core writes
+ * its tag hash twice (= 64 bytes) to fill a SHA-256 block, leaving nothing to
+ * extend; a sponge needs no such fill.
+ * A tagged hash can be computed by feeding the message into this object, and
+ * then calling HashWriter::GetSHA256().
+ */
+HashWriter TaggedHash(const std::string& tag);
+
+/** Compute the 160-bit RIPEMD-160 hash of an array. */
+inline uint160 RIPEMD160(std::span<const unsigned char> data)
+{
+    uint160 result;
+    CRIPEMD160().Write(data.data(), data.size()).Finalize(result.begin());
+    return result;
+}
 
 #endif // LATTICA_HASH_H
