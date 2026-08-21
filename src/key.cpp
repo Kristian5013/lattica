@@ -641,9 +641,10 @@ void CExtKey::SetSeed(std::span<const unsigned char> seed, unsigned int secret_s
 }
 
 CExtPubKey CExtKey::Neuter() const {
-    // secp256k1's: CExtPubKey carries a 33-byte key, and public derivation is
-    // the scalar homomorphism a lattice scheme does not have.
-    assert(key.size() == CKey::SECP256K1_SIZE);
+    // The public half of a node, for any of the three schemes. It is a label and
+    // a cache record, not a derivation root: Derive puts the parent's secret node
+    // seed in every child's preimage, so no scheme here has public derivation and
+    // CExtPubKey::Derive does not continue this tree. See its comment.
     CExtPubKey ret;
     ret.nDepth = nDepth;
     ret.fingerprint = fingerprint;

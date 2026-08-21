@@ -354,6 +354,10 @@ struct CExtKey {
     void Encode(unsigned char code[SIZE]) const;
     void Decode(const unsigned char code[SIZE]);
     [[nodiscard]] bool Derive(CExtKey& out, unsigned int nChild) const;
+
+    //! The public half of this node. Every child's preimage holds the parent's
+    //! secret node seed, so this is a label and a cache record and not something
+    //! further keys can be derived from; see CExtPubKey::Derive.
     CExtPubKey Neuter() const;
 
     //! Make this the master node of a tree of that scheme. The scheme is part of

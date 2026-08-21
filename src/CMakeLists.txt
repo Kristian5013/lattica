@@ -109,6 +109,7 @@ add_library(lattica_common STATIC EXCLUDE_FROM_ALL
   musig.cpp
   scheduler.cpp
   script/descriptor.cpp
+  script/parsing.cpp
   script/sign.cpp
   script/signingprovider.cpp
   script/solver.cpp

@@ -436,6 +436,19 @@ void CExtPubKey::DecodeWithVersion(const unsigned char code[BIP32_EXTKEY_WITH_VE
     Decode(&code[4]);
 }
 
+//! BIP32 public derivation: tweak the point by a hash of the chain code, the
+//! child number and the key. It is BIP328's, and the MuSig2 synthetic xpub is
+//! what it is here for.
+//!
+//! It is NOT the inverse of CExtKey::Derive. That one puts the parent's secret
+//! node seed in the child's preimage — for every scheme, secp256k1 included —
+//! so a node's public half cannot continue the tree, and
+//!
+//!     xprv.Neuter().Derive(i)  !=  xprv.Derive(i).Neuter()
+//!
+//! Deriving addresses from an extended key therefore always needs the secret;
+//! a watch-only wallet works from a cache of already-derived public keys, not
+//! from an xpub. test_hdkey pins this.
 bool CExtPubKey::Derive(CExtPubKey &out, unsigned int _nChild, uint256* bip32_tweak_out) const {
     if (nDepth == std::numeric_limits<unsigned char>::max()) return false;
     out.nDepth = nDepth + 1;

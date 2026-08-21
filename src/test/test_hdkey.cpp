@@ -170,6 +170,31 @@ int main()
             bad.Decode(code);
             Check("a scheme no size names leaves the key invalid", !bad.key.IsValid());
         }
+
+        // This tree is hardened at every step, secp256k1 included: the parent's
+        // secret node seed is in every child's preimage. So the public half of a
+        // node cannot continue it, and CExtPubKey::Derive — which is BIP32's
+        // point tweak, and what MuSig2's synthetic xpub is derived with — is not
+        // the inverse of CExtKey::Derive. Pinned here so the divergence is a
+        // recorded fact rather than something a wallet discovers.
+        {
+            const CExtPubKey xpub = m_secp.Neuter();
+            Check("Neuter carries the node's public key and chain code",
+                  xpub.pubkey == m_secp.key.GetPubKey() && xpub.chaincode == m_secp.chaincode);
+
+            CExtPubKey pub_child;
+            const bool derived = xpub.Derive(pub_child, 0);
+            Check("public derivation runs", derived);
+            Check("...but does not reach the private tree's child",
+                  derived && !(pub_child.pubkey == c_secp.key.GetPubKey()));
+
+            // Every scheme can be neutered; the lattice ones only for the cache
+            // record, since they have no base58 form and no derivation either.
+            const CExtPubKey falcon_pub = m_falcon.Neuter();
+            Check("a lattice node neuters to its own public key",
+                  falcon_pub.pubkey == m_falcon.key.GetPubKey() &&
+                  falcon_pub.pubkey.size() == CPubKey::FALCON512_SIZE);
+        }
     }
 
     std::printf("%s\n", g_fail == 0 ? "ALL PASS" : "FAILURES");

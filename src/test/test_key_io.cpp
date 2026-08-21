@@ -226,6 +226,48 @@ int main()
         Check("garbage is not a WIF", !DecodeSecret("not a wif", *main).IsValid());
     }
 
+    // ---- Extended keys. One length per scheme is not enough: an extended key
+    // here is 75 bytes rather than Bitcoin's 74, because it carries a 32-byte
+    // node seed and the two bytes that name the scheme, and the decoder's length
+    // bound has to be written for that and not inherited.
+    {
+        unsigned char seed[32];
+        for (int i = 0; i < 32; ++i) seed[i] = (unsigned char)(i * 7 + 1);
+
+        bool all_round_trip = true;
+        for (unsigned int secret_size : {CKey::SECP256K1_SIZE, CKey::FALCON512_SIZE, CKey::MLDSA44_SIZE}) {
+            CExtKey master;
+            master.SetSeed(seed, secret_size);
+            const std::string xprv = EncodeExtKey(master, *main);
+            if (xprv.empty()) { all_round_trip = false; continue; }
+            const CExtKey back = DecodeExtKey(xprv, *main);
+            if (!(back == master)) all_round_trip = false;
+            if (back.secret_size != secret_size) all_round_trip = false;
+            // A child of the decoded key must be the child of the original.
+            CExtKey a, b;
+            if (!master.Derive(a, 3) || !back.Derive(b, 3) || !(a == b)) all_round_trip = false;
+        }
+        Check("an extended key of every scheme round-trips through base58", all_round_trip);
+
+        CExtKey mainnet_master;
+        mainnet_master.SetSeed(seed, CKey::MLDSA44_SIZE);
+        const std::string xprv = EncodeExtKey(mainnet_master, *main);
+        Check("an extended key from another network does not decode",
+              !DecodeExtKey(xprv, *regtest).key.IsValid());
+        Check("garbage is not an extended key", !DecodeExtKey("not an xprv", *main).key.IsValid());
+
+        // The public half is 74 bytes, secp256k1's, and only that scheme has one
+        // that encodes; see CExtKey::Neuter.
+        CExtKey secp_master;
+        secp_master.SetSeed(seed, CKey::SECP256K1_SIZE);
+        const CExtPubKey xpub = secp_master.Neuter();
+        const std::string xpub_str = EncodeExtPubKey(xpub, *main);
+        Check("a secp256k1 extended public key round-trips",
+              !xpub_str.empty() && DecodeExtPubKey(xpub_str, *main) == xpub);
+        Check("an extended public key is not an extended private key",
+              !DecodeExtKey(xpub_str, *main).key.IsValid());
+    }
+
     // ---- Error reporting via the error_str / error_locations overload.
     {
         const std::string addr = EncodeDestination(WitnessV0KeyHash(pub_secp), *regtest);
