@@ -9,18 +9,12 @@
 #include <script/script.h>
 #include <script/solver.h>
 #include <uint256.h>
+#include <util/hash_type.h>
 
-#include <algorithm>
 #include <cassert>
-#include <span>
 #include <vector>
 
 typedef std::vector<unsigned char> valtype;
-
-namespace {
-//! Construct a uint160 from a 20-byte hash buffer.
-uint160 ToUint160(const unsigned char* p) { return uint160(std::span<const unsigned char>(p, 20)); }
-} // namespace
 
 ScriptHash::ScriptHash(const CScript& in) : BaseHash(Hash160(in)) {}
 ScriptHash::ScriptHash(const CScriptID& in) : BaseHash{in} {}
@@ -31,35 +25,107 @@ PKHash::PKHash(const CKeyID& pubkey_id) : BaseHash(pubkey_id) {}
 WitnessV0KeyHash::WitnessV0KeyHash(const CPubKey& pubkey) : BaseHash(pubkey.GetID()) {}
 WitnessV0KeyHash::WitnessV0KeyHash(const PKHash& pubkey_hash) : BaseHash{pubkey_hash} {}
 
+WitnessV2KeyHash::WitnessV2KeyHash(const CPubKey& pubkey) : BaseHash(pubkey.GetID()) {}
+WitnessV2KeyHash::WitnessV2KeyHash(const PKHash& pubkey_hash) : BaseHash{pubkey_hash} {}
+
 CKeyID ToKeyID(const PKHash& key_hash)
 {
-    return CKeyID{ToUint160(key_hash.begin())};
+    return CKeyID{uint160{key_hash}};
 }
 
 CKeyID ToKeyID(const WitnessV0KeyHash& key_hash)
 {
-    return CKeyID{ToUint160(key_hash.begin())};
+    return CKeyID{uint160{key_hash}};
+}
+
+CKeyID ToKeyID(const WitnessV2KeyHash& key_hash)
+{
+    return CKeyID{uint160{key_hash}};
 }
 
 CScriptID ToScriptID(const ScriptHash& script_hash)
 {
-    return CScriptID{ToUint160(script_hash.begin())};
+    return CScriptID{uint160{script_hash}};
 }
 
-// Lattica divergence: Core hashes the witnessScript with SHA-256
-// (CSHA256().Write(in.data(), in.size()).Finalize(begin())); Lattica is
-// SHA3-only, so the v0 witness-script hash is SHA3-256 — matching the P2WSH
-// program check in the script interpreter.
 WitnessV0ScriptHash::WitnessV0ScriptHash(const CScript& in)
 {
-    SHA3_256()
-        .Write(std::span<const unsigned char>(in.data(), in.size()))
-        .Finalize(std::span<unsigned char>(begin(), SHA3_256::OUTPUT_SIZE));
+    SHA3_256().Write(in).Finalize(*this);
 }
 
-bool IsValidDestination(const CTxDestination& dest)
+WitnessV2ScriptHash::WitnessV2ScriptHash(const CScript& in)
 {
-    return !std::holds_alternative<CNoDestination>(dest);
+    SHA3_256().Write(in).Finalize(*this);
+}
+
+bool ExtractDestination(const CScript& scriptPubKey, CTxDestination& addressRet)
+{
+    std::vector<valtype> vSolutions;
+    TxoutType whichType = Solver(scriptPubKey, vSolutions);
+
+    switch (whichType) {
+    case TxoutType::PUBKEY: {
+        CPubKey pubKey(vSolutions[0]);
+        if (!pubKey.IsValid()) {
+            addressRet = CNoDestination(scriptPubKey);
+        } else {
+            addressRet = PubKeyDestination(pubKey);
+        }
+        return false;
+    }
+    case TxoutType::PUBKEYHASH: {
+        addressRet = PKHash(uint160(vSolutions[0]));
+        return true;
+    }
+    case TxoutType::SCRIPTHASH: {
+        addressRet = ScriptHash(uint160(vSolutions[0]));
+        return true;
+    }
+    case TxoutType::WITNESS_V0_KEYHASH: {
+        WitnessV0KeyHash hash;
+        std::copy(vSolutions[0].begin(), vSolutions[0].end(), hash.begin());
+        addressRet = hash;
+        return true;
+    }
+    case TxoutType::WITNESS_V0_SCRIPTHASH: {
+        WitnessV0ScriptHash hash;
+        std::copy(vSolutions[0].begin(), vSolutions[0].end(), hash.begin());
+        addressRet = hash;
+        return true;
+    }
+    case TxoutType::WITNESS_V1_TAPROOT: {
+        WitnessV1Taproot tap;
+        std::copy(vSolutions[0].begin(), vSolutions[0].end(), tap.begin());
+        addressRet = tap;
+        return true;
+    }
+    case TxoutType::WITNESS_V2_KEYHASH: {
+        WitnessV2KeyHash hash;
+        std::copy(vSolutions[0].begin(), vSolutions[0].end(), hash.begin());
+        addressRet = hash;
+        return true;
+    }
+    case TxoutType::WITNESS_V2_SCRIPTHASH: {
+        WitnessV2ScriptHash hash;
+        std::copy(vSolutions[0].begin(), vSolutions[0].end(), hash.begin());
+        addressRet = hash;
+        return true;
+    }
+    case TxoutType::ANCHOR: {
+        addressRet = PayToAnchor();
+        return true;
+    }
+    case TxoutType::WITNESS_UNKNOWN: {
+        addressRet = WitnessUnknown{vSolutions[0][0], vSolutions[1]};
+        return true;
+    }
+    case TxoutType::MULTISIG:
+    case TxoutType::NULL_DATA:
+    case TxoutType::NONSTANDARD:
+        addressRet = CNoDestination(scriptPubKey);
+        return false;
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
 }
 
 namespace {
@@ -96,12 +162,40 @@ public:
         return CScript() << OP_0 << ToByteVector(id);
     }
 
-    // Lattica (option A) has no Taproot, so there is no WitnessV1Taproot case.
-    // PayToAnchor is a WitnessUnknown subtype and is handled by this overload.
+    CScript operator()(const WitnessV1Taproot& tap) const
+    {
+        return CScript() << OP_1 << ToByteVector(tap);
+    }
+
+    CScript operator()(const WitnessV2KeyHash& id) const
+    {
+        return CScript() << OP_2 << ToByteVector(id);
+    }
+
+    CScript operator()(const WitnessV2ScriptHash& id) const
+    {
+        return CScript() << OP_2 << ToByteVector(id);
+    }
+
     CScript operator()(const WitnessUnknown& id) const
     {
         return CScript() << CScript::EncodeOP_N(id.GetWitnessVersion()) << id.GetWitnessProgram();
     }
+};
+
+class ValidDestinationVisitor
+{
+public:
+    bool operator()(const CNoDestination& dest) const { return false; }
+    bool operator()(const PubKeyDestination& dest) const { return false; }
+    bool operator()(const PKHash& dest) const { return true; }
+    bool operator()(const ScriptHash& dest) const { return true; }
+    bool operator()(const WitnessV0KeyHash& dest) const { return true; }
+    bool operator()(const WitnessV0ScriptHash& dest) const { return true; }
+    bool operator()(const WitnessV1Taproot& dest) const { return true; }
+    bool operator()(const WitnessV2KeyHash& dest) const { return true; }
+    bool operator()(const WitnessV2ScriptHash& dest) const { return true; }
+    bool operator()(const WitnessUnknown& dest) const { return true; }
 };
 } // namespace
 
@@ -110,54 +204,6 @@ CScript GetScriptForDestination(const CTxDestination& dest)
     return std::visit(CScriptVisitor(), dest);
 }
 
-bool ExtractDestination(const CScript& scriptPubKey, CTxDestination& addressRet)
-{
-    std::vector<valtype> vSolutions;
-    const TxoutType whichType = Solver(scriptPubKey, vSolutions);
-
-    switch (whichType) {
-    case TxoutType::PUBKEY: {
-        CPubKey pubKey(vSolutions[0]);
-        if (!pubKey.IsValid()) {
-            addressRet = CNoDestination(scriptPubKey);
-        } else {
-            addressRet = PubKeyDestination(pubKey);
-        }
-        return false;
-    }
-    case TxoutType::PUBKEYHASH: {
-        addressRet = PKHash(uint160(vSolutions[0]));
-        return true;
-    }
-    case TxoutType::SCRIPTHASH: {
-        addressRet = ScriptHash(uint160(vSolutions[0]));
-        return true;
-    }
-    case TxoutType::WITNESS_V0_KEYHASH: {
-        WitnessV0KeyHash hash;
-        std::copy(vSolutions[0].begin(), vSolutions[0].end(), hash.begin());
-        addressRet = hash;
-        return true;
-    }
-    case TxoutType::WITNESS_V0_SCRIPTHASH: {
-        WitnessV0ScriptHash hash;
-        std::copy(vSolutions[0].begin(), vSolutions[0].end(), hash.begin());
-        addressRet = hash;
-        return true;
-    }
-    case TxoutType::ANCHOR: {
-        addressRet = PayToAnchor();
-        return true;
-    }
-    case TxoutType::WITNESS_UNKNOWN: {
-        addressRet = WitnessUnknown{vSolutions[0][0], vSolutions[1]};
-        return true;
-    }
-    case TxoutType::MULTISIG:
-    case TxoutType::NULL_DATA:
-    case TxoutType::NONSTANDARD:
-        addressRet = CNoDestination(scriptPubKey);
-        return false;
-    } // no default case, so the compiler can warn about missing cases
-    assert(false);
+bool IsValidDestination(const CTxDestination& dest) {
+    return std::visit(ValidDestinationVisitor(), dest);
 }

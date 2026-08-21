@@ -311,7 +311,35 @@ public:
         return obj;
     }
 
-    // Lattica has no Taproot, so there is no WitnessV1Taproot destination to describe.
+    UniValue operator()(const WitnessV1Taproot& tap) const
+    {
+        UniValue obj(UniValue::VOBJ);
+        obj.pushKV("isscript", true);
+        obj.pushKV("iswitness", true);
+        obj.pushKV("witness_version", 1);
+        obj.pushKV("witness_program", HexStr(tap));
+        return obj;
+    }
+
+    UniValue operator()(const WitnessV2KeyHash& id) const
+    {
+        UniValue obj(UniValue::VOBJ);
+        obj.pushKV("isscript", false);
+        obj.pushKV("iswitness", true);
+        obj.pushKV("witness_version", 2);
+        obj.pushKV("witness_program", HexStr(id));
+        return obj;
+    }
+
+    UniValue operator()(const WitnessV2ScriptHash& id) const
+    {
+        UniValue obj(UniValue::VOBJ);
+        obj.pushKV("isscript", true);
+        obj.pushKV("iswitness", true);
+        obj.pushKV("witness_version", 2);
+        obj.pushKV("witness_program", HexStr(id));
+        return obj;
+    }
 
     UniValue operator()(const PayToAnchor& anchor) const
     {

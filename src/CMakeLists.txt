@@ -68,6 +68,7 @@ endif()
 # Higher-level functionality shared by the executables and libraries.
 add_library(lattica_common STATIC EXCLUDE_FROM_ALL
   addresstype.cpp
+  base58.cpp
   bech32.cpp
   chain.cpp
   chainparams.cpp
