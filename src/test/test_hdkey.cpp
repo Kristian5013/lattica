@@ -111,6 +111,67 @@ int main()
         Check("decoded key matches and signs", dec.key == c0a.key && SignsAndVerifies(dec.key, h));
     }
 
+    // --- One seed, three schemes, three unrelated trees ---
+    //
+    // The scheme goes into the master node's preimage rather than sitting beside
+    // it as a label. If it did not, the three trees would share every node seed
+    // and a key in one would stand in a fixed relation to the key at the same
+    // path in the others -- which is not a property anyone should have to reason
+    // about, and not one a seed backup implies.
+    {
+        ECC_Context ecc_context{};
+        const std::array<unsigned char, 32> seed{{'o', 'n', 'e', ' ', 's', 'e', 'e', 'd'}};
+
+        CExtKey m_secp, m_falcon, m_mldsa;
+        m_secp.SetSeed(seed, CKey::SECP256K1_SIZE);
+        m_falcon.SetSeed(seed, CKey::FALCON512_SIZE);
+        m_mldsa.SetSeed(seed, CKey::MLDSA44_SIZE);
+
+        Check("each master carries its own scheme",
+              m_secp.secret_size == CKey::SECP256K1_SIZE &&
+              m_falcon.secret_size == CKey::FALCON512_SIZE &&
+              m_mldsa.secret_size == CKey::MLDSA44_SIZE);
+        Check("each master's key is of that scheme",
+              m_secp.key.size() == CKey::SECP256K1_SIZE &&
+              m_falcon.key.size() == CKey::FALCON512_SIZE &&
+              m_mldsa.key.size() == CKey::MLDSA44_SIZE);
+        Check("the three trees do not share a node seed",
+              m_secp.nodeseed != m_falcon.nodeseed &&
+              m_falcon.nodeseed != m_mldsa.nodeseed &&
+              m_secp.nodeseed != m_mldsa.nodeseed);
+        Check("nor a chain code",
+              !(m_secp.chaincode == m_falcon.chaincode) &&
+              !(m_falcon.chaincode == m_mldsa.chaincode));
+
+        // A child is its parent's scheme, at every depth.
+        CExtKey c_secp, c_falcon, g_falcon;
+        Check("secp derives", m_secp.Derive(c_secp, 0));
+        Check("falcon derives", m_falcon.Derive(c_falcon, 0));
+        Check("...and again", c_falcon.Derive(g_falcon, 7));
+        Check("a child keeps the scheme",
+              c_secp.secret_size == CKey::SECP256K1_SIZE &&
+              c_secp.key.size() == CKey::SECP256K1_SIZE &&
+              g_falcon.secret_size == CKey::FALCON512_SIZE &&
+              g_falcon.key.size() == CKey::FALCON512_SIZE);
+        Check("derived keys of each scheme sign and verify",
+              SignsAndVerifies(c_secp.key, h) && SignsAndVerifies(g_falcon.key, h));
+
+        // The scheme survives a backup, and a corrupted one is refused rather
+        // than expanded under whatever the field happens to hold.
+        {
+            unsigned char code[CExtKey::SIZE];
+            c_secp.Encode(code);
+            CExtKey dec;
+            dec.Decode(code);
+            Check("Encode/Decode round-trips a secp256k1 tree", dec == c_secp);
+
+            code[CExtKey::SIZE - 1] ^= 0xff;
+            CExtKey bad;
+            bad.Decode(code);
+            Check("a scheme no size names leaves the key invalid", !bad.key.IsValid());
+        }
+    }
+
     std::printf("%s\n", g_fail == 0 ? "ALL PASS" : "FAILURES");
     return g_fail == 0 ? 0 : 1;
 }

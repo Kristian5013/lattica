@@ -322,11 +322,16 @@ struct CExtKey {
     //! key expanded out of it. Core chains the secret itself, which only a scalar
     //! allows; every scheme here expands from the seed instead.
     uint256 nodeseed;
+    //! The secret size of the scheme this tree carries, which is what names it.
+    //! One tree is one scheme throughout: a child expands from its parent's seed
+    //! under the same scheme, and the seed alone would not say which.
+    unsigned int secret_size{CKey::MLDSA44_SIZE};
     CKey key;
 
-    //! Serialized size: depth(1) + fingerprint(4) + child(4) + chaincode(32) + nodeseed(32).
-    //! Core's BIP32_EXTKEY_SIZE is 74 because its payload is a 33-byte key.
-    static constexpr unsigned int SIZE = 1 + 4 + 4 + 32 + 32;
+    //! Serialized size: depth(1) + fingerprint(4) + child(4) + chaincode(32)
+    //! + nodeseed(32) + secret size(2). Core's BIP32_EXTKEY_SIZE is 74 because
+    //! its payload is a 33-byte key and it has one scheme to carry.
+    static constexpr unsigned int SIZE = 1 + 4 + 4 + 32 + 32 + 2;
 
     friend bool operator==(const CExtKey& a, const CExtKey& b)
     {
@@ -335,6 +340,7 @@ struct CExtKey {
             a.nChild == b.nChild &&
             a.chaincode == b.chaincode &&
             a.nodeseed == b.nodeseed &&
+            a.secret_size == b.secret_size &&
             a.key == b.key;
     }
 
@@ -349,10 +355,14 @@ struct CExtKey {
     void Decode(const unsigned char code[SIZE]);
     [[nodiscard]] bool Derive(CExtKey& out, unsigned int nChild) const;
     CExtPubKey Neuter() const;
-    void SetSeed(std::span<const unsigned char> seed);
+
+    //! Make this the master node of a tree of that scheme. The scheme is part of
+    //! the derivation, not a label on it: the same seed gives a different tree
+    //! under each, and every key in a tree is the scheme the master names.
+    void SetSeed(std::span<const unsigned char> seed, unsigned int secret_size = CKey::MLDSA44_SIZE);
 
     //! Compute the master node from a seed and a personalization tag.
-    void SetSeedFromTag(std::span<const unsigned char> seed, const unsigned char* tag, size_t taglen);
+    void SetSeedFromTag(std::span<const unsigned char> seed, const unsigned char* tag, size_t taglen, unsigned int secret_size);
 };
 
 //! Get extended key and origin info for a given path

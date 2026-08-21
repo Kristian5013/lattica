@@ -578,8 +578,9 @@ CKey GenerateRandomKey(unsigned int secret_size) noexcept
     return key;
 }
 
-/* CExtKey is hardened-only and still ML-DSA-only. Core chains the secret itself,
-   which only a scalar allows; here the chained thing is the 32-byte node seed. */
+/* CExtKey is hardened-only. Core chains the secret itself, which only a scalar
+   allows; here the chained thing is the 32-byte node seed, and the scheme the
+   seed is expanded under travels with the tree. */
 
 bool CExtKey::Derive(CExtKey &out, unsigned int _nChild) const {
     if (nDepth == std::numeric_limits<unsigned char>::max()) return false;
@@ -587,6 +588,7 @@ bool CExtKey::Derive(CExtKey &out, unsigned int _nChild) const {
     out.nDepth = nDepth + 1;
     out.fingerprint = id_key_fingerprint();
     out.nChild = _nChild;
+    out.secret_size = secret_size;
     // Hardened-only: the parent's secret node seed is always in the preimage.
     unsigned char data[32 + CKey::SEED_SIZE + 4];
     memcpy(data, chaincode.begin(), 32);
@@ -596,7 +598,7 @@ bool CExtKey::Derive(CExtKey &out, unsigned int _nChild) const {
     SHA3_512().Write(data, sizeof(data)).Finalize(vout.data());
     out.nodeseed = uint256(std::span{vout.data(), CKey::SEED_SIZE});
     memcpy(out.chaincode.begin(), vout.data() + 32, 32);
-    return out.key.MakeKeyFromSeed(CKey::MLDSA44_SIZE, std::span{out.nodeseed.begin(), CKey::SEED_SIZE});
+    return out.key.MakeKeyFromSeed(secret_size, std::span{out.nodeseed.begin(), CKey::SEED_SIZE});
 }
 
 std::optional<std::pair<CExtKey, KeyOriginInfo>> DeriveExtKey(const CExtKey& ext_key, const std::vector<uint32_t>& path)
@@ -613,24 +615,31 @@ std::optional<std::pair<CExtKey, KeyOriginInfo>> DeriveExtKey(const CExtKey& ext
     return std::make_pair(descendant, origin);
 }
 
-void CExtKey::SetSeedFromTag(std::span<const unsigned char> seed, const unsigned char* tag, size_t taglen)
+void CExtKey::SetSeedFromTag(std::span<const unsigned char> seed, const unsigned char* tag, size_t taglen, unsigned int secret_size_in)
 {
     Assert(16 <= seed.size() && seed.size() <= 64);
+    Assert(CKey::ValidSize(secret_size_in));
+    // The scheme goes into the preimage, not just into the field: one seed must
+    // give three unrelated trees rather than three views of one, or a key in the
+    // Falcon tree would share a node seed with the ML-DSA key at the same path.
+    unsigned char scheme[2];
+    WriteBE16(scheme, static_cast<uint16_t>(secret_size_in));
     std::vector<unsigned char, secure_allocator<unsigned char>> vout(64);
-    SHA3_512().Write(tag, taglen).Write(seed.data(), seed.size()).Finalize(vout.data());
+    SHA3_512().Write(tag, taglen).Write(scheme, sizeof(scheme)).Write(seed.data(), seed.size()).Finalize(vout.data());
+    secret_size = secret_size_in;
     nodeseed = uint256(std::span{vout.data(), CKey::SEED_SIZE});
-    key.MakeKeyFromSeed(CKey::MLDSA44_SIZE, std::span{nodeseed.begin(), CKey::SEED_SIZE});
+    key.MakeKeyFromSeed(secret_size, std::span{nodeseed.begin(), CKey::SEED_SIZE});
     memcpy(chaincode.begin(), vout.data() + 32, 32);
     nDepth = 0;
     nChild = 0;
     fingerprint.fill(0);
 }
 
-void CExtKey::SetSeed(std::span<const unsigned char> seed)
+void CExtKey::SetSeed(std::span<const unsigned char> seed, unsigned int secret_size_in)
 {
     // Part of the derivation: changing it invalidates every wallet derived before.
     static const unsigned char hashkey[] = {'L','a','t','t','i','c','a',' ','H','D',' ','m','a','s','t','e','r'};
-    SetSeedFromTag(seed, hashkey, sizeof(hashkey));
+    SetSeedFromTag(seed, hashkey, sizeof(hashkey), secret_size_in);
 }
 
 CExtPubKey CExtKey::Neuter() const {
@@ -652,6 +661,7 @@ void CExtKey::Encode(unsigned char code[SIZE]) const {
     WriteBE32(code+5, nChild);
     memcpy(code+9, chaincode.begin(), 32);
     memcpy(code+41, nodeseed.begin(), CKey::SEED_SIZE);
+    WriteBE16(code+73, static_cast<uint16_t>(secret_size));
 }
 
 void CExtKey::Decode(const unsigned char code[SIZE]) {
@@ -660,7 +670,12 @@ void CExtKey::Decode(const unsigned char code[SIZE]) {
     nChild = ReadBE32(code+5);
     memcpy(chaincode.begin(), code+9, 32);
     nodeseed = uint256(std::span{code + 41, CKey::SEED_SIZE});
-    key.MakeKeyFromSeed(CKey::MLDSA44_SIZE, std::span{nodeseed.begin(), CKey::SEED_SIZE});
+    secret_size = ReadBE16(code+73);
+    if (!CKey::ValidSize(secret_size)) {
+        key = CKey();
+        return;
+    }
+    key.MakeKeyFromSeed(secret_size, std::span{nodeseed.begin(), CKey::SEED_SIZE});
     if (nDepth == 0 && (nChild != 0 || ReadLE32(fingerprint.data()) != 0)) key = CKey();
 }
 

@@ -3,10 +3,12 @@
 
 #include <outputtype.h>
 
+#include <key.h>
 #include <pubkey.h>
 #include <script/script.h>
 #include <script/sign.h>
 #include <script/signingprovider.h>
+#include <util/string.h>
 
 #include <cassert>
 #include <optional>
@@ -16,6 +18,8 @@ static const std::string OUTPUT_TYPE_STRING_LEGACY = "legacy";
 static const std::string OUTPUT_TYPE_STRING_P2SH_SEGWIT = "p2sh-segwit";
 static const std::string OUTPUT_TYPE_STRING_BECH32 = "bech32";
 static const std::string OUTPUT_TYPE_STRING_BECH32M = "bech32m";
+static const std::string OUTPUT_TYPE_STRING_FALCON512 = "falcon512";
+static const std::string OUTPUT_TYPE_STRING_MLDSA44 = "mldsa44";
 static const std::string OUTPUT_TYPE_STRING_UNKNOWN = "unknown";
 
 std::optional<OutputType> ParseOutputType(std::string_view type)
@@ -28,6 +32,10 @@ std::optional<OutputType> ParseOutputType(std::string_view type)
         return OutputType::BECH32;
     } else if (type == OUTPUT_TYPE_STRING_BECH32M) {
         return OutputType::BECH32M;
+    } else if (type == OUTPUT_TYPE_STRING_FALCON512) {
+        return OutputType::FALCON512;
+    } else if (type == OUTPUT_TYPE_STRING_MLDSA44) {
+        return OutputType::MLDSA44;
     }
     return std::nullopt;
 }
@@ -39,6 +47,8 @@ const std::string& FormatOutputType(OutputType type)
     case OutputType::P2SH_SEGWIT: return OUTPUT_TYPE_STRING_P2SH_SEGWIT;
     case OutputType::BECH32: return OUTPUT_TYPE_STRING_BECH32;
     case OutputType::BECH32M: return OUTPUT_TYPE_STRING_BECH32M;
+    case OutputType::FALCON512: return OUTPUT_TYPE_STRING_FALCON512;
+    case OutputType::MLDSA44: return OUTPUT_TYPE_STRING_MLDSA44;
     case OutputType::UNKNOWN: return OUTPUT_TYPE_STRING_UNKNOWN;
     } // no default case, so the compiler can warn about missing cases
     assert(false);
@@ -47,6 +57,23 @@ const std::string& FormatOutputType(OutputType type)
 std::string FormatAllOutputTypes()
 {
     return util::Join(OUTPUT_TYPES, ", ", [](const auto& i) { return "\"" + FormatOutputType(i) + "\""; });
+}
+
+unsigned int SecretSizeForOutputType(OutputType type)
+{
+    switch (type) {
+    case OutputType::LEGACY:
+    case OutputType::P2SH_SEGWIT:
+    case OutputType::BECH32:
+    case OutputType::BECH32M:
+        // Every one of Bitcoin's formats is a curve point's: a 520-byte push
+        // cannot hold a lattice signature, and Taproot's key is a point.
+        return CKey::SECP256K1_SIZE;
+    case OutputType::FALCON512: return CKey::FALCON512_SIZE;
+    case OutputType::MLDSA44: return CKey::MLDSA44_SIZE;
+    case OutputType::UNKNOWN: return 0;
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
 }
 
 CTxDestination AddAndGetDestinationForScript(FlatSigningProvider& keystore, const CScript& script, OutputType type)
@@ -69,6 +96,16 @@ CTxDestination AddAndGetDestinationForScript(FlatSigningProvider& keystore, cons
             return ScriptHash(witprog);
         }
     }
+    case OutputType::FALCON512:
+    case OutputType::MLDSA44: {
+        // The witness v2 script path. The script itself carries the scheme, in
+        // the keys it names; the two types differ only in what the wallet
+        // generates, so the destination they build is the same.
+        CTxDestination witdest = WitnessV2ScriptHash(script);
+        CScript witprog = GetScriptForDestination(witdest);
+        keystore.scripts.emplace(CScriptID(witprog), witprog);
+        return witdest;
+    }
     case OutputType::BECH32M:
     case OutputType::UNKNOWN: {} // This function should not be used for BECH32M or UNKNOWN, so let it assert
     } // no default case, so the compiler can warn about missing cases
@@ -84,12 +121,12 @@ std::optional<OutputType> OutputTypeFromDestination(const CTxDestination& dest) 
         std::holds_alternative<WitnessV0ScriptHash>(dest)) {
         return OutputType::BECH32;
     }
-    // Lattica is witness-only without Taproot (no WitnessV1Taproot variant), so the
-    // bech32m class covers any witness version >= 1 we can still encode: PayToAnchor
-    // (the standard witness-v1 anchor) and any other unknown witness program.
-    if (std::holds_alternative<PayToAnchor>(dest) ||
+    if (std::holds_alternative<WitnessV1Taproot>(dest) ||
         std::holds_alternative<WitnessUnknown>(dest)) {
         return OutputType::BECH32M;
     }
+    // A witness v2 destination is a hash of a key or a script, and neither says
+    // which of the two schemes produced it. Only the wallet holding the key can
+    // tell, so there is nothing to return here.
     return std::nullopt;
 }
