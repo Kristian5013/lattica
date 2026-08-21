@@ -605,9 +605,7 @@ std::optional<std::pair<CExtKey, KeyOriginInfo>> DeriveExtKey(const CExtKey& ext
 {
     CExtKey descendant = ext_key;
     KeyOriginInfo origin;
-    // KeyOriginInfo here still carries raw bytes, the older Core shape.
-    const KeyFingerprint fingerprint = ext_key.id_key_fingerprint();
-    std::copy(fingerprint.begin(), fingerprint.end(), origin.fingerprint);
+    origin.fingerprint = ext_key.id_key_fingerprint();
     origin.path = path;
     for (uint32_t i : path) {
         if (!descendant.Derive(descendant, i)) return std::nullopt;
