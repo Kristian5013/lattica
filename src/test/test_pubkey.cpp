@@ -3,8 +3,8 @@
 //
 // Tests for the crypto-agile CPubKey over the vendored ML-DSA-44: scheme sizes,
 // validity by key length, end-to-end sign/verify through CPubKey::Verify (with
-// tampered message / signature / key rejected), and GetID = first 20 bytes of
-// SHA3-256(scheme byte || pubkey) cross-checked against an independent digest.
+// tampered message / signature / key rejected), and GetID = RIPEMD-160 of
+// SHA3-256(pubkey) cross-checked against an independent digest.
 
 #include <key.h>
 #include <pubkey.h>

@@ -74,7 +74,8 @@ int main()
             const auto blob = DecodeBase64(sig);
             const CPubKey pub = k.GetPubKey();
             Check("blob is key + signature, no padding",
-                  blob && blob->size() == pub.size() + pub.SignatureSize());
+                  blob && blob->size() > pub.size() &&
+                  blob->size() <= pub.size() + pub.SignatureSize());
 
             Check("verify a message with this scheme",
                   MessageVerify(addr, sig, message) == MessageVerificationResult::OK);

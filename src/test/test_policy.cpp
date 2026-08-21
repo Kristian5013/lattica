@@ -6,6 +6,7 @@
 // (no DERSIG/Taproot), and the vsize == bytes identity (WITNESS_SCALE_FACTOR=1).
 
 #include <policy/policy.h>
+#include <pubkey.h>
 #include <policy/feerate.h>
 #include <script/solver.h>
 #include <script/script.h>
@@ -52,7 +53,10 @@ int main()
         bool std_super = (STANDARD_SCRIPT_VERIFY_FLAGS & MANDATORY_SCRIPT_VERIFY_FLAGS) == MANDATORY_SCRIPT_VERIFY_FLAGS;
         Check("MANDATORY has P2SH+WITNESS", p2sh && wit);
         Check("STANDARD superset of MANDATORY", std_super);
-        Check("P2WSH standard item size == MAX_WITNESS_ITEM", MAX_STANDARD_P2WSH_STACK_ITEM_SIZE == MAX_WITNESS_ITEM);
+        Check("witness v0 keeps Bitcoin's standard item size", MAX_STANDARD_P2WSH_STACK_ITEM_SIZE == 80);
+        Check("witness v2 relays a whole ML-DSA signature",
+              MAX_STANDARD_WITNESS_V2_STACK_ITEM_SIZE == MAX_SCRIPT_ELEMENT_SIZE_V2 &&
+              MAX_STANDARD_WITNESS_V2_STACK_ITEM_SIZE >= CPubKey::MLDSA44_SIGNATURE_SIZE + 1);
     }
 
     // IsStandardTx: a plain version-2 P2WPKH-output spend is standard.

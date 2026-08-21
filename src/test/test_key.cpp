@@ -188,8 +188,10 @@ int main()
         const uint256 msg = Hash(std::vector<unsigned char>{'s', 'e', 'c', 'p'});
         std::vector<unsigned char> sig;
         Check("secp: Sign succeeds", k.Sign(msg, sig));
-        Check("secp: signature is 64 bytes (compact r||s)",
-              sig.size() == CPubKey::SECP256K1_SIGNATURE_SIZE);
+        Check("secp: signature is DER within its bound",
+              sig.size() <= CPubKey::SECP256K1_SIGNATURE_SIZE && sig.size() > 8 && sig[0] == 0x30);
+        Check("secp: signing grinds for low R, so the DER stays under 71 bytes",
+              sig.size() <= 71);
         Check("secp: signature verifies", pub.Verify(msg, sig));
 
         // RFC6979: the nonce comes from the key and the message, so a second
@@ -212,30 +214,22 @@ int main()
         }
         {
             std::vector<unsigned char> truncated(sig.begin(), sig.end() - 1);
-            Check("secp: a 63-byte signature is rejected", !pub.Verify(msg, truncated));
+            Check("secp: a truncated signature is rejected", !pub.Verify(msg, truncated));
+            // Trailing junk after the SEQUENCE is what the lax parser exists to
+            // tolerate, exactly as in Bitcoin. Rejecting it is BIP66's job, and
+            // BIP66 lives in the script interpreter behind SCRIPT_VERIFY_DERSIG.
             std::vector<unsigned char> padded = sig;
             padded.push_back(0x00);
-            Check("secp: a 65-byte signature is rejected", !pub.Verify(msg, padded));
+            Check("secp: trailing junk still verifies, as the lax parser allows",
+                  pub.Verify(msg, padded));
         }
 
-        // Low-S is a rule, not a habit. Flip s to n-s: the result is still a
-        // mathematically valid ECDSA signature for the same key and message —
-        // that is exactly the classic malleability — and it must be refused.
-        {
-            static const unsigned char N[32] = {
-                0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,
-                0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B, 0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41};
-            std::vector<unsigned char> high = sig;
-            int borrow = 0;
-            for (int i = 31; i >= 0; --i) {
-                const int d = int(N[i]) - int(sig[32 + i]) - borrow;
-                high[32 + i] = static_cast<unsigned char>(d & 0xff);
-                borrow = (d < 0) ? 1 : 0;
-            }
-            Check("secp: n-s differs from s (the flip did something)",
-                  !std::equal(high.begin() + 32, high.end(), sig.begin() + 32));
-            Check("secp: high-S is rejected as non-canonical", !pub.Verify(msg, high));
-        }
+        // Low-S is BIP62 rule 5, which Bitcoin enforces at script level rather
+        // than inside verification: CPubKey::Verify normalizes and accepts, and
+        // CheckLowS is what reports the form. Signing always produces low-S.
+        Check("secp: a fresh signature is low-S", CPubKey::CheckLowS(sig));
+        Check("secp: CheckLowS refuses a blob that is not a signature",
+              !CPubKey::CheckLowS(std::vector<unsigned char>{0x01, 0x02, 0x03}));
 
         // An ML-DSA public key must not accept a secp signature, or vice versa.
         {
@@ -248,7 +242,8 @@ int main()
 
         // GetPrivKey / Load round-trip.
         const CPrivKey priv = k.GetPrivKey();
-        Check("secp: serialized secret is 32 bytes", priv.size() == 32);
+        Check("secp: serialized secret is DER, as in Bitcoin",
+              priv.size() == CKey::DER_COMPRESSED_SIZE);
         CKey loaded;
         Check("secp: Load round-trips", loaded.Load(priv, pub, /*fSkipCheck=*/false));
         Check("secp: loaded key equals original", loaded == k);
@@ -273,7 +268,9 @@ int main()
             // Load() with fSkipCheck=false goes through Set(), which derives the
             // public key and compares; success means the derivation produced
             // exactly these bytes.
-            const bool ok = k.Load(CPrivKey(sk.begin(), sk.end()), expected, /*fSkipCheck=*/false);
+            // The scalar is loaded as a seed: CPrivKey is DER for secp256k1, as
+            // in Bitcoin, and a KAT names the scalar itself.
+            const bool ok = k.MakeKeyFromSeed(CKey::SECP256K1_SIZE, sk);
             Check((std::string("secp KAT: ") + kat.name).c_str(), ok && k.GetPubKey() == expected);
         }
 

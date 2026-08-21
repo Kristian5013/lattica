@@ -86,7 +86,7 @@ int main()
     Check("child != master", !(c0a.key == m1.key));
     Check("child depth == 1", c0a.nDepth == 1 && c0a.nChild == 0);
     Check("child fingerprint == parent keyid[:4]",
-          std::memcmp(c0a.vchFingerprint, m1.key.GetPubKey().GetID().begin(), 4) == 0);
+          c0a.fingerprint == m1.key.GetPubKey().GetID().fingerprint());
     Check("child key signs and verifies", SignsAndVerifies(c0a.key, h));
 
     // A two-level path m/0/5 is reproducible and deepens correctly.
