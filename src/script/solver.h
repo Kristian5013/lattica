@@ -1,5 +1,9 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
+//
+// Ported from Bitcoin Core's src/script/solver.h. Two things are absent and
+// both are Taproot: TxoutType::WITNESS_V1_TAPROOT and MatchMultiA(), the
+// tapscript multisig matcher. Everything else is Core's, line for line.
 
 // The Solver functions are used by policy and the wallet, but not consensus.
 

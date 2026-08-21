@@ -1,5 +1,18 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
+//
+// Ported from Bitcoin Core's src/script/solver.cpp. Three things differ, and
+// only the third is a rewrite rather than an omission:
+//
+//   * TxoutType::WITNESS_V1_TAPROOT and its branch in Solver() are absent —
+//     there is no witness v1 here, so such a program falls through to
+//     WITNESS_UNKNOWN like any other reserved version.
+//   * MatchMultiA(), the tapscript multisig matcher, is absent for the same
+//     reason.
+//   * MatchPayToPubkey() cannot take Core's form. Core writes one branch per
+//     key size because both of its sizes push directly; of the three here only
+//     secp256k1's 33 bytes do, and 897 and 1312 arrive via OP_PUSHDATA2. The
+//     byte-offset shape is kept — see the comment on it for why that matters.
 
 #include <script/solver.h>
 
@@ -30,20 +43,46 @@ std::string GetTxnOutputType(TxoutType t)
     assert(false);
 }
 
+/**
+ * One branch of MatchPayToPubkey, for a key of `len` bytes.
+ *
+ * Core writes its two branches out literally because 33 and 65 both fit the
+ * direct-push range; here only 33 does, so the push header is either the one
+ * byte of a direct push or the three of OP_PUSHDATA2. The shape is otherwise
+ * Core's: match by byte offset rather than by parsing.
+ *
+ * That is the point rather than an implementation detail. Matching offsets
+ * accepts only the minimal push encoding, which is what Core's form does
+ * implicitly. Parsing with GetOp would also accept a 33-byte key announced by
+ * OP_PUSHDATA1 or OP_PUSHDATA4, and two scripts that no standardness rule
+ * treats as the same would classify as one output type.
+ */
+static bool MatchPayToPubkeyOfSize(const CScript& script, unsigned int len, valtype& pubkey)
+{
+    // Direct pushes are opcodes 0x01..0x4b; anything longer needs a prefix.
+    if (len <= 0x4b) {
+        if (script.size() == len + 2 && script[0] == len && script.back() == OP_CHECKSIG) {
+            pubkey = valtype(script.begin() + 1, script.begin() + 1 + len);
+            return CPubKey::ValidSize(pubkey);
+        }
+        return false;
+    }
+    // OP_PUSHDATA2 is minimal for 76..65535: the opcode, then the length
+    // little-endian.
+    if (script.size() == len + 4 && script[0] == OP_PUSHDATA2 &&
+        script[1] == (len & 0xff) && script[2] == ((len >> 8) & 0xff) &&
+        script.back() == OP_CHECKSIG) {
+        pubkey = valtype(script.begin() + 3, script.begin() + 3 + len);
+        return CPubKey::ValidSize(pubkey);
+    }
+    return false;
+}
+
 static bool MatchPayToPubkey(const CScript& script, valtype& pubkey)
 {
-    // A public key here may be any implemented scheme's, and ValidSize() decides
-    // by length. The push is parsed with GetOp rather than Core's byte-offset
-    // shortcut because a lattice key exceeds the single-byte push range and
-    // arrives via OP_PUSHDATA2. (Bare P2PK is unspendable for the lattice
-    // schemes — their signatures do not fit a BASE script — but is classified.)
-    opcodetype opcode;
-    valtype data;
-    CScript::const_iterator it = script.begin();
-    if (!script.GetOp(it, opcode, data) || !CPubKey::ValidSize(data)) return false;
-    pubkey = std::move(data);
-    if (!script.GetOp(it, opcode, data) || opcode != OP_CHECKSIG) return false;
-    return it == script.end();
+    return MatchPayToPubkeyOfSize(script, CPubKey::SECP256K1_SIZE, pubkey) ||
+           MatchPayToPubkeyOfSize(script, CPubKey::FALCON512_SIZE, pubkey) ||
+           MatchPayToPubkeyOfSize(script, CPubKey::MLDSA44_SIZE, pubkey);
 }
 
 static bool MatchPayToPubkeyHash(const CScript& script, valtype& pubkeyhash)
@@ -128,7 +167,8 @@ TxoutType Solver(const CScript& scriptPubKey, std::vector<std::vector<unsigned c
             vSolutionsRet.push_back(std::move(witnessprogram));
             return TxoutType::WITNESS_V0_SCRIPTHASH;
         }
-        // Lattica has no Taproot (witness v1); such programs are unknown.
+        // Core has a witness v1 / Taproot branch here. Lattica has no v1, so a
+        // v1 program is simply another reserved version.
         if (scriptPubKey.IsPayToAnchor()) {
             return TxoutType::ANCHOR;
         }

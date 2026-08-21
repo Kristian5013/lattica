@@ -11,7 +11,7 @@ set(LATTICA_TESTS
   test_merkle test_mldsa44 test_moneystr test_policy test_pow test_pubkey
   test_random test_retarget test_ripemd160 test_script test_serialize test_sigcache
   test_signingprovider test_sign test_spend test_sha256 test_signmessage
-  test_sha3 test_sha3_512 test_strencodings test_transaction test_txdb
+  test_sha3 test_sha3_512 test_solver test_strencodings test_transaction test_txdb
   test_txgraph test_tx_check test_tx_verify test_uint256 test_v2cipher
   test_v2transport test_validation test_wallet test_wallet_spend test_walletdb)
 
