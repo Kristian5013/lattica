@@ -396,11 +396,24 @@ struct CExtPubKey {
         return pubkey.GetID().fingerprint();
     }
 
+    //! Encode/Decode are BIP32's fixed 74 bytes and so are secp256k1's; Encode
+    //! asserts a 33-byte key. They are the base58 form, which only that scheme
+    //! has.
     void Encode(unsigned char code[BIP32_EXTKEY_SIZE]) const;
     void Decode(const unsigned char code[BIP32_EXTKEY_SIZE]);
     void EncodeWithVersion(unsigned char code[BIP32_EXTKEY_WITH_VERSION_SIZE]) const;
     void DecodeWithVersion(const unsigned char code[BIP32_EXTKEY_WITH_VERSION_SIZE]);
     [[nodiscard]] bool Derive(CExtPubKey& out, unsigned int nChild, uint256* bip32_tweak_out = nullptr) const;
+
+    //! Serialization, for records that hold a node of the key tree. Core has none
+    //! and writes Encode()'s fixed 74 bytes instead, which it can because every
+    //! key it caches is 33 bytes. A node here may hold a Falcon-512 or ML-DSA-44
+    //! public key, so the key carries its own length. The version bytes are not
+    //! part of a node and are left out.
+    SERIALIZE_METHODS(CExtPubKey, obj)
+    {
+        READWRITE(obj.nDepth, obj.fingerprint, obj.nChild, obj.chaincode, obj.pubkey);
+    }
 };
 
 #endif // LATTICA_PUBKEY_H

@@ -13,7 +13,7 @@ set(LATTICA_TESTS
   test_signingprovider test_sha256 test_signmessage
   test_sha3 test_sha3_512 test_solver test_strencodings test_taproot test_transaction test_txdb
   test_txgraph test_tx_check test_tx_verify test_uint256 test_v2cipher
-  test_v2transport test_validation test_walletdb)
+  test_v2transport test_validation test_walletdb test_walletutil)
 
 # Removed with the move of the post-quantum schemes from witness v0 to v2:
 # test_interpreter, test_sign, test_spend, test_wallet, test_wallet_spend all

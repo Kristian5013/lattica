@@ -4,17 +4,29 @@
 #ifndef LATTICA_WALLET_WALLETUTIL_H
 #define LATTICA_WALLET_WALLETUTIL_H
 
+#include <script/descriptor.h>
+#include <uint256.h>
 #include <util/fs.h>
 
 #include <cstdint>
+#include <ios>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 class ArgsManager;
+class CExtKey;
+enum class OutputType;
 
 namespace wallet {
 
 //! The directory holding wallet databases: <datadir>/wallets/ (created if absent).
-//! A wallet `name` lives at <walletdir>/<name>/wallet.dat. Lattica opens wallets by
-//! explicit name -> path, so this takes the ArgsManager rather than reading gArgs.
+//! A wallet `name` lives at <walletdir>/<name>/wallet.dat.
+//!
+//! Core reads the global gArgs here. This takes the ArgsManager instead, so that
+//! the five call sites name where their configuration comes from.
 fs::path GetWalletDir(const ArgsManager& args);
 
 enum WalletFlags : uint64_t {
@@ -41,17 +53,11 @@ enum WalletFlags : uint64_t {
     //! a newly created wallet when the wallet database is loaded, to avoid
     //! initialization that should only happen on first run.
     //!
-    //! A secondary function of this flag, which applies to descriptor wallets
-    //! only, is to serve as an ongoing indication that descriptors in the
-    //! wallet should be created manually, and that the wallet should not
-    //! generate automatically generate new descriptors if it is later
-    //! encrypted. To support this behavior, descriptor wallets unlike legacy
-    //! wallets do not automatically unset the BLANK flag when things are
-    //! imported.
-    //!
-    //! This flag is also a mandatory flag to prevent previous versions of
-    //! bitcoin from opening the wallet, thinking it was newly created, and
-    //! then improperly reinitializing it.
+    //! A secondary function of this flag is to serve as an ongoing indication
+    //! that descriptors in the wallet should be created manually, and that the
+    //! wallet should not automatically generate new descriptors if it is later
+    //! encrypted. To support this behavior, importing something into a wallet
+    //! does not unset the BLANK flag.
     WALLET_FLAG_BLANK_WALLET = (1ULL << 33),
 
     //! Indicate that this wallet supports DescriptorScriptPubKeyMan
@@ -61,12 +67,61 @@ enum WalletFlags : uint64_t {
     WALLET_FLAG_EXTERNAL_SIGNER = (1ULL << 35),
 };
 
-// NOTE: Core's walletutil.h also declares the descriptor helper
-// WalletDescriptor / GenerateWalletDescriptor(CExtPubKey, ...). It is deliberately
-// omitted: WalletDescriptor wraps a secp256k1 output descriptor and CExtPubKey-based
-// range expansion, which a post-quantum (ML-DSA) witness-only chain has no analog
-// for (no xpub homomorphism). Lattica's wallet uses a direct ML-DSA HD keystore
-// rather than a DescriptorScriptPubKeyMan.
+/** Descriptor with some wallet metadata */
+class WalletDescriptor
+{
+public:
+    std::shared_ptr<Descriptor> descriptor;
+    uint256 id; // Descriptor ID (calculated once at descriptor initialization/deserialization)
+    uint64_t creation_time = 0;
+    int32_t range_start = 0; // First item in range; start of range, inclusive, i.e. [range_start, range_end). This never changes.
+    int32_t range_end = 0; // Item after the last; end of range, exclusive, i.e. [range_start, range_end). This will increment with each TopUp()
+    int32_t next_index = 0; // Position of the next item to generate
+    DescriptorCache cache;
+
+    void DeserializeDescriptor(const std::string& str)
+    {
+        std::string error;
+        FlatSigningProvider keys;
+        auto descs = Parse(str, keys, error, true);
+        if (descs.empty()) {
+            throw std::ios_base::failure("Invalid descriptor: " + error);
+        }
+        if (descs.size() > 1) {
+            throw std::ios_base::failure("Can't load a multipath descriptor from databases");
+        }
+        descriptor = std::move(descs.at(0));
+        id = DescriptorID(*descriptor);
+    }
+
+    //! The record holds the descriptor's own string. A key expression here is an
+    //! extended private key -- derivation is hardened at every step, so there is
+    //! no public form of one (see Descriptor::IsPrivateOnly) -- which means this
+    //! record carries key material and belongs with the wallet's other secrets,
+    //! encrypted along with them and never handed out as a public descriptor.
+    SERIALIZE_METHODS(WalletDescriptor, obj)
+    {
+        std::string descriptor_str;
+        SER_WRITE(obj, descriptor_str = obj.descriptor->ToString());
+        READWRITE(descriptor_str, obj.creation_time, obj.next_index, obj.range_start, obj.range_end);
+        SER_READ(obj, obj.DeserializeDescriptor(descriptor_str));
+    }
+
+    WalletDescriptor() = default;
+    WalletDescriptor(std::shared_ptr<Descriptor> descriptor, uint64_t creation_time, int32_t range_start, int32_t range_end, int32_t next_index) : descriptor(descriptor), id(DescriptorID(*descriptor)), creation_time(creation_time), range_start(range_start), range_end(range_end), next_index(next_index) { }
+};
+
+/** Build the wallet's own descriptor for an output type, over the given tree.
+ *
+ *  Core takes the master CExtPubKey, because its descriptors expand from an xpub.
+ *  This takes the extended private key: the tree is hardened at every step, so a
+ *  key expression is written with the xprv (see descriptor.cpp).
+ *
+ *  The tree must be the one whose scheme `output_type` names -- see
+ *  SecretSizeForOutputType -- since a lattice key belongs under witness v2 and a
+ *  secp256k1 key does not.
+ */
+WalletDescriptor GenerateWalletDescriptor(const CExtKey& master_key, const OutputType& output_type, bool internal);
 
 } // namespace wallet
 
