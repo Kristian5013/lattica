@@ -105,4 +105,7 @@ void UpdateInput(CTxIn& input, const SignatureData& data);
 /** Determine whether a script (or, for P2SH, its known redeemScript) is a SegWit output. */
 bool IsSegWitOutput(const SigningProvider& provider, const CScript& script);
 
+/** Determine whether a script can be signed for, were the private keys at hand. */
+bool IsSolvable(const SigningProvider& provider, const CScript& script);
+
 #endif // LATTICA_SCRIPT_SIGN_H
