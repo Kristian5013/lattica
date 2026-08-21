@@ -1,9 +1,5 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
-//
-// Ported from Bitcoin Core's src/script/solver.h. Two things are absent and
-// both are Taproot: TxoutType::WITNESS_V1_TAPROOT and MatchMultiA(), the
-// tapscript multisig matcher. Everything else is Core's, line for line.
 
 // The Solver functions are used by policy and the wallet, but not consensus.
 
@@ -32,6 +28,9 @@ enum class TxoutType {
     NULL_DATA, //!< unspendable OP_RETURN script that carries data
     WITNESS_V0_SCRIPTHASH,
     WITNESS_V0_KEYHASH,
+    WITNESS_V1_TAPROOT,
+    WITNESS_V2_SCRIPTHASH, //!< post-quantum, the scheme named by the key's length
+    WITNESS_V2_KEYHASH,    //!< likewise
     WITNESS_UNKNOWN, //!< Only for Witness versions not already defined above
 };
 
@@ -57,6 +56,10 @@ TxoutType Solver(const CScript& scriptPubKey, std::vector<std::vector<unsigned c
 
 /** Generate a P2PK script for the given pubkey. */
 CScript GetScriptForRawPubKey(const CPubKey& pubkey);
+
+/** Determine if script is a "multi_a" script. Returns (threshold, keyspans) if so, and nullopt otherwise.
+ *  The keyspans refer to bytes in the passed script. */
+std::optional<std::pair<int, std::vector<std::span<const unsigned char>>>> MatchMultiA(const CScript& script LIFETIMEBOUND);
 
 /** Generate a multisig script. */
 CScript GetScriptForMultisig(int nRequired, const std::vector<CPubKey>& keys);

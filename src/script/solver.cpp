@@ -1,18 +1,5 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
-//
-// Ported from Bitcoin Core's src/script/solver.cpp. Three things differ, and
-// only the third is a rewrite rather than an omission:
-//
-//   * TxoutType::WITNESS_V1_TAPROOT and its branch in Solver() are absent —
-//     there is no witness v1 here, so such a program falls through to
-//     WITNESS_UNKNOWN like any other reserved version.
-//   * MatchMultiA(), the tapscript multisig matcher, is absent for the same
-//     reason.
-//   * MatchPayToPubkey() cannot take Core's form. Core writes one branch per
-//     key size because both of its sizes push directly; of the three here only
-//     secp256k1's 33 bytes do, and 897 and 1312 arrive via OP_PUSHDATA2. The
-//     byte-offset shape is kept — see the comment on it for why that matters.
 
 #include <script/solver.h>
 
@@ -38,6 +25,9 @@ std::string GetTxnOutputType(TxoutType t)
     case TxoutType::ANCHOR: return "anchor";
     case TxoutType::WITNESS_V0_KEYHASH: return "witness_v0_keyhash";
     case TxoutType::WITNESS_V0_SCRIPTHASH: return "witness_v0_scripthash";
+    case TxoutType::WITNESS_V1_TAPROOT: return "witness_v1_taproot";
+    case TxoutType::WITNESS_V2_KEYHASH: return "witness_v2_keyhash";
+    case TxoutType::WITNESS_V2_SCRIPTHASH: return "witness_v2_scripthash";
     case TxoutType::WITNESS_UNKNOWN: return "witness_unknown";
     } // no default case, so the compiler can warn about missing cases
     assert(false);
@@ -143,6 +133,40 @@ static bool MatchMultisig(const CScript& script, int& required_sigs, std::vector
     return (it + 1 == script.end());
 }
 
+std::optional<std::pair<int, std::vector<std::span<const unsigned char>>>> MatchMultiA(const CScript& script)
+{
+    std::vector<std::span<const unsigned char>> keyspans;
+
+    // Redundant, but very fast and selective test.
+    if (script.size() == 0 || script[0] != 32 || script.back() != OP_NUMEQUAL) return {};
+
+    // Parse keys
+    auto it = script.begin();
+    while (script.end() - it >= 34) {
+        if (*it != 32) return {};
+        ++it;
+        keyspans.emplace_back(&*it, 32);
+        it += 32;
+        if (*it != (keyspans.size() == 1 ? OP_CHECKSIG : OP_CHECKSIGADD)) return {};
+        ++it;
+    }
+    if (keyspans.size() == 0 || keyspans.size() > MAX_PUBKEYS_PER_MULTI_A) return {};
+
+    // Parse threshold.
+    opcodetype opcode;
+    std::vector<unsigned char> data;
+    if (!script.GetOp(it, opcode, data)) return {};
+    if (it == script.end()) return {};
+    if (*it != OP_NUMEQUAL) return {};
+    ++it;
+    if (it != script.end()) return {};
+    auto threshold = GetScriptNumber(opcode, data, 1, (int)keyspans.size());
+    if (!threshold) return {};
+
+    // Construct result.
+    return std::pair{*threshold, std::move(keyspans)};
+}
+
 TxoutType Solver(const CScript& scriptPubKey, std::vector<std::vector<unsigned char>>& vSolutionsRet)
 {
     vSolutionsRet.clear();
@@ -167,8 +191,18 @@ TxoutType Solver(const CScript& scriptPubKey, std::vector<std::vector<unsigned c
             vSolutionsRet.push_back(std::move(witnessprogram));
             return TxoutType::WITNESS_V0_SCRIPTHASH;
         }
-        // Core has a witness v1 / Taproot branch here. Lattica has no v1, so a
-        // v1 program is simply another reserved version.
+        if (witnessversion == 1 && witnessprogram.size() == WITNESS_V1_TAPROOT_SIZE) {
+            vSolutionsRet.push_back(std::move(witnessprogram));
+            return TxoutType::WITNESS_V1_TAPROOT;
+        }
+        if (witnessversion == 2 && witnessprogram.size() == WITNESS_V2_KEYHASH_SIZE) {
+            vSolutionsRet.push_back(std::move(witnessprogram));
+            return TxoutType::WITNESS_V2_KEYHASH;
+        }
+        if (witnessversion == 2 && witnessprogram.size() == WITNESS_V2_SCRIPTHASH_SIZE) {
+            vSolutionsRet.push_back(std::move(witnessprogram));
+            return TxoutType::WITNESS_V2_SCRIPTHASH;
+        }
         if (scriptPubKey.IsPayToAnchor()) {
             return TxoutType::ANCHOR;
         }

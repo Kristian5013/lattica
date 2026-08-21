@@ -140,15 +140,29 @@ int main()
     CheckType("witness v0, 32-byte program",
               CScript() << OP_0 << h32,
               TxoutType::WITNESS_V0_SCRIPTHASH);
-    CheckType("witness v1 is unknown here (no Taproot)",
+    CheckType("witness v1, 32-byte program is Taproot",
               CScript() << OP_1 << h32,
-              TxoutType::WITNESS_UNKNOWN);
-    CheckType("witness v2 is unknown, and reserved for post-quantum",
+              TxoutType::WITNESS_V1_TAPROOT);
+    CheckType("witness v2, 20-byte program",
+              CScript() << OP_2 << h20,
+              TxoutType::WITNESS_V2_KEYHASH);
+    CheckType("witness v2, 32-byte program",
               CScript() << OP_2 << h32,
-              TxoutType::WITNESS_UNKNOWN);
+              TxoutType::WITNESS_V2_SCRIPTHASH);
     CheckType("witness v0 of an unexpected length",
               CScript() << OP_0 << valtype(30, 0x11),
               TxoutType::NONSTANDARD);
+    // A defined version at a length it does not define falls through to the
+    // unknown branch, as Bitcoin's witness v1 does at any length but 32.
+    CheckType("witness v1 of an unexpected length is unknown",
+              CScript() << OP_1 << valtype(20, 0x11),
+              TxoutType::WITNESS_UNKNOWN);
+    CheckType("witness v2 of an unexpected length is unknown",
+              CScript() << OP_2 << valtype(30, 0x11),
+              TxoutType::WITNESS_UNKNOWN);
+    CheckType("witness v3 is unknown, and reserved",
+              CScript() << OP_3 << h32,
+              TxoutType::WITNESS_UNKNOWN);
     CheckType("anchor",
               CScript() << OP_1 << valtype{0x4e, 0x73},
               TxoutType::ANCHOR);
@@ -179,12 +193,56 @@ int main()
               CScript() << OP_2 << k_secp << k_mldsa << OP_2 << OP_CHECKMULTISIG,
               TxoutType::MULTISIG);
 
+    // ---- The witness branches hand the program back, which is what the address
+    // layer reads to build a destination out of.
+    {
+        std::vector<valtype> sol;
+        Solver(CScript() << OP_1 << h32, sol);
+        Check("taproot solution is the 32-byte output key", sol.size() == 1 && sol[0] == h32);
+        Solver(CScript() << OP_2 << h20, sol);
+        Check("witness v2 keyhash solution is the 20-byte hash", sol.size() == 1 && sol[0] == h20);
+        Solver(CScript() << OP_2 << h32, sol);
+        Check("witness v2 scripthash solution is the 32-byte hash", sol.size() == 1 && sol[0] == h32);
+        // An unknown version hands back the version first, then the program, so a
+        // caller can tell them apart without re-parsing the script.
+        Solver(CScript() << OP_3 << h32, sol);
+        Check("an unknown version hands back version then program",
+              sol.size() == 2 && sol[0] == valtype{3} && sol[1] == h32);
+    }
+
+    // ---- MatchMultiA, tapscript's multisig. Keys are 32-byte x-only ones, the
+    // first checked with OP_CHECKSIG and the rest accumulated with OP_CHECKSIGADD.
+    {
+        const valtype k1(32, 0x11), k2(32, 0x22), k3(32, 0x33);
+        const CScript multi_a = CScript() << k1 << OP_CHECKSIG << k2 << OP_CHECKSIGADD
+                                          << k3 << OP_CHECKSIGADD << 2 << OP_NUMEQUAL;
+        const auto m = MatchMultiA(multi_a);
+        Check("MatchMultiA reads a 2-of-3", m.has_value() && m->first == 2 && m->second.size() == 3);
+        if (m) {
+            Check("...and the key spans point at the script's own bytes",
+                  std::equal(m->second[0].begin(), m->second[0].end(), k1.begin()) &&
+                  std::equal(m->second[2].begin(), m->second[2].end(), k3.begin()));
+        }
+        // multi_a is a tapscript leaf, not a scriptPubKey; Solver must not claim it.
+        CheckType("a multi_a script is not a standard output on its own",
+                  multi_a, TxoutType::NONSTANDARD);
+
+        Check("MatchMultiA refuses a threshold above the key count",
+              !MatchMultiA(CScript() << k1 << OP_CHECKSIG << 2 << OP_NUMEQUAL).has_value());
+        Check("MatchMultiA refuses OP_CHECKSIG where OP_CHECKSIGADD belongs",
+              !MatchMultiA(CScript() << k1 << OP_CHECKSIG << k2 << OP_CHECKSIG << 2 << OP_NUMEQUAL).has_value());
+        Check("MatchMultiA refuses a 33-byte key",
+              !MatchMultiA(CScript() << valtype(33, 0x02) << OP_CHECKSIG << 1 << OP_NUMEQUAL).has_value());
+    }
+
     // ---- Every name round-trips, so a new TxoutType cannot be added without
     // giving it one.
     for (const TxoutType t : {TxoutType::NONSTANDARD, TxoutType::ANCHOR, TxoutType::PUBKEY,
                               TxoutType::PUBKEYHASH, TxoutType::SCRIPTHASH, TxoutType::MULTISIG,
                               TxoutType::NULL_DATA, TxoutType::WITNESS_V0_SCRIPTHASH,
-                              TxoutType::WITNESS_V0_KEYHASH, TxoutType::WITNESS_UNKNOWN}) {
+                              TxoutType::WITNESS_V0_KEYHASH, TxoutType::WITNESS_V1_TAPROOT,
+                              TxoutType::WITNESS_V2_SCRIPTHASH, TxoutType::WITNESS_V2_KEYHASH,
+                              TxoutType::WITNESS_UNKNOWN}) {
         if (!GetTxnOutputType(t).empty()) continue;
         Check("every TxoutType has a name", false);
         break;
