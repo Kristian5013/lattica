@@ -4,6 +4,7 @@
 add_library(lattica_util STATIC EXCLUDE_FROM_ALL
   asmap.cpp
   batchpriority.cpp
+  bip32.cpp
   bytevectorhash.cpp
   chaintype.cpp
   check.cpp
