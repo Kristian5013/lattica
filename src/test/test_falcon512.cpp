@@ -70,7 +70,7 @@ int main()
               sig.data(), siglen, m, mlen, pk.data()) == 0);
 
     // Padding is load-bearing: the verifier must reject any other length, or the
-    // fixed-size contract SchemeSignatureSize() rests on would be a fiction.
+    // fixed-size contract CPubKey::FALCON512_SIGNATURE_SIZE rests on would be a fiction.
     Check("a 665-byte signature is rejected",
           PQCLEAN_FALCONPADDED512_CLEAN_crypto_sign_verify(
               sig.data(), siglen - 1, m, mlen, pk.data()) != 0);

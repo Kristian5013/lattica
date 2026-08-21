@@ -53,17 +53,18 @@ MessageVerificationResult MessageVerify(
     // secp256k1, 1563 for Falcon-512, 3732 for ML-DSA-44 — so exactly one split
     // can be right. A fixed CPubKey::SIZE offset would only ever have worked for
     // the largest scheme.
-    std::optional<SigScheme> scheme;
-    for (const SigScheme s : ALL_SIG_SCHEMES) {
-        if (signature_bytes->size() == SchemePublicKeySize(s) + SchemeSignatureSize(s)) {
-            scheme = s;
+    size_t pk_len{0};
+    for (const unsigned int n : {CPubKey::SECP256K1_SIZE, CPubKey::FALCON512_SIZE, CPubKey::MLDSA44_SIZE}) {
+        if (signature_bytes->size() <= n) continue;
+        const CPubKey candidate(signature_bytes->begin(), signature_bytes->begin() + n);
+        if (candidate.IsValid() && signature_bytes->size() == n + candidate.SignatureSize()) {
+            pk_len = n;
             break;
         }
     }
-    if (!scheme) {
+    if (pk_len == 0) {
         return MessageVerificationResult::ERR_MALFORMED_SIGNATURE;
     }
-    const size_t pk_len{SchemePublicKeySize(*scheme)};
     CPubKey pubkey(signature_bytes->begin(), signature_bytes->begin() + pk_len);
     if (!pubkey.IsValid()) {
         return MessageVerificationResult::ERR_PUBKEY_NOT_RECOVERED;

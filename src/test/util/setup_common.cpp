@@ -421,7 +421,7 @@ TestChain100Setup::TestChain100Setup(
 {
     constexpr std::array<unsigned char, 32> vchKey = {
         {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}};
-    coinbaseKey.MakeKeyFromSeed(SigScheme::ML_DSA_44, vchKey);
+    coinbaseKey.MakeKeyFromSeed(CKey::MLDSA44_SIZE, vchKey);
 
     // Generate a 100-block chain:
     this->mineBlocks(COINBASE_MATURITY);

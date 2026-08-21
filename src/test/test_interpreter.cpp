@@ -57,15 +57,6 @@ bool Eval(const CScript& script, std::vector<valtype>& stack, ScriptError* err =
 }
 
 // (scheme byte || raw key) — the on-stack public key form.
-//! A public key as it appears on the stack: the scheme's own bytes, nothing in
-//! front. The scheme follows from the length, so this is now just a copy — kept
-//! as a named helper so the call sites still say which scheme they mean.
-valtype PubkeyStack(SigScheme scheme, const valtype& rawkey)
-{
-    assert(rawkey.size() == SchemePublicKeySize(scheme));
-    return rawkey;
-}
-
 valtype Hash160Vec(const valtype& data)
 {
     uint160 h = Hash160(data);
@@ -135,7 +126,7 @@ int main()
     constexpr size_t SIGMAX = PQCLEAN_MLDSA44_CLEAN_CRYPTO_BYTES;
     valtype pk(PK), sk(SK);
     PQCLEAN_MLDSA44_CLEAN_crypto_sign_keypair(pk.data(), sk.data());
-    const valtype pubkey_stack = PubkeyStack(SigScheme::ML_DSA_44, pk);
+    const valtype pubkey_stack = pk;
     const valtype pkh = Hash160Vec(pubkey_stack);
 
     auto sign = [&](const uint256& sighash, unsigned char hashtype) {
@@ -229,7 +220,7 @@ int main()
     // CheckSig picks the verifier from that leading byte. This exercises
     // crypto-agility through the consensus engine rather than at the primitive.
     {
-        const CKey sk_secp = GenerateRandomKey(SigScheme::SECP256K1);
+        const CKey sk_secp = GenerateRandomKey(CKey::SECP256K1_SIZE);
         const CPubKey pub_secp = sk_secp.GetPubKey();
         const valtype pubkey_secp(pub_secp.begin(), pub_secp.end());
         const valtype pkh_secp = Hash160Vec(pubkey_secp);
@@ -302,7 +293,7 @@ int main()
     // is a compromise rather than an extreme: 1570 bytes against secp's 99 and
     // ML-DSA's 3741.
     {
-        const CKey sk_f = GenerateRandomKey(SigScheme::FALCON_512);
+        const CKey sk_f = GenerateRandomKey(CKey::FALCON512_SIZE);
         const CPubKey pub_f = sk_f.GetPubKey();
         const valtype pubkey_f(pub_f.begin(), pub_f.end());
         const valtype pkh_f = Hash160Vec(pubkey_f);
@@ -360,7 +351,7 @@ int main()
     // 520 B MAX_SCRIPT_ELEMENT_SIZE made every such script unspendable at execution.
     valtype pk2v(PK), sk2v(SK);
     PQCLEAN_MLDSA44_CLEAN_crypto_sign_keypair(pk2v.data(), sk2v.data());
-    const valtype pubkey_stack2 = PubkeyStack(SigScheme::ML_DSA_44, pk2v);
+    const valtype pubkey_stack2 = pk2v;
 
     auto sign_with = [&](const valtype& sk_, const uint256& h, unsigned char ht) {
         valtype sig(SIGMAX);
@@ -419,7 +410,7 @@ int main()
     // from the witness version — Bitcoin's — cannot express this at all, since
     // every key under one version shares one algorithm.
     {
-        const CKey sk_secp = GenerateRandomKey(SigScheme::SECP256K1);
+        const CKey sk_secp = GenerateRandomKey(CKey::SECP256K1_SIZE);
         const CPubKey pub_secp = sk_secp.GetPubKey();
         const valtype pubkey_secp(pub_secp.begin(), pub_secp.end());
 
@@ -507,7 +498,7 @@ int main()
     {
         valtype pk3v(PK), sk3v(SK);
         PQCLEAN_MLDSA44_CLEAN_crypto_sign_keypair(pk3v.data(), sk3v.data());
-        const valtype pubkey_stack3 = PubkeyStack(SigScheme::ML_DSA_44, pk3v);
+        const valtype pubkey_stack3 = pk3v;
 
         CScript ws = CScript() << OP_3 << pubkey_stack << pubkey_stack2 << pubkey_stack3 << OP_3 << OP_CHECKMULTISIG;
         CScript spk = p2wsh_spk(ws);

@@ -164,8 +164,8 @@ int main()
         bool witness_sizes_ok = !tx.vin.empty();
         for (const auto& in : tx.vin) {
             if (in.scriptWitness.stack.size() != 2) { witness_sizes_ok = false; continue; }
-            if (in.scriptWitness.stack[0].size() != size_t(SchemeSignatureSize(SigScheme::ML_DSA_44) + 1)) witness_sizes_ok = false;
-            if (in.scriptWitness.stack[1].size() != SchemePublicKeySize(SigScheme::ML_DSA_44)) witness_sizes_ok = false;
+            if (in.scriptWitness.stack[0].size() != size_t(CPubKey::MLDSA44_SIGNATURE_SIZE + 1)) witness_sizes_ok = false;
+            if (in.scriptWitness.stack[1].size() != CPubKey::MLDSA44_SIZE) witness_sizes_ok = false;
         }
         Check("ML-DSA witness sizes match the size model (sig 2421 + pubkey 1312)", witness_sizes_ok);
 

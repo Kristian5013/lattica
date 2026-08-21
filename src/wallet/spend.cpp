@@ -59,8 +59,8 @@ static constexpr size_t OUTPUT_GROUP_MAX_ENTRIES{100};
  *  + witness{ stack item count(2), signature, pubkey }. */
 static int64_t MaxP2WPKHInputWeight()
 {
-    const int64_t sig_size = SchemeSignatureSize(SigScheme::ML_DSA_44) + 1; // signature || sighash byte
-    const int64_t pubkey_size = SchemePublicKeySize(SigScheme::ML_DSA_44);
+    const int64_t sig_size = CPubKey::MLDSA44_SIGNATURE_SIZE + 1; // signature || sighash byte
+    const int64_t pubkey_size = CPubKey::MLDSA44_SIZE;
     const int64_t base = 36 + 1 + 4;
     const int64_t witness = GetSizeOfCompactSize(2)
         + GetSizeOfCompactSize(sig_size) + sig_size

@@ -141,7 +141,7 @@ bool DecryptKey(const CKeyingMaterial& master_key, const std::span<const unsigne
     // key's leading byte. Core reconstructs from (secret, pubkey, compression);
     // there is no compression flag here, and ML-DSA cannot recompute the public
     // key from the secret, so it is supplied to Set() and verified there.
-    if (secret.size() != SchemeSecretKeySize(pub_key.GetScheme())) {
+    if (secret.size() != CKey::SecretSizeForPubKey(pub_key.size())) {
         return false;
     }
 

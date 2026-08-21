@@ -54,20 +54,20 @@ int main()
     // A freshly generated key is valid and exposes a valid, well-formed pubkey.
     CKey key = GenerateRandomKey();
     Check("generated key is valid", key.IsValid());
-    Check("key scheme is ML-DSA-44", key.GetScheme() == SigScheme::ML_DSA_44);
-    Check("secret key size == 2560", key.size() == SchemeSecretKeySize(SigScheme::ML_DSA_44));
+    Check("key scheme is ML-DSA-44", key.size() == CKey::MLDSA44_SIZE);
+    Check("secret key size == 2560", key.size() == CKey::MLDSA44_SIZE);
 
     CPubKey pub = key.GetPubKey();
     Check("public key is valid", pub.IsValid());
-    Check("public key size == 1312", pub.size() == SchemePublicKeySize(SigScheme::ML_DSA_44));
-    Check("scheme is read off the length", pub.GetScheme() == SigScheme::ML_DSA_44);
+    Check("public key size == 1312", pub.size() == CPubKey::MLDSA44_SIZE);
+    Check("scheme is read off the length", pub.size() == CPubKey::MLDSA44_SIZE);
 
     // Sign a sighash and verify it under the public key.
     const uint256 hash = Hash(std::span<const unsigned char>(pub.data(), pub.size()));
     std::vector<unsigned char> sig;
     bool signed_ok = key.Sign(hash, sig);
     Check("Sign succeeds", signed_ok);
-    Check("signature size == 2420", sig.size() == SchemeSignatureSize(SigScheme::ML_DSA_44));
+    Check("signature size == 2420", sig.size() == CPubKey::MLDSA44_SIGNATURE_SIZE);
     Check("signature verifies under own pubkey", pub.Verify(hash, sig));
 
     // A different message must not verify against that signature.
@@ -110,7 +110,7 @@ int main()
     // the same pubkey, and still produces verifiable signatures.
     {
         CPrivKey priv = key.GetPrivKey();
-        Check("serialized private key size == 2560", priv.size() == SchemeSecretKeySize(SigScheme::ML_DSA_44));
+        Check("serialized private key size == 2560", priv.size() == CKey::MLDSA44_SIZE);
         CKey loaded;
         bool load_ok = loaded.Load(priv, pub, /*fSkipCheck=*/false);
         Check("Load (with check) succeeds", load_ok);
@@ -161,26 +161,26 @@ int main()
     // that the day it lands, this test fails and gets updated rather than
     // silently passing.
     {
-        CKey k = GenerateRandomKey(SigScheme::SECP256K1);
+        CKey k = GenerateRandomKey(CKey::SECP256K1_SIZE);
         Check("secp: generated key is valid", k.IsValid());
-        Check("secp: scheme is SECP256K1", k.GetScheme() == SigScheme::SECP256K1);
+        Check("secp: scheme is SECP256K1", k.size() == CKey::SECP256K1_SIZE);
         Check("secp: secret is 32 bytes", k.size() == 32);
 
         const CPubKey pub = k.GetPubKey();
         Check("secp: pubkey is valid", pub.IsValid());
         Check("secp: pubkey is 33 bytes, no tag in front", pub.size() == 33);
-        Check("secp: 33 bytes means secp256k1", pub.GetScheme() == SigScheme::SECP256K1);
+        Check("secp: 33 bytes means secp256k1", pub.size() == CPubKey::SECP256K1_SIZE);
         Check("secp: key is compressed SEC (0x02/0x03)",
               pub[0] == 0x02 || pub[0] == 0x03);
 
         Check("secp: VerifyPubKey accepts its own", k.VerifyPubKey(pub));
 
-        CKey other = GenerateRandomKey(SigScheme::SECP256K1);
+        CKey other = GenerateRandomKey(CKey::SECP256K1_SIZE);
         Check("secp: two fresh keys differ", !(other == k) && other.GetPubKey() != pub);
         Check("secp: VerifyPubKey rejects a foreign key", !k.VerifyPubKey(other.GetPubKey()));
 
         // Cross-scheme confusion must not pass in either direction.
-        const CKey mldsa = GenerateRandomKey(SigScheme::ML_DSA_44);
+        const CKey mldsa = GenerateRandomKey(CKey::MLDSA44_SIZE);
         Check("secp: VerifyPubKey rejects an ML-DSA pubkey", !k.VerifyPubKey(mldsa.GetPubKey()));
         Check("ML-DSA: VerifyPubKey rejects a secp pubkey", !mldsa.VerifyPubKey(pub));
 
@@ -189,7 +189,7 @@ int main()
         std::vector<unsigned char> sig;
         Check("secp: Sign succeeds", k.Sign(msg, sig));
         Check("secp: signature is 64 bytes (compact r||s)",
-              sig.size() == SchemeSignatureSize(SigScheme::SECP256K1));
+              sig.size() == CPubKey::SECP256K1_SIGNATURE_SIZE);
         Check("secp: signature verifies", pub.Verify(msg, sig));
 
         // RFC6979: the nonce comes from the key and the message, so a second
@@ -268,7 +268,7 @@ int main()
         for (const auto& kat : kats) {
             const std::vector<unsigned char> sk = FromHex(kat.scalar);
             const std::vector<unsigned char> raw = FromHex(kat.pubkey);
-            const CPubKey expected(SigScheme::SECP256K1, raw);
+            const CPubKey expected(raw);
             CKey k;
             // Load() with fSkipCheck=false goes through Set(), which derives the
             // public key and compares; success means the derivation produced
@@ -282,14 +282,14 @@ int main()
         const std::vector<unsigned char> wrong = FromHex("02C6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5");
         CKey k;
         Check("secp: Load rejects a mismatched pubkey",
-              !k.Load(CPrivKey(sk.begin(), sk.end()), CPubKey(SigScheme::SECP256K1, wrong), false));
+              !k.Load(CPrivKey(sk.begin(), sk.end()), CPubKey(wrong), false));
 
         // Out-of-range scalars are rejected: zero, and n itself.
         for (const char* bad : {"0000000000000000000000000000000000000000000000000000000000000000",
                                 "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"}) {
             const std::vector<unsigned char> b = FromHex(bad);
             CKey bk;
-            const CPubKey any(SigScheme::SECP256K1, FromHex("0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"));
+            const CPubKey any(FromHex("0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"));
             Check("secp: out-of-range scalar refused",
                   !bk.Load(CPrivKey(b.begin(), b.end()), any, false));
         }
@@ -297,15 +297,15 @@ int main()
 
     // ---------------------------------------------------------------- Falcon-512
     {
-        CKey k = GenerateRandomKey(SigScheme::FALCON_512);
+        CKey k = GenerateRandomKey(CKey::FALCON512_SIZE);
         Check("falcon: generated key is valid", k.IsValid());
-        Check("falcon: scheme is FALCON_512", k.GetScheme() == SigScheme::FALCON_512);
+        Check("falcon: scheme is FALCON_512", k.size() == CKey::FALCON512_SIZE);
         Check("falcon: secret is 1281 bytes", k.size() == 1281);
 
         const CPubKey pub = k.GetPubKey();
         Check("falcon: pubkey is valid", pub.IsValid());
         Check("falcon: pubkey is 897 bytes, no tag in front", pub.size() == 897);
-        Check("falcon: 897 bytes means Falcon-512", pub.GetScheme() == SigScheme::FALCON_512);
+        Check("falcon: 897 bytes means Falcon-512", pub.size() == CPubKey::FALCON512_SIZE);
         // A Falcon public key is a packed polynomial whose first byte encodes
         // the degree; 0x09 is n = 512.
         Check("falcon: key says n = 512", pub[0] == 0x09);
@@ -315,7 +315,7 @@ int main()
         std::vector<unsigned char> sig;
         Check("falcon: Sign succeeds", k.Sign(msg, sig));
         Check("falcon: signature is exactly 666 bytes",
-              sig.size() == SchemeSignatureSize(SigScheme::FALCON_512));
+              sig.size() == CPubKey::FALCON512_SIGNATURE_SIZE);
         Check("falcon: signature verifies", pub.Verify(msg, sig));
 
         // Falcon salts every signature, unlike the other two schemes here.
@@ -331,13 +331,13 @@ int main()
         Check("falcon: the wrong message does not verify",
               !pub.Verify(Hash(std::vector<unsigned char>{'x'}), sig));
 
-        CKey other = GenerateRandomKey(SigScheme::FALCON_512);
+        CKey other = GenerateRandomKey(CKey::FALCON512_SIZE);
         Check("falcon: two fresh keys differ", !(other == k) && other.GetPubKey() != pub);
         Check("falcon: a foreign key does not verify it", !other.GetPubKey().Verify(msg, sig));
 
         // Cross-scheme confusion, in every direction that exists.
-        const CKey mldsa_k = GenerateRandomKey(SigScheme::ML_DSA_44);
-        const CKey secp_k = GenerateRandomKey(SigScheme::SECP256K1);
+        const CKey mldsa_k = GenerateRandomKey(CKey::MLDSA44_SIZE);
+        const CKey secp_k = GenerateRandomKey(CKey::SECP256K1_SIZE);
         Check("falcon: VerifyPubKey rejects an ML-DSA pubkey", !k.VerifyPubKey(mldsa_k.GetPubKey()));
         Check("falcon: VerifyPubKey rejects a secp pubkey", !k.VerifyPubKey(secp_k.GetPubKey()));
         {
@@ -361,19 +361,19 @@ int main()
         std::array<unsigned char, 32> seed;
         for (unsigned i = 0; i < seed.size(); ++i) seed[i] = static_cast<unsigned char>(0x20 + i);
 
-        for (const SigScheme scheme : {SigScheme::SECP256K1, SigScheme::FALCON_512, SigScheme::ML_DSA_44}) {
+        for (const unsigned int secret_size : {CKey::SECP256K1_SIZE, CKey::FALCON512_SIZE, CKey::MLDSA44_SIZE}) {
             CKey a, b;
-            Check("seeded keygen succeeds", a.MakeKeyFromSeed(scheme, seed));
-            b.MakeKeyFromSeed(scheme, seed);
+            Check("seeded keygen succeeds", a.MakeKeyFromSeed(secret_size, seed));
+            b.MakeKeyFromSeed(secret_size, seed);
             Check("seeded keygen is deterministic", a == b && a.GetPubKey() == b.GetPubKey());
             Check("seeded keygen rejects a 31-byte seed",
-                  !CKey{}.MakeKeyFromSeed(scheme, std::span<const unsigned char>(seed.data(), 31)));
+                  !CKey{}.MakeKeyFromSeed(secret_size, std::span<const unsigned char>(seed.data(), 31)));
         }
 
         // The same seed must not produce related keys across schemes.
         CKey f, m;
-        f.MakeKeyFromSeed(SigScheme::FALCON_512, seed);
-        m.MakeKeyFromSeed(SigScheme::ML_DSA_44, seed);
+        f.MakeKeyFromSeed(CKey::FALCON512_SIZE, seed);
+        m.MakeKeyFromSeed(CKey::MLDSA44_SIZE, seed);
         Check("one seed gives unrelated keys in different schemes",
               f.GetPubKey() != m.GetPubKey());
 

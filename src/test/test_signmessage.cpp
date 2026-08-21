@@ -65,15 +65,16 @@ int main()
     // sum is distinct: 97, 1563, 3732.
     {
         ECC_Context ecc_context{};
-        for (const SigScheme scheme : ALL_SIG_SCHEMES) {
-            const CKey k = GenerateRandomKey(scheme);
+        for (const unsigned int secret_size : {CKey::SECP256K1_SIZE, CKey::FALCON512_SIZE, CKey::MLDSA44_SIZE}) {
+            const CKey k = GenerateRandomKey(secret_size);
             const std::string addr = EncodeDestination(WitnessV0KeyHash(k.GetPubKey()), Params());
             std::string sig;
             Check("sign a message with this scheme", MessageSign(k, message, sig));
 
             const auto blob = DecodeBase64(sig);
+            const CPubKey pub = k.GetPubKey();
             Check("blob is key + signature, no padding",
-                  blob && blob->size() == SchemePublicKeySize(scheme) + SchemeSignatureSize(scheme));
+                  blob && blob->size() == pub.size() + pub.SignatureSize());
 
             Check("verify a message with this scheme",
                   MessageVerify(addr, sig, message) == MessageVerificationResult::OK);
@@ -82,9 +83,9 @@ int main()
 
             // The address commits to the key, so another scheme's address must
             // not accept this signature.
-            for (const SigScheme other_scheme : ALL_SIG_SCHEMES) {
-                if (other_scheme == scheme) continue;
-                const CKey o = GenerateRandomKey(other_scheme);
+            for (const unsigned int other_size : {CKey::SECP256K1_SIZE, CKey::FALCON512_SIZE, CKey::MLDSA44_SIZE}) {
+                if (other_size == secret_size) continue;
+                const CKey o = GenerateRandomKey(other_size);
                 const std::string oaddr = EncodeDestination(WitnessV0KeyHash(o.GetPubKey()), Params());
                 Check("another scheme's address does not accept it",
                       MessageVerify(oaddr, sig, message) != MessageVerificationResult::OK);

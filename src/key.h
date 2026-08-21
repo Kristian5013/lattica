@@ -12,14 +12,15 @@
 // survives a second scheme, so this class keeps Core's contract and skeleton
 // while its interior is written for three:
 //
-//     tag    scheme        secret  public  signature
-//     0x01   ML-DSA-44       2560    1312       2420   FIPS 204, lattice
-//     0x02   Falcon-512      1281     897        666   NTRU lattice, padded form
-//     0x03   secp256k1         32      33         64   compact r||s, low-S
+//     scheme        secret  public  signature
+//     secp256k1         32      33         64
+//     Falcon-512      1281     897        666
+//     ML-DSA-44       2560    1312       2420
 //
-// A CKey holds the secret of exactly one of them, tagged by the same SigScheme
-// byte that leads its public key, so the scheme travels with the key rather
-// than being tracked beside it.
+// Nothing names the scheme. As in CPubKey, the length is the type information:
+// a CKey holds one secret and the size of that secret says which algorithm it
+// belongs to. The sizes are pairwise distinct and a static_assert holds them
+// that way, which is the same rule CPubKey rests on.
 //
 // Three consequences are worth stating because they are not choices:
 //
@@ -28,21 +29,21 @@
 //     packs t1, and recovering t1 means re-expanding A and recomputing
 //     t = A*s1 + s2. Falcon's is recomputable in principle (h = g/f mod q) but
 //     PQClean exposes that only as an internal symbol over unpacked
-//     polynomials, not through its api.h. Rather than branch on storage, every
-//     scheme captures the public key at generation time.
+//     polynomials. Rather than branch on storage, every scheme captures the
+//     public key at generation time.
 //
-//   * There is no compression flag. Core's public-key header byte (0x02/0x03 vs
-//     0x04) IS the compression marker; here the leading byte is the scheme tag,
-//     and CPubKey::GetLen() maps one tag to exactly one length. secp256k1 keys
-//     are therefore compressed-only.
+//   * There is no compression flag. Core's public-key header byte is the
+//     compression marker and the source of its length; here the length is the
+//     scheme, and one scheme cannot have two lengths, so secp256k1 keys are
+//     compressed-only.
 //
-//   * There are no per-class size constants. A CKey has no single size; the
-//     sizes live in pubkey.h as SchemeSecretKeySize() / SchemePublicKeySize() /
-//     SchemeSignatureSize(), keyed by the tag.
+//   * A caller that wants a particular scheme names it by size —
+//     GenerateRandomKey(CKey::FALCON512_SIZE). Passing the wrong constant is a
+//     runtime rejection rather than a compile error; that is the cost of having
+//     no tag type.
 //
-// Parts of Core's key.h with no analog here are not dropped silently — they are
-// enumerated with the reason at the bottom of the class, mirroring how pubkey.h
-// documents the public-key types it omits.
+// Parts of Core's key.h with no analog here are enumerated with the reason at
+// the bottom of the class, mirroring how pubkey.h documents what it omits.
 
 #ifndef LATTICA_KEY_H
 #define LATTICA_KEY_H
@@ -77,17 +78,43 @@ class CKey
 {
 public:
     /**
+     * The size of a secret, per scheme. As in CPubKey these constants are the
+     * whole of the type information: a key carries no tag, so the length of
+     * the secret says which algorithm it belongs to, and a caller naming a
+     * scheme names one of these.
+     *
+     * SIZE is the largest, the bound the secure allocation is sized to.
+     */
+    static constexpr unsigned int SECP256K1_SIZE = 32;
+    static constexpr unsigned int FALCON512_SIZE = 1281;
+    static constexpr unsigned int MLDSA44_SIZE   = 2560;
+    static constexpr unsigned int SIZE           = MLDSA44_SIZE;
+
+    static_assert(SIZE >= SECP256K1_SIZE && SIZE >= FALCON512_SIZE,
+                  "SIZE must be the largest secret");
+    static_assert(SECP256K1_SIZE != FALCON512_SIZE &&
+                  FALCON512_SIZE != MLDSA44_SIZE &&
+                  SECP256K1_SIZE != MLDSA44_SIZE,
+                  "secret sizes must be pairwise distinct: the length is what names the scheme");
+
+    /**
      * The key-generation seed size, and deliberately not per-scheme: ML-DSA's
-     * FIPS 204 xi, Falcon's keygen seed and a secp256k1 scalar are all 32 bytes,
-     * which is what lets one hierarchical tree carry every scheme.
+     * FIPS 204 xi, Falcon's keygen seed and a secp256k1 scalar are all 32
+     * bytes, which is what lets one hierarchical tree carry every scheme.
      */
     static constexpr unsigned int SEED_SIZE = 32;
 
+    //! Whether this length is one an implemented scheme uses.
+    static bool ValidSize(size_t len)
+    {
+        return len == SECP256K1_SIZE || len == FALCON512_SIZE || len == MLDSA44_SIZE;
+    }
+
 private:
-    //! Per-scheme secret buffers, sized from the schemes' own constants.
-    using SecpKey = std::array<unsigned char, 32>;
-    using FalconKey = std::array<unsigned char, 1281>;
-    using MLDSAKey = std::array<unsigned char, 2560>;
+    //! Per-scheme secret buffers.
+    using SecpKey = std::array<unsigned char, SECP256K1_SIZE>;
+    using FalconKey = std::array<unsigned char, FALCON512_SIZE>;
+    using MLDSAKey = std::array<unsigned char, MLDSA44_SIZE>;
     using KeyVariant = std::variant<SecpKey, FalconKey, MLDSAKey>;
 
     //! secure_unique_ptr's deleter returns the storage to the locked pool
@@ -102,23 +129,21 @@ private:
      *
      * The variant lives INSIDE the secure allocation rather than beside it:
      * secure_allocator draws from the locked pool and memory_cleanse()s on
-     * release, whereas a plain std::variant member would sit in ordinary memory
-     * that can be paged to disk and is never wiped. The cost is that the
-     * allocation is always the size of the largest alternative, so a 32-byte
-     * scalar occupies an ML-DSA-sized slot; locked-pool space is not the scarce
-     * resource here.
+     * release, whereas a plain std::variant member would sit in ordinary
+     * memory that can be paged to disk and is never wiped. The cost is that
+     * the allocation is always SIZE, so a 32-byte scalar occupies an
+     * ML-DSA-sized slot; locked-pool space is not the scarce resource here.
      */
     secure_unique_ptr<KeyVariant> m_keydata;
-
-    //! Which scheme m_keydata holds. Meaningful only while m_keydata is non-null.
-    SigScheme m_scheme{SigScheme::ML_DSA_44};
 
     //! The matching public key. See the header comment for why it is stored.
     CPubKey m_pubkey;
 
     //! Allocate if needed, then select and zero the alternative for `scheme`.
     //! Leaves the key invalid if the scheme is not one this build knows.
-    void MakeKeyData(SigScheme scheme);
+    //! Allocate if needed, then select and zero the alternative for a secret
+    //! of `secret_size`. Leaves the key invalid if no scheme uses that size.
+    void MakeKeyData(unsigned int secret_size);
 
     void ClearKeyData()
     {
@@ -143,7 +168,6 @@ public:
             } else {
                 m_keydata.reset();
             }
-            m_scheme = other.m_scheme;
             m_pubkey = other.m_pubkey;
         }
         return *this;
@@ -153,7 +177,7 @@ public:
 
     friend bool operator==(const CKey& a, const CKey& b)
     {
-        return a.m_scheme == b.m_scheme && a.size() == b.size() &&
+        return a.size() == b.size() &&
                (a.size() == 0 || std::memcmp(a.data(), b.data(), a.size()) == 0);
     }
 
@@ -175,13 +199,13 @@ public:
             ClearKeyData();
             return;
         }
-        const SigScheme scheme{pubkey.GetScheme()};
         const size_t len{static_cast<size_t>(sk_end - sk_begin)};
-        if (len != SchemeSecretKeySize(scheme) || !Check(scheme, UCharCast(&sk_begin[0]))) {
+        if (!ValidSize(len) || len != SecretSizeForPubKey(pubkey.size()) ||
+            !Check(static_cast<unsigned int>(len), UCharCast(&sk_begin[0]))) {
             ClearKeyData();
             return;
         }
-        MakeKeyData(scheme);
+        MakeKeyData(static_cast<unsigned int>(len));
         if (!m_keydata) return;
         std::memcpy(MutableData(), (const unsigned char*)&sk_begin[0], len);
         m_pubkey = pubkey;
@@ -197,25 +221,27 @@ public:
     //! Check whether this private key is valid.
     bool IsValid() const { return !!m_keydata; }
 
-    //! The signature scheme of this key.
-    SigScheme GetScheme() const { return m_scheme; }
+    //! The secret size a scheme uses given its public key size, or 0 if that
+    //! public key size belongs to no scheme. The one place the two size
+    //! namespaces are bridged.
+    static unsigned int SecretSizeForPubKey(unsigned int pubkey_size);
 
     /**
-     * Whether a secret buffer is structurally acceptable for `scheme`.
+     * Whether a secret buffer is structurally acceptable for that size.
      *
      * Only secp256k1 has a real predicate: the scalar must lie in [1, n-1], and
      * secp256k1_ec_seckey_verify decides it. Neither lattice scheme has a cheap
      * equivalent — any buffer of the right length is structurally fine, and
      * semantic validity is what VerifyPubKey establishes.
      */
-    static bool Check(SigScheme scheme, const unsigned char* vch);
+    static bool Check(unsigned int secret_size, const unsigned char* vch);
 
-    //! Generate a fresh random keypair for `scheme`.
+    //! Generate a fresh random keypair for the scheme of that secret size.
     //! secp256k1 and Falcon need a signing context (see ECC_Context).
-    void MakeNewKey(SigScheme scheme = SigScheme::ML_DSA_44);
+    void MakeNewKey(unsigned int secret_size = MLDSA44_SIZE);
 
     /**
-     * Deterministically generate a keypair for `scheme` from a SEED_SIZE-byte
+     * Deterministically generate a keypair for that scheme from a SEED_SIZE-byte
      * seed. This backs hierarchical derivation; it returns false, leaving the
      * key invalid, if the seed is the wrong length or unusable for the scheme.
      *
@@ -233,7 +259,7 @@ public:
      *               and is rejected, which happens with probability about
      *               2^-128 and must still be handled by the caller.
      */
-    bool MakeKeyFromSeed(SigScheme scheme, std::span<const unsigned char> seed);
+    bool MakeKeyFromSeed(unsigned int secret_size, std::span<const unsigned char> seed);
 
     //! Serialize the private key (the raw scheme secret; see CPrivKey).
     CPrivKey GetPrivKey() const;
@@ -295,8 +321,8 @@ public:
     //   ComputeBIP324ECDHSecret()         ML-KEM-768; see v2cipher.h.
 };
 
-//! Produce a fresh random private key of `scheme`, with its matching public key.
-CKey GenerateRandomKey(SigScheme scheme = SigScheme::ML_DSA_44) noexcept;
+//! Produce a fresh random private key of that scheme, with its matching public key.
+CKey GenerateRandomKey(unsigned int secret_size = CKey::MLDSA44_SIZE) noexcept;
 
 /**
  * Self-test every implemented scheme at startup: generate, sign, verify, and

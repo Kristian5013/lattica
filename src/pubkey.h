@@ -1,19 +1,39 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
 //
-// Public key + signature verification, modeled on Bitcoin Core's pubkey.h
-// (CKeyID / CPubKey). Lattica is crypto-agile and post-quantum: where Core's
-// CPubKey wraps a secp256k1 point (a header byte then the curve point), ours
-// wraps a one-byte scheme tag then the raw scheme public key — the math is the
-// vendored ML-DSA-44 (PQClean / FIPS 204, the standardized Dilithium2), the
-// analog of Core's secp256k1 subtree. The serialized form a CPubKey stores is
-// exactly the byte string a transaction pushes (scheme byte || key), so its
-// size is recoverable from the first byte just like Core's.
+// Public key + signature verification, modeled on Bitcoin Core's pubkey.h.
+//
+// Core's CPubKey is a secp256k1 point: a fixed 65-byte array whose length is
+// read off the first byte (0x02/0x03 compressed, 0x04 uncompressed), with a
+// surface of curve arithmetic around it — IsCompressed(), Decompress(),
+// RecoverCompact(), Derive(). This class keeps Core's contract and member
+// order while holding a key of any of three schemes:
+//
+//     scheme        public key  signature
+//     secp256k1             33         64   compact r||s, low-S mandatory
+//     Falcon-512           897        666   PQClean falcon-padded-512
+//     ML-DSA-44           1312       2420   FIPS 204
+//
+// Nothing names the scheme. A key on the stack is the scheme's own bytes with
+// nothing in front of them, exactly as in Bitcoin, and the length is the type
+// information — which is also how Core works, since its GetLen() turns a header
+// byte into a length and the length is what its code then reasons about.
+// Bitcoin likewise disambiguates by length inside a witness version, a 20-byte
+// program being P2WPKH and a 32-byte one P2WSH.
+//
+// The rule this rests on is enforced below by static_assert rather than left to
+// a comment: no two schemes may share a public-key length. It binds every
+// scheme added later.
+//
+// One structural difference from Core. The bytes live in a std::vector rather
+// than an inline array: Core can afford `unsigned char vch[65]` in every
+// CPubKey, whereas the same choice here would put 1312 bytes in every copy,
+// including the ones that never hold a lattice key.
 //
 // Core's secp256k1-only types — XOnlyPubKey (Taproot/Schnorr), EllSwiftPubKey
-// (BIP324 transport), and CExtPubKey (BIP32 HD derivation) — are intentionally
-// not ported: Lattica's design (option A) has no Taproot, and EC-style key
-// tweaking/derivation does not carry over to ML-DSA.
+// (BIP324 transport) and CExtPubKey (BIP32 public derivation) — are not
+// reproduced. Lattica has no witness v1, its transport is ML-KEM-768, and a
+// lattice scheme has no key homomorphism to derive a child public key with.
 
 #ifndef LATTICA_PUBKEY_H
 #define LATTICA_PUBKEY_H
@@ -23,126 +43,107 @@
 #include <span.h>
 #include <uint256.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
-#include <optional>
 #include <vector>
 
-/** Crypto-agile signature scheme ids.
- *
- * These are internal identifiers and are NOT serialized. A public key on the
- * stack is the bare scheme key with nothing in front of it, exactly as in
- * Bitcoin, and the scheme is recovered from its length — the three sizes are
- * pairwise distinct. Bitcoin already disambiguates by length inside a witness
- * version (a 20-byte program is P2WPKH, a 32-byte one P2WSH), so this is its
- * habit rather than a new trick.
- *
- * The rule that follows, and it binds every scheme added later: a new scheme
- * must not share a public-key length with one already accepted, or the two
- * become indistinguishable on the stack. Current sizes are 33, 897 and 1312;
- * the obvious candidates are clear of them (ML-DSA-65 is 1952, Falcon-1024 is
- * 1793, SLH-DSA is 32).
- */
-enum class SigScheme : uint8_t {
-    ML_DSA_44 = 0x01,
-    FALCON_512 = 0x02,
-    SECP256K1 = 0x03,
-};
+using KeyFingerprint = std::array<unsigned char, 4>;
 
-//! Every scheme this build implements, for callers that must try each in turn.
-inline constexpr std::array<SigScheme, 3> ALL_SIG_SCHEMES{
-    SigScheme::SECP256K1, SigScheme::FALCON_512, SigScheme::ML_DSA_44};
-
-//! The scheme a public key of this length belongs to, or nullopt if no scheme
-//! uses that length. This is how a key on the stack is identified.
-[[nodiscard]] std::optional<SigScheme> SchemeFromPubKeySize(size_t len);
-
-[[nodiscard]] bool IsKnownScheme(SigScheme s);
-[[nodiscard]] size_t SchemePublicKeySize(SigScheme s);
-[[nodiscard]] size_t SchemeSignatureSize(SigScheme s);
-[[nodiscard]] size_t SchemeSecretKeySize(SigScheme s);
-
-/** The per-signature verification cost (sig-op weight) of a scheme, used to
- *  bound a block's total PQC-verification work (see MAX_BLOCK_SIGOPS_COST).
- *  ML-DSA-44 is the unit (1); a heavier future scheme would cost proportionally
- *  more; an unknown scheme is 0 (it is rejected without a verify). */
-[[nodiscard]] int64_t SchemeSigOpCost(SigScheme s);
-
-/** A reference to a CPubKey: the Hash160 of the public key. */
+/** A reference to a CKey: the Hash160 of its public key */
 class CKeyID : public uint160
 {
 public:
     CKeyID() : uint160() {}
     explicit CKeyID(const uint160& in) : uint160(in) {}
+    KeyFingerprint fingerprint() const
+    {
+        KeyFingerprint ret;
+        std::copy_n(begin(), ret.size(), ret.begin());
+        return ret;
+    }
 };
 
-/** An encapsulated public key. The bytes are the scheme's own key and nothing
- *  else; which scheme that is follows from the length. */
+/** An encapsulated public key. */
 class CPubKey
 {
 public:
-    //! Largest public key of any implemented scheme (ML-DSA-44's 1312). A bound
-    //! for deserialization, not the size of every key.
-    static constexpr unsigned int SIZE = 1312;
+    /**
+     * The size of a public key, per scheme, and of the signature that scheme
+     * produces. These constants are the whole of the type information: a key
+     * carries no tag, so its length is what says which scheme it belongs to.
+     *
+     * SIZE and SIGNATURE_SIZE are the largest of each, the bound a caller uses
+     * when it must allocate before knowing the scheme.
+     */
+    static constexpr unsigned int SECP256K1_SIZE = 33;
+    static constexpr unsigned int FALCON512_SIZE = 897;
+    static constexpr unsigned int MLDSA44_SIZE   = 1312;
+    static constexpr unsigned int SIZE           = MLDSA44_SIZE;
+
+    static constexpr unsigned int SECP256K1_SIGNATURE_SIZE = 64;
+    static constexpr unsigned int FALCON512_SIGNATURE_SIZE = 666;
+    static constexpr unsigned int MLDSA44_SIGNATURE_SIZE   = 2420;
+    static constexpr unsigned int SIGNATURE_SIZE           = MLDSA44_SIGNATURE_SIZE;
+
+    static_assert(SIZE >= SECP256K1_SIZE && SIZE >= FALCON512_SIZE,
+                  "SIZE must be the largest public key");
+    static_assert(SIGNATURE_SIZE >= SECP256K1_SIGNATURE_SIZE && SIGNATURE_SIZE >= FALCON512_SIGNATURE_SIZE,
+                  "SIGNATURE_SIZE must be the largest signature");
+    static_assert(SECP256K1_SIZE != FALCON512_SIZE &&
+                  FALCON512_SIZE != MLDSA44_SIZE &&
+                  SECP256K1_SIZE != MLDSA44_SIZE,
+                  "public key sizes must be pairwise distinct: the length is what names the scheme");
 
 private:
-    //! The public key bytes. Empty == invalid.
+    //! Just store the key. Its length is what says which scheme it belongs to.
     std::vector<unsigned char> vch;
 
-    //! Set this key to be invalid.
+    //! Set this key data to be invalid
     void Invalidate() { vch.clear(); }
 
 public:
-    //! Whether a byte vector is the right length for some implemented scheme.
-    static bool ValidSize(const std::vector<unsigned char>& vch)
+    //! Whether this length is one an implemented scheme uses.
+    static bool ValidSize(size_t len)
     {
-        return SchemeFromPubKeySize(vch.size()).has_value();
+        return len == SECP256K1_SIZE || len == FALCON512_SIZE || len == MLDSA44_SIZE;
+    }
+
+    bool static ValidSize(const std::vector<unsigned char>& vch)
+    {
+        return ValidSize(vch.size());
     }
 
     //! Construct an invalid public key.
     CPubKey() { Invalidate(); }
 
-    //! Initialize from begin/end iterators over the public key bytes.
+    //! Initialize a public key using begin/end iterators to byte data.
     template <typename T>
     void Set(const T pbegin, const T pend)
     {
-        if (SchemeFromPubKeySize(static_cast<size_t>(pend - pbegin))) {
+        if (ValidSize(static_cast<size_t>(pend - pbegin))) {
             vch.assign(pbegin, pend);
         } else {
             Invalidate();
         }
     }
 
-    //! Construct from begin/end iterators over the serialized bytes.
+    //! Construct a public key using begin/end iterators to byte data.
     template <typename T>
     CPubKey(const T pbegin, const T pend) { Set(pbegin, pend); }
 
-    //! Construct from a public key byte span.
-    explicit CPubKey(std::span<const unsigned char> _vch) { Set(_vch.begin(), _vch.end()); }
+    //! Construct a public key from a byte vector.
+    explicit CPubKey(std::span<const uint8_t> _vch) { Set(_vch.begin(), _vch.end()); }
 
-    //! Construct a key of a named scheme. The scheme is only checked against the
-    //! length here; it is not stored, because the length is what carries it.
-    CPubKey(SigScheme scheme, std::span<const unsigned char> rawkey)
-    {
-        if (rawkey.size() == SchemePublicKeySize(scheme)) {
-            Set(rawkey.begin(), rawkey.end());
-        } else {
-            Invalidate();
-        }
-    }
-
-    //! Simple read-only vector-like interface to the serialized data.
+    //! Simple read-only vector-like interface to the pubkey data.
     unsigned int size() const { return static_cast<unsigned int>(vch.size()); }
     const unsigned char* data() const { return vch.data(); }
     const unsigned char* begin() const { return vch.data(); }
     const unsigned char* end() const { return vch.data() + vch.size(); }
     const unsigned char& operator[](unsigned int pos) const { return vch[pos]; }
 
-    //! The scheme, read off the length. Meaningful only for a valid key.
-    SigScheme GetScheme() const { return *SchemeFromPubKeySize(vch.size()); }
-
-    //! Comparators.
+    //! Comparator implementation.
     friend bool operator==(const CPubKey& a, const CPubKey& b) { return a.vch == b.vch; }
     friend bool operator!=(const CPubKey& a, const CPubKey& b) { return a.vch != b.vch; }
     friend bool operator<(const CPubKey& a, const CPubKey& b) { return a.vch < b.vch; }
@@ -173,7 +174,7 @@ public:
         }
     }
 
-    //! Get the KeyID of this public key (its Hash160).
+    //! Get the KeyID of this public key (its Hash160)
     CKeyID GetID() const
     {
         return CKeyID(Hash160(std::span{vch.data(), size()}));
@@ -185,19 +186,61 @@ public:
         return Hash(std::span{vch.data(), size()});
     }
 
-    /**
+    /*
      * Check syntactic correctness.
      *
-     * Note that this is consensus critical as CheckSig() calls it: an invalid
-     * key (wrong scheme or wrong length) must never verify.
+     * When setting a pubkey (Set()) or deserializing fails — the data is not
+     * the length of any implemented scheme — the size is set to 0. Thus, by
+     * checking size, one can observe whether Set() or deserialization failed.
+     *
+     * This does not check for more than that. In particular it does not verify
+     * that a secp256k1 key is a point on the curve (see IsFullyValid() for that
+     * instead).
+     *
+     * Note that this is consensus critical as CheckSig() calls it!
      */
-    bool IsValid() const { return size() > 0; }
+    bool IsValid() const
+    {
+        return size() > 0;
+    }
 
     /**
-     * Verify `sig` over `hash` (the sighash) under this key. Returns false if
-     * the key is not syntactically valid.
+     * Fully validate whether this is a valid public key (more expensive than
+     * IsValid()).
+     *
+     * How much "fully" means differs by scheme, and the difference is real:
+     *
+     *   secp256k1   a complete check. The bytes must decode to a point on the
+     *               curve, which secp256k1_ec_pubkey_parse decides.
+     *   Falcon-512  partial. The header byte must announce degree n = 512;
+     *               whether every coefficient is in range is decided inside
+     *               PQClean, which does not expose its decoder.
+     *   ML-DSA-44   the length is the whole of it. Any MLDSA44_SIZE bytes
+     *               unpack to some (rho, t1), so there is no key to reject.
+     *
+     * A caller must therefore not read a true here as "this key has a matching
+     * private key" for the lattice schemes — only that nothing is detectably
+     * wrong with it.
+     */
+    bool IsFullyValid() const;
+
+    /**
+     * Verify a signature over `hash` under this key, using the scheme its
+     * length names.
+     *
+     * secp256k1 signatures are a fixed 64-byte compact r||s and low-S is
+     * mandatory: a high-S signature is rejected rather than normalized, so the
+     * encoding is unique and a third party cannot rewrite a txid by flipping s
+     * to n-s. Core needs CheckLowS() as a separate policy rule because its
+     * consensus rules accept both; here the rule is in the verifier, so there
+     * is nothing left for policy to add.
+     *
+     * If this public key is not fully valid, the return value will be false.
      */
     bool Verify(const uint256& hash, std::span<const unsigned char> sig) const;
+
+    //! The signature size this key's scheme produces, or 0 if the key is invalid.
+    unsigned int SignatureSize() const;
 };
 
 #endif // LATTICA_PUBKEY_H

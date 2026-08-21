@@ -222,12 +222,14 @@ CPubKey HexToPubKey(const std::string& hex_in)
     // A public key is whatever length its scheme uses — 33, 897 or 1312 — and
     // the length is what names the scheme, so any of them is acceptable here and
     // nothing else is.
-    if (!SchemeFromPubKeySize(hex_in.length() / 2)) {
+    if (!CPubKey::ValidSize(hex_in.length() / 2)) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
                            strprintf("Pubkey \"%s\" is not the length of any supported scheme", hex_in));
     }
     CPubKey vchPubKey(ParseHex(hex_in));
-    if (!vchPubKey.IsValid()) {
+    // IsFullyValid(), not IsValid(): the message promises a cryptographic check,
+    // and for secp256k1 that means the bytes really are a point on the curve.
+    if (!vchPubKey.IsFullyValid()) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Pubkey \"" + hex_in + "\" must be cryptographically valid.");
     }
     return vchPubKey;

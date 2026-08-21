@@ -447,11 +447,11 @@ public:
     bool CreateSig(const SigningProvider&, std::vector<unsigned char>& vchSig, const CKeyID&, const CScript&, SigVersion) const override
     {
         // A dummy signature of the LARGEST implemented scheme, so callers can
-        // estimate sizes and test solvability without a private key. The scheme
-        // is not knowable here — CreateSig only gets a CKeyID — so this
-        // deliberately overestimates rather than guesses; it must become a
-        // per-key lookup once more than one scheme can actually sign.
-        vchSig.assign(SchemeSignatureSize(SigScheme::ML_DSA_44), '\000');
+        // estimate sizes and test solvability without a private key. Which
+        // scheme the key belongs to is not knowable here — CreateSig only gets a
+        // CKeyID — so this deliberately overestimates rather than guesses; it
+        // must become a per-key lookup once the wallet holds more than one.
+        vchSig.assign(CPubKey::SIGNATURE_SIZE, '\000');
         vchSig.push_back(SIGHASH_ALL);
         return true;
     }

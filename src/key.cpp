@@ -137,25 +137,28 @@ int SeededKeypair(const unsigned char* seed, KeypairFn&& keypair)
 // CKey
 // ---------------------------------------------------------------------------
 
-void CKey::MakeKeyData(SigScheme scheme)
+unsigned int CKey::SecretSizeForPubKey(unsigned int pubkey_size)
 {
-    if (!IsKnownScheme(scheme)) {
+    switch (pubkey_size) {
+    case CPubKey::SECP256K1_SIZE: return SECP256K1_SIZE;
+    case CPubKey::FALCON512_SIZE: return FALCON512_SIZE;
+    case CPubKey::MLDSA44_SIZE:   return MLDSA44_SIZE;
+    }
+    return 0;
+}
+
+void CKey::MakeKeyData(unsigned int secret_size)
+{
+    if (!ValidSize(secret_size)) {
         ClearKeyData();
         return;
     }
     if (!m_keydata) m_keydata = make_secure_unique<KeyVariant>();
-    switch (scheme) {
-    case SigScheme::SECP256K1:
-        m_keydata->emplace<SecpKey>();
-        break;
-    case SigScheme::FALCON_512:
-        m_keydata->emplace<FalconKey>();
-        break;
-    case SigScheme::ML_DSA_44:
-        m_keydata->emplace<MLDSAKey>();
-        break;
+    switch (secret_size) {
+    case SECP256K1_SIZE: m_keydata->emplace<SecpKey>(); break;
+    case FALCON512_SIZE: m_keydata->emplace<FalconKey>(); break;
+    case MLDSA44_SIZE:   m_keydata->emplace<MLDSAKey>(); break;
     }
-    m_scheme = scheme;
 }
 
 unsigned char* CKey::MutableData()
@@ -176,96 +179,96 @@ const unsigned char* CKey::data() const
     return std::visit([](const auto& k) -> const unsigned char* { return k.data(); }, *m_keydata);
 }
 
-bool CKey::Check(SigScheme scheme, const unsigned char* vch)
+bool CKey::Check(unsigned int secret_size, const unsigned char* vch)
 {
     if (vch == nullptr) return false;
-    switch (scheme) {
-    case SigScheme::SECP256K1:
+    switch (secret_size) {
+    case SECP256K1_SIZE:
         // A real predicate: the scalar must lie in [1, n-1]. The static context
         // suffices — this is arithmetic on the secret, not a multiplication by G.
         return secp256k1_ec_seckey_verify(secp256k1_context_static, vch) == 1;
-    case SigScheme::FALCON_512:
-    case SigScheme::ML_DSA_44:
-        // Neither has a cheap validity predicate. Any buffer of the right length
-        // (checked by the caller) is structurally acceptable; semantic validity
-        // is what VerifyPubKey establishes.
+    case FALCON512_SIZE:
+    case MLDSA44_SIZE:
+        // Neither lattice scheme has a cheap validity predicate. Any buffer of
+        // the right length is structurally acceptable; semantic validity is
+        // what VerifyPubKey establishes.
         return true;
     }
     return false;
 }
 
-void CKey::MakeNewKey(SigScheme scheme)
+void CKey::MakeNewKey(unsigned int secret_size)
 {
-    MakeKeyData(scheme);
+    MakeKeyData(secret_size);
     if (!m_keydata) return;
 
-    switch (scheme) {
-    case SigScheme::SECP256K1: {
+    switch (secret_size) {
+    case SECP256K1_SIZE: {
         // Rejection-sample until the scalar is in range. A draw fails with
         // probability around 2^-128, so this never loops in practice; it loops
         // in code because "never in practice" is not "never".
         do {
             GetStrongRandBytes(std::span<unsigned char>(MutableData(), size()));
-        } while (!Check(scheme, data()));
+        } while (!Check(secret_size, data()));
 
-        std::array<unsigned char, 33> pk;
+        std::array<unsigned char, CPubKey::SECP256K1_SIZE> pk;
         const bool ok = DeriveSecpPubKey(data(), pk);
         assert(ok);
         (void)ok;
-        m_pubkey = CPubKey(SigScheme::SECP256K1, pk);
+        m_pubkey = CPubKey(pk);
         break;
     }
-    case SigScheme::FALCON_512: {
-        std::array<unsigned char, 897> pk;
+    case FALCON512_SIZE: {
+        std::array<unsigned char, CPubKey::FALCON512_SIZE> pk;
         // PQClean draws its own OS entropy and aborts on failure, so a return
         // here is always success.
         const int ret = PQCLEAN_FALCONPADDED512_CLEAN_crypto_sign_keypair(pk.data(), MutableData());
         assert(ret == 0);
         (void)ret;
-        m_pubkey = CPubKey(SigScheme::FALCON_512, pk);
+        m_pubkey = CPubKey(pk);
         break;
     }
-    case SigScheme::ML_DSA_44: {
-        std::array<unsigned char, PQCLEAN_MLDSA44_CLEAN_CRYPTO_PUBLICKEYBYTES> pk;
+    case MLDSA44_SIZE: {
+        std::array<unsigned char, CPubKey::MLDSA44_SIZE> pk;
         const int ret = PQCLEAN_MLDSA44_CLEAN_crypto_sign_keypair(pk.data(), MutableData());
         assert(ret == 0);
         (void)ret;
-        m_pubkey = CPubKey(SigScheme::ML_DSA_44, pk);
+        m_pubkey = CPubKey(pk);
         break;
     }
     }
     assert(m_pubkey.IsValid());
 }
 
-bool CKey::MakeKeyFromSeed(SigScheme scheme, std::span<const unsigned char> seed)
+bool CKey::MakeKeyFromSeed(unsigned int secret_size, std::span<const unsigned char> seed)
 {
     if (seed.size() != SEED_SIZE) {
         ClearKeyData();
         return false;
     }
-    MakeKeyData(scheme);
+    MakeKeyData(secret_size);
     if (!m_keydata) return false;
 
-    switch (scheme) {
-    case SigScheme::SECP256K1: {
+    switch (secret_size) {
+    case SECP256K1_SIZE: {
         // The seed is the scalar. One in roughly 2^128 seeds lies outside
         // [1, n-1] and simply has no key; the caller has to cope, which for a
         // derivation path means moving to the next index as BIP32 does.
-        if (!Check(scheme, seed.data())) {
+        if (!Check(secret_size, seed.data())) {
             ClearKeyData();
             return false;
         }
         std::memcpy(MutableData(), seed.data(), seed.size());
-        std::array<unsigned char, 33> pk;
+        std::array<unsigned char, CPubKey::SECP256K1_SIZE> pk;
         if (!DeriveSecpPubKey(data(), pk)) {
             ClearKeyData();
             return false;
         }
-        m_pubkey = CPubKey(SigScheme::SECP256K1, pk);
+        m_pubkey = CPubKey(pk);
         break;
     }
-    case SigScheme::FALCON_512: {
-        std::array<unsigned char, 897> pk;
+    case FALCON512_SIZE: {
+        std::array<unsigned char, CPubKey::FALCON512_SIZE> pk;
         unsigned char* sk = MutableData();
         const int ret = SeededKeypair(seed.data(), [&] {
             return PQCLEAN_FALCONPADDED512_CLEAN_crypto_sign_keypair(pk.data(), sk);
@@ -274,11 +277,11 @@ bool CKey::MakeKeyFromSeed(SigScheme scheme, std::span<const unsigned char> seed
             ClearKeyData();
             return false;
         }
-        m_pubkey = CPubKey(SigScheme::FALCON_512, pk);
+        m_pubkey = CPubKey(pk);
         break;
     }
-    case SigScheme::ML_DSA_44: {
-        std::array<unsigned char, PQCLEAN_MLDSA44_CLEAN_CRYPTO_PUBLICKEYBYTES> pk;
+    case MLDSA44_SIZE: {
+        std::array<unsigned char, CPubKey::MLDSA44_SIZE> pk;
         unsigned char* sk = MutableData();
         const int ret = SeededKeypair(seed.data(), [&] {
             return PQCLEAN_MLDSA44_CLEAN_crypto_sign_keypair(pk.data(), sk);
@@ -287,7 +290,7 @@ bool CKey::MakeKeyFromSeed(SigScheme scheme, std::span<const unsigned char> seed
             ClearKeyData();
             return false;
         }
-        m_pubkey = CPubKey(SigScheme::ML_DSA_44, pk);
+        m_pubkey = CPubKey(pk);
         break;
     }
     }
@@ -304,8 +307,8 @@ bool CKey::Sign(const uint256& hash, std::vector<unsigned char>& vchSig) const
 {
     if (!m_keydata) return false;
 
-    switch (m_scheme) {
-    case SigScheme::SECP256K1: {
+    switch (size()) {
+    case SECP256K1_SIZE: {
         secp256k1_ecdsa_signature sig;
         // Nonces are libsecp256k1's default RFC6979: derived from the secret and
         // the message, so signing is deterministic and needs no entropy. Core's
@@ -319,17 +322,17 @@ bool CKey::Sign(const uint256& hash, std::vector<unsigned char>& vchSig) const
         // invariant something this function enforces rather than inherits, and
         // CPubKey::Verify refuses a high-S signature outright.
         secp256k1_ecdsa_signature_normalize(secp256k1_context_static, &sig, &sig);
-        vchSig.resize(SchemeSignatureSize(SigScheme::SECP256K1));
+        vchSig.resize(CPubKey::SECP256K1_SIGNATURE_SIZE);
         const int ok = secp256k1_ecdsa_signature_serialize_compact(
             secp256k1_context_static, vchSig.data(), &sig);
         assert(ok);
         (void)ok;
         return true;
     }
-    case SigScheme::FALCON_512: {
+    case FALCON512_SIZE: {
         // Randomized: a fresh salt per signature, so two signatures over the
         // same message differ. Nothing here may assume otherwise.
-        vchSig.resize(SchemeSignatureSize(SigScheme::FALCON_512));
+        vchSig.resize(CPubKey::FALCON512_SIGNATURE_SIZE);
         size_t siglen = 0;
         const int ret = PQCLEAN_FALCONPADDED512_CLEAN_crypto_sign_signature(
             vchSig.data(), &siglen, hash.begin(), hash.size(), data());
@@ -342,8 +345,8 @@ bool CKey::Sign(const uint256& hash, std::vector<unsigned char>& vchSig) const
         }
         return true;
     }
-    case SigScheme::ML_DSA_44: {
-        vchSig.resize(SchemeSignatureSize(SigScheme::ML_DSA_44));
+    case MLDSA44_SIZE: {
+        vchSig.resize(CPubKey::MLDSA44_SIGNATURE_SIZE);
         size_t siglen = 0;
         const int ret = PQCLEAN_MLDSA44_CLEAN_crypto_sign_signature(
             vchSig.data(), &siglen, hash.begin(), hash.size(), data());
@@ -361,13 +364,13 @@ bool CKey::Sign(const uint256& hash, std::vector<unsigned char>& vchSig) const
 bool CKey::VerifyPubKey(const CPubKey& pubkey) const
 {
     if (!IsValid() || !pubkey.IsValid()) return false;
-    if (pubkey.GetScheme() != m_scheme) return false;
+    if (SecretSizeForPubKey(pubkey.size()) != size()) return false;
 
-    if (m_scheme == SigScheme::SECP256K1) {
+    if (size() == SECP256K1_SIZE) {
         // Derivable, so this is an equality test rather than a proof.
-        std::array<unsigned char, 33> pk;
+        std::array<unsigned char, CPubKey::SECP256K1_SIZE> pk;
         if (!DeriveSecpPubKey(data(), pk)) return false;
-        return pubkey.size() == pk.size() && std::memcmp(pk.data(), pubkey.data(), pk.size()) == 0;
+        return std::memcmp(pk.data(), pubkey.data(), pk.size()) == 0;
     }
 
     // Neither lattice scheme hands back a public key, so prove the pairing
@@ -381,11 +384,11 @@ bool CKey::VerifyPubKey(const CPubKey& pubkey) const
 bool CKey::Load(const CPrivKey& privkey, const CPubKey& vchPubKey, bool fSkipCheck)
 {
     if (!vchPubKey.IsValid()) return false;
-    const SigScheme scheme{vchPubKey.GetScheme()};
-    if (privkey.size() != SchemeSecretKeySize(scheme)) return false;
+    const unsigned int secret_size{SecretSizeForPubKey(vchPubKey.size())};
+    if (secret_size == 0 || privkey.size() != secret_size) return false;
 
     if (fSkipCheck) {
-        MakeKeyData(scheme);
+        MakeKeyData(secret_size);
         if (!m_keydata) return false;
         std::memcpy(MutableData(), privkey.data(), privkey.size());
         m_pubkey = vchPubKey;
@@ -395,10 +398,10 @@ bool CKey::Load(const CPrivKey& privkey, const CPubKey& vchPubKey, bool fSkipChe
     return IsValid();
 }
 
-CKey GenerateRandomKey(SigScheme scheme) noexcept
+CKey GenerateRandomKey(unsigned int secret_size) noexcept
 {
     CKey key;
-    key.MakeNewKey(scheme);
+    key.MakeNewKey(secret_size);
     return key;
 }
 
@@ -408,18 +411,18 @@ bool KeyCryptoSanityCheck()
     const uint256 hash = Hash(std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(test.data()), test.size()));
 
-    for (const SigScheme scheme : {SigScheme::SECP256K1, SigScheme::FALCON_512, SigScheme::ML_DSA_44}) {
-        const CKey key = GenerateRandomKey(scheme);
-        if (!key.IsValid()) return false;
-        if (key.size() != SchemeSecretKeySize(scheme)) return false;
+    for (const unsigned int secret_size : {CKey::SECP256K1_SIZE, CKey::FALCON512_SIZE, CKey::MLDSA44_SIZE}) {
+        const CKey key = GenerateRandomKey(secret_size);
+        if (!key.IsValid() || key.size() != secret_size) return false;
 
         const CPubKey pubkey = key.GetPubKey();
-        if (!pubkey.IsValid() || pubkey.GetScheme() != scheme) return false;
+        if (!pubkey.IsValid() || !pubkey.IsFullyValid()) return false;
+        if (CKey::SecretSizeForPubKey(pubkey.size()) != secret_size) return false;
         if (!key.VerifyPubKey(pubkey)) return false;
 
         std::vector<unsigned char> sig;
         if (!key.Sign(hash, sig)) return false;
-        if (sig.size() != SchemeSignatureSize(scheme)) return false;
+        if (sig.size() != pubkey.SignatureSize()) return false;
         if (!pubkey.Verify(hash, sig)) return false;
     }
     return true;
@@ -450,7 +453,7 @@ void CExtKey::SetSeedFromTag(std::span<const unsigned char> seed, const unsigned
     std::memset(vchFingerprint, 0, sizeof(vchFingerprint));
     nodeseed = uint256(std::span<const unsigned char>(out, CKey::SEED_SIZE));
     chaincode = ChainCode(std::span<const unsigned char>(out + CKey::SEED_SIZE, 32));
-    key.MakeKeyFromSeed(SigScheme::ML_DSA_44,
+    key.MakeKeyFromSeed(CKey::MLDSA44_SIZE,
                         std::span<const unsigned char>(nodeseed.begin(), CKey::SEED_SIZE));
 }
 
@@ -471,8 +474,8 @@ bool CExtKey::Derive(CExtKey& out, unsigned int _nChild) const
     if (!key.IsValid()) return false;
 
     out.nDepth = nDepth + 1;
-    const CKeyID id = key.GetPubKey().GetID();
-    std::memcpy(out.vchFingerprint, id.begin(), sizeof(out.vchFingerprint));
+    const KeyFingerprint fp = key.GetPubKey().GetID().fingerprint();
+    std::memcpy(out.vchFingerprint, fp.data(), sizeof(out.vchFingerprint));
     out.nChild = _nChild;
 
     // Hardened-only: I = SHA3-512(chaincode || nodeseed || ser32BE(nChild)). The
@@ -490,7 +493,7 @@ bool CExtKey::Derive(CExtKey& out, unsigned int _nChild) const
     SHA3_512().Write(data, sizeof(data)).Finalize(out64);
     out.nodeseed = uint256(std::span<const unsigned char>(out64, CKey::SEED_SIZE));
     out.chaincode = ChainCode(std::span<const unsigned char>(out64 + CKey::SEED_SIZE, 32));
-    return out.key.MakeKeyFromSeed(SigScheme::ML_DSA_44,
+    return out.key.MakeKeyFromSeed(CKey::MLDSA44_SIZE,
                                    std::span<const unsigned char>(out.nodeseed.begin(), CKey::SEED_SIZE));
 }
 
@@ -514,6 +517,6 @@ void CExtKey::Decode(const unsigned char code[SIZE])
              (static_cast<unsigned int>(code[7]) << 8) | static_cast<unsigned int>(code[8]);
     chaincode = ChainCode(std::span<const unsigned char>(code + 9, 32));
     nodeseed = uint256(std::span<const unsigned char>(code + 41, CKey::SEED_SIZE));
-    key.MakeKeyFromSeed(SigScheme::ML_DSA_44,
+    key.MakeKeyFromSeed(CKey::MLDSA44_SIZE,
                         std::span<const unsigned char>(nodeseed.begin(), CKey::SEED_SIZE));
 }
