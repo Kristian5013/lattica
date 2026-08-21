@@ -7,6 +7,8 @@
 
 #include <policy/policy.h>
 
+#include <span>
+
 #include <coins.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
@@ -316,10 +318,37 @@ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
                 if (tx.vin[i].scriptWitness.stack[j].size() > MAX_STANDARD_P2WSH_STACK_ITEM_SIZE)
                     return false;
             }
+        } else if (witnessversion == 1 && witnessprogram.size() == WITNESS_V1_TAPROOT_SIZE && !p2sh) {
+            // Taproot spend (non-P2SH-wrapped, version 1, witness program size 32; see BIP 341)
+            auto stack = std::span{tx.vin[i].scriptWitness.stack};
+            if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
+                // Annexes are nonstandard as long as no semantics are defined for them.
+                return false;
+            }
+            if (stack.size() >= 2) {
+                // Script path spend (2 or more stack elements after removing optional annex)
+                const auto& control_block = SpanPopBack(stack);
+                SpanPopBack(stack); // Ignore script
+                if (control_block.empty()) return false; // Empty control block is invalid
+                if ((control_block[0] & TAPROOT_LEAF_MASK) == TAPROOT_LEAF_TAPSCRIPT) {
+                    // Leaf version 0xc0 (aka Tapscript, see BIP 342)
+                    for (const auto& item : stack) {
+                        if (item.size() > MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE) return false;
+                    }
+                }
+            }
+        } else if (witnessversion == 2 && witnessprogram.size() == WITNESS_V2_SCRIPTHASH_SIZE) {
+            // The witness v2 script path, on its own limits; see policy.h.
+            if (tx.vin[i].scriptWitness.stack.back().size() > MAX_STANDARD_WITNESS_V2_SCRIPT_SIZE)
+                return false;
+            size_t sizeWitnessStack = tx.vin[i].scriptWitness.stack.size() - 1;
+            if (sizeWitnessStack > MAX_STANDARD_P2WSH_STACK_ITEMS)
+                return false;
+            for (unsigned int j = 0; j < sizeWitnessStack; j++) {
+                if (tx.vin[i].scriptWitness.stack[j].size() > MAX_STANDARD_WITNESS_V2_STACK_ITEM_SIZE)
+                    return false;
+            }
         }
-
-        // Lattica (option A) has no Taproot (witness v1); Core's tapscript
-        // stack-item-size / annex policy checks are omitted here.
     }
     return true;
 }

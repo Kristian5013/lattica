@@ -50,18 +50,26 @@ static constexpr unsigned int DEFAULT_BYTES_PER_SIGOP{20};
 static constexpr bool DEFAULT_PERMIT_BAREMULTISIG{true};
 /** The maximum number of witness stack items in a standard P2WSH script */
 static constexpr unsigned int MAX_STANDARD_P2WSH_STACK_ITEMS{100};
-/** The maximum size in bytes of each witness stack item in a standard P2WSH script.
- *  Lattica: raised from Core's 80 to MAX_WITNESS_ITEM so an ML-DSA-44 public key
- *  (1312 B) / signature (2420 B) is relayable as a standard witness item. */
-static constexpr unsigned int MAX_STANDARD_P2WSH_STACK_ITEM_SIZE{MAX_WITNESS_ITEM};
-/** The maximum size in bytes of a standard witnessScript.
- *  Lattica: raised from Core's 3600 so that multi-key ML-DSA scripts relay. A
- *  serialized ML-DSA-44 pubkey costs ~1316 B in-script (PUSHDATA2 + 1313 B), so a
- *  3-key HTLC (~4100 B) or an n-of-m funding/multisig with several keys would be
- *  non-standard under 3600. 7000 fits ~5 in-script keys while staying well below
- *  the consensus MAX_SCRIPT_SIZE (10000) — relay stays a strict subset of what a
- *  block may contain, so raising it is policy-only (no consensus fork). */
-static constexpr unsigned int MAX_STANDARD_P2WSH_SCRIPT_SIZE{7000};
+/** The maximum size in bytes of each witness stack item in a standard P2WSH script */
+static constexpr unsigned int MAX_STANDARD_P2WSH_STACK_ITEM_SIZE{80};
+/** The maximum size in bytes of a standard witnessScript */
+static constexpr unsigned int MAX_STANDARD_P2WSH_SCRIPT_SIZE{3600};
+/** The maximum size in bytes of each witness stack item in a standard tapscript spend */
+static constexpr unsigned int MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE{80};
+/** The witness v2 counterparts of the two P2WSH limits above.
+ *
+ *  Core's 80 and 3600 are sized for secp256k1, and witness v0 keeps them here
+ *  because witness v0 is secp256k1. Witness v2 carries an ML-DSA-44 signature
+ *  of 2420 bytes and a 1312-byte public key, so its item limit is the consensus
+ *  one, MAX_SCRIPT_ELEMENT_SIZE_V2.
+ *
+ *  The script limit is 7000 rather than 3600 because a serialized ML-DSA-44
+ *  pubkey costs about 1316 bytes in-script (OP_PUSHDATA2 plus the key), so a
+ *  3-key HTLC or a small n-of-m would be non-standard under 3600. 7000 holds
+ *  about five in-script keys and stays well under the consensus MAX_SCRIPT_SIZE
+ *  of 10000, so relay remains a strict subset of what a block may contain. */
+static constexpr unsigned int MAX_STANDARD_WITNESS_V2_STACK_ITEM_SIZE{MAX_SCRIPT_ELEMENT_SIZE_V2};
+static constexpr unsigned int MAX_STANDARD_WITNESS_V2_SCRIPT_SIZE{7000};
 /** The maximum size of a standard ScriptSig */
 static constexpr unsigned int MAX_STANDARD_SCRIPTSIG_SIZE{1650};
 /** Min feerate for defining dust.
