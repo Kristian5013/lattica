@@ -106,6 +106,7 @@ add_library(lattica_common STATIC EXCLUDE_FROM_ALL
   rpc/rawtransaction_util.cpp
   rpc/request.cpp
   rpc/util.cpp
+  musig.cpp
   scheduler.cpp
   script/descriptor.cpp
   script/sign.cpp
