@@ -1,12 +1,5 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
-//
-// Ported from Bitcoin Core's src/script/interpreter.cpp. The header states the
-// two differences that run through the whole file — SHA3-256 for SHA-256, and
-// three signature schemes admitted by witness version. Everything Core's DER
-// machinery does is gone with it: a secp256k1 signature here is a fixed 64-byte
-// compact r||s and low-S is refused inside CPubKey::Verify, so there is no
-// encoding left to be strict about beyond the sighash byte.
 
 #include <script/interpreter.h>
 
@@ -370,7 +363,7 @@ public:
 
 static bool EvalChecksigPreTapscript(const valtype& vchSig, const valtype& vchPubKey, CScript::const_iterator pbegincodehash, CScript::const_iterator pend, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror, bool& fSuccess)
 {
-    assert(sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0);
+    assert(sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0 || sigversion == SigVersion::WITNESS_V2);
 
     // Subset of script starting at the most recent codeseparator
     CScript scriptCode(pbegincodehash, pend);
@@ -444,6 +437,9 @@ static bool EvalChecksig(const valtype& sig, const valtype& pubkey, CScript::con
     switch (sigversion) {
     case SigVersion::BASE:
     case SigVersion::WITNESS_V0:
+    case SigVersion::WITNESS_V2:
+        // Witness v2 checks a signature the way v0 does; what differs is the
+        // scheme the key names, which CheckPubKeyEncoding admits or refuses.
         return EvalChecksigPreTapscript(sig, pubkey, pbegincodehash, pend, flags, checker, sigversion, serror, success);
     case SigVersion::TAPSCRIPT:
         return EvalChecksigTapscript(sig, pubkey, execdata, flags, checker, sigversion, serror, success);
@@ -465,7 +461,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
     static const valtype vchTrue(1, 1);
 
     // sigversion cannot be TAPROOT here, as it admits no script execution.
-    assert(sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0 || sigversion == SigVersion::TAPSCRIPT);
+    assert(sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0 || sigversion == SigVersion::WITNESS_V2 || sigversion == SigVersion::TAPSCRIPT);
 
     CScript::const_iterator pc = script.begin();
     CScript::const_iterator pend = script.end();
@@ -475,7 +471,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
     ConditionStack vfExec;
     std::vector<valtype> altstack;
     set_error(serror, SCRIPT_ERR_UNKNOWN_ERROR);
-    if ((sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0) && script.size() > MAX_SCRIPT_SIZE) {
+    if ((sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0 || sigversion == SigVersion::WITNESS_V2) && script.size() > MAX_SCRIPT_SIZE) {
         return set_error(serror, SCRIPT_ERR_SCRIPT_SIZE);
     }
     int nOpCount = 0;
@@ -497,7 +493,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
             if (vchPushValue.size() > MaxScriptElementSize(sigversion))
                 return set_error(serror, SCRIPT_ERR_PUSH_SIZE);
 
-            if (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0) {
+            if (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0 || sigversion == SigVersion::WITNESS_V2) {
                 // Note how OP_RESERVED does not count towards the opcode limit.
                 if (opcode > OP_16 && ++nOpCount > MAX_OPS_PER_SCRIPT) {
                     return set_error(serror, SCRIPT_ERR_OP_COUNT);
@@ -668,8 +664,8 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                                 return set_error(serror, SCRIPT_ERR_TAPSCRIPT_MINIMALIF);
                             }
                         }
-                        // Under witness v0 rules it is only a policy rule, enabled through SCRIPT_VERIFY_MINIMALIF.
-                        if (sigversion == SigVersion::WITNESS_V0 && (flags & SCRIPT_VERIFY_MINIMALIF)) {
+                        // Under witness v0 and v2 rules it is only a policy rule, enabled through SCRIPT_VERIFY_MINIMALIF.
+                        if ((sigversion == SigVersion::WITNESS_V0 || sigversion == SigVersion::WITNESS_V2) && (flags & SCRIPT_VERIFY_MINIMALIF)) {
                             if (vch.size() > 1)
                                 return set_error(serror, SCRIPT_ERR_MINIMALIF);
                             if (vch.size() == 1 && vch[0] != 1)
@@ -1142,7 +1138,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                 case OP_CHECKSIGADD:
                 {
                     // OP_CHECKSIGADD is only available in Tapscript
-                    if (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+                    if (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0 || sigversion == SigVersion::WITNESS_V2) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
 
                     // (sig num pubkey -- num)
                     if (stack.size() < 3) return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
@@ -1770,8 +1766,9 @@ bool GenericTransactionSignatureChecker<T>::CheckSig(const std::vector<unsigned 
     int nHashType = vchSig.back();
     vchSig.pop_back();
 
-    // Witness sighashes need the amount.
-    if (sigversion == SigVersion::WITNESS_V0 && amount < 0) return HandleMissingData(m_mdb);
+    // Witness sighashes need the amount. Witness v2 signs the same serialization
+    // as v0, so it commits to the amount and needs it just as much.
+    if (SignsBIP143(sigversion) && amount < 0) return HandleMissingData(m_mdb);
 
     uint256 sighash = SignatureHash(scriptCode, *txTo, nIn, nHashType, amount, sigversion, this->txdata, &m_sighash_cache);
 
@@ -2056,11 +2053,11 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             return set_success(serror);
         }
     } else if (witversion == 2) {
-        // Lattica witness v2: the post-quantum pair, structurally v0's — a
-        // 20-byte program is a key hash and a 32-byte one a script hash. What
-        // differs is the scheme admitted inside (Falcon-512 or ML-DSA-44, named
-        // by the length of the key on the stack) and the element size limit,
-        // which MaxScriptElementSize raises for this version alone.
+        // Witness v2: the post-quantum pair, structurally v0's — a 20-byte
+        // program is a key hash and a 32-byte one a script hash. What differs is
+        // the scheme admitted inside (Falcon-512 or ML-DSA-44, named by the
+        // length of the key on the stack) and the element size limit, which
+        // MaxScriptElementSize raises for this version alone.
         //
         // Unlike Taproot this may be P2SH-wrapped, as v0 may. Taproot forbids
         // it and has to leave the combination anyone-can-spend for softfork

@@ -1,31 +1,5 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
-//
-// Ported from Bitcoin Core's src/script/interpreter.h. Two things run through
-// the whole file and are worth stating once here rather than at each site.
-//
-// The hash is SHA3-256 wherever Core has SHA-256, single-pass wherever Core
-// runs two; see hash.h. Every sighash below is therefore a different value from
-// Bitcoin's, and no signature crosses between the chains.
-//
-// And there are three signature schemes, admitted by witness version rather
-// than by a tag on the key. Bitcoin already works this way — witness v0 means
-// secp256k1 and nothing else, and a 20- against a 32-byte program is what tells
-// P2WPKH from P2WSH inside it — so the rule is Bitcoin's, extended by one
-// version:
-//
-//     version         scheme                     because
-//     BASE, P2SH      secp256k1                  see below
-//     witness v0      secp256k1                  BIP 141, unchanged
-//     witness v1      secp256k1 (BIP340)         Taproot is a curve point
-//     witness v2      Falcon-512, ML-DSA-44      new; length names the scheme
-//
-// The first line is arithmetic, not policy. A push in a script is capped at
-// MAX_SCRIPT_ELEMENT_SIZE = 520 bytes, and the smallest lattice signature here
-// is Falcon's 666. Neither lattice scheme can be spent through a scriptSig at
-// all, so the legacy formats are secp256k1's by construction. Witness v2 raises
-// that cap for itself alone, which is what leaves v0 and tapscript identical to
-// Bitcoin's.
 
 #ifndef LATTICA_SCRIPT_INTERPRETER_H
 #define LATTICA_SCRIPT_INTERPRETER_H
@@ -76,7 +50,8 @@ enum class script_verify_flag_name : uint8_t {
     SCRIPT_VERIFY_P2SH,
 
     // Passing a non-strict-DER signature or one with undefined hashtype to a checksig operation causes script failure.
-    // Evaluating a pubkey that is not (0x04 + 64 bytes) or (0x02 or 0x03 + 32 bytes) by checksig causes script failure.
+    // Evaluating a pubkey that is not (0x02 or 0x03 + 32 bytes), or one of the two lattice lengths, by checksig
+    // causes script failure.
     // (not used or intended as a consensus rule).
     SCRIPT_VERIFY_STRICTENC,
 
@@ -187,21 +162,16 @@ bool CheckSignatureEncoding(const std::vector<unsigned char>& vchSig, script_ver
 
 struct PrecomputedTransactionData
 {
-    // BIP341 precomputed data.
-    //
-    // Core keeps two sets, single-SHA256 for BIP341 and double-SHA256 for
-    // BIP143. Here a single SHA3-256 pass is the whole of both, so the three
-    // shared values are computed once and named as Core names them for BIP143;
-    // only the two BIP341 adds its own are separate. The ready flags stay apart
-    // because BIP341 needs the spent outputs and BIP143 does not, so the two
-    // become available at different moments.
+    // BIP341 precomputed data. Core keeps five of these, three of which are the
+    // single-SHA256 halves of its BIP143 pair; one SHA3-256 pass is the whole of
+    // both here, so only the two BIP341 adds of its own are separate.
     uint256 m_spent_amounts_single_hash;
     uint256 m_spent_scripts_single_hash;
     //! Whether the two fields above, and the three below, are initialized.
     bool m_bip341_taproot_ready = false;
 
-    // BIP143 precomputed data. Also BIP341's m_prevouts_single_hash,
-    // m_sequences_single_hash and m_outputs_single_hash, which coincide here.
+    // BIP143 precomputed data, which is also BIP341's prevouts, sequences and
+    // outputs hashes.
     uint256 hashPrevouts, hashSequence, hashOutputs;
     //! Whether the 3 fields above are initialized.
     bool m_bip143_segwit_ready = false;
@@ -232,7 +202,7 @@ enum class SigVersion
     WITNESS_V0 = 1,  //!< Witness v0 (P2WPKH and P2WSH); see BIP 141
     TAPROOT = 2,     //!< Witness v1 with 32-byte program, not BIP16 P2SH-wrapped, key path spending; see BIP 341
     TAPSCRIPT = 3,   //!< Witness v1 with 32-byte program, not BIP16 P2SH-wrapped, script path spending, leaf version 0xc0; see BIP 342
-    WITNESS_V2 = 4,  //!< Witness v2 (post-quantum keyhash and scripthash); Lattica's, the scheme named by public key length
+    WITNESS_V2 = 4,  //!< Witness v2 (post-quantum keyhash and scripthash), the scheme named by public key length
 };
 
 struct ScriptExecutionData
@@ -277,13 +247,10 @@ inline constexpr size_t TAPROOT_CONTROL_NODE_SIZE = 32;
 inline constexpr size_t TAPROOT_CONTROL_MAX_NODE_COUNT = 128;
 inline constexpr size_t TAPROOT_CONTROL_MAX_SIZE = TAPROOT_CONTROL_BASE_SIZE + TAPROOT_CONTROL_NODE_SIZE * TAPROOT_CONTROL_MAX_NODE_COUNT;
 
-/** Maximum size of a witness stack item, and of a push executed inside a script,
- *  under witness v2.
- *
- *  Everywhere else this is Bitcoin's MAX_SCRIPT_ELEMENT_SIZE. Witness v2 exists
- *  to carry material that does not fit in 520 bytes — an ML-DSA-44 signature is
- *  2420 and its public key 1312 — and raising the cap for that version alone is
- *  what leaves every older version's limit exactly Bitcoin's. */
+/** The element size limit under witness v2, which exists to carry material that
+ *  does not fit in Bitcoin's 520: an ML-DSA-44 signature is 2420 bytes and its
+ *  public key 1312. Raising it for that version alone is what leaves every older
+ *  version's limit exactly Bitcoin's. */
 inline constexpr size_t MAX_SCRIPT_ELEMENT_SIZE_V2 = 3600;
 static_assert(MAX_SCRIPT_ELEMENT_SIZE_V2 > MAX_SCRIPT_ELEMENT_SIZE);
 
@@ -291,11 +258,18 @@ static_assert(MAX_SCRIPT_ELEMENT_SIZE_V2 > MAX_SCRIPT_ELEMENT_SIZE);
 size_t MaxScriptElementSize(SigVersion sigversion);
 
 /** Whether a public key of this length may be signed with under this signature
- *  version. Consensus: the version names the scheme.
+ *  version. This is consensus, and it is Bitcoin's own rule — witness v0 means
+ *  secp256k1 and nothing else — extended by one version:
+ *
+ *      BASE, P2SH   secp256k1              a 520-byte push cannot hold a lattice
+ *                                          signature, the smaller being 666
+ *      witness v0   secp256k1              BIP 141, unchanged
+ *      witness v1   secp256k1 (BIP 340)    a Taproot key is a curve point
+ *      witness v2   Falcon-512, ML-DSA-44  the length names the scheme
  *
  *  Defined for BASE, WITNESS_V0 and WITNESS_V2, the versions whose CHECKSIG
- *  takes a CPubKey. Taproot's key is a 32-byte x-only one and its own rules in
- *  CheckSchnorrSignature decide it. */
+ *  takes a CPubKey; Taproot's key is a 32-byte x-only one and BIP 342's own
+ *  rules in CheckSchnorrSignature decide it. */
 bool SchemeAllowedForSigVersion(size_t pubkey_len, SigVersion sigversion);
 
 extern const HashWriter HASHER_TAPSIGHASH; //!< Hasher with tag "TapSighash" pre-fed to it.
@@ -329,11 +303,9 @@ class BaseSignatureChecker
 public:
     /** Verify a signature under a CPubKey, for BASE, WITNESS_V0 and WITNESS_V2.
      *
-     *  This is Core's CheckECDSASignature slot. It is not named for an algorithm
-     *  here because three of them arrive through it — secp256k1 ECDSA, Falcon-512
-     *  and ML-DSA-44 — chosen by the length of `vchPubKey`, subject to
-     *  SchemeAllowedForSigVersion. `scriptSig` carries the scheme's signature
-     *  with a trailing sighash-type byte. */
+     *  Core's CheckECDSASignature slot, not named for an algorithm because three
+     *  arrive through it — secp256k1 ECDSA, Falcon-512 and ML-DSA-44 — chosen by
+     *  the length of vchPubKey and admitted by SchemeAllowedForSigVersion. */
     virtual bool CheckSig(const std::vector<unsigned char>& scriptSig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const
     {
         return false;
