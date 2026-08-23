@@ -11,21 +11,26 @@
 ---
 
 Lattica keeps the Bitcoin Core design — a UTXO ledger, Script, full-node
-validation, a peer-to-peer network, a built-in wallet — and replaces the
-cryptography that a quantum computer breaks.
+validation, a peer-to-peer network, a built-in wallet — and adds the signature
+schemes a quantum computer does not break.
 
-That replacement is the whole point. In March 2026 a joint whitepaper from
-Google Quantum AI, the Ethereum Foundation and Stanford put a number on it: the
-256-bit elliptic-curve discrete logarithm, the problem every Bitcoin signature
-rests on, falls in minutes to fewer than half a million physical qubits
+That addition is the whole point. In March 2026 a joint whitepaper from Google
+Quantum AI, the Ethereum Foundation and Stanford put a number on it: the 256-bit
+elliptic-curve discrete logarithm, the problem every Bitcoin signature rests on,
+falls in minutes to fewer than half a million physical qubits
 ([arXiv:2603.28846](https://arxiv.org/abs/2603.28846)). NIST has separately
 scheduled ECDSA for deprecation after 2030 and disallowance after 2035. Lattica
 starts on the other side of that line.
 
 ### What is different from Bitcoin
 
-- **Signatures: ML-DSA-44** (FIPS 204), vendored from PQClean. There is no
-  elliptic-curve code in the tree at all — `libsecp256k1` is not present.
+- **Three signature schemes, and the witness version says which.** Base, P2SH
+  and witness v0 and v1 are secp256k1, byte for byte Bitcoin's — including
+  Taproot. Witness v2 is post-quantum: **Falcon-512** (FIPS 206 draft) or
+  **ML-DSA-44** (FIPS 204), both vendored from PQClean. Nothing distinguishes
+  the two lattice schemes in the address, because a witness v2 address is a
+  hash; what tells them apart is the length of the key that spends it, and only
+  the wallet holding that key knows it in advance.
 - **Encrypted transport: ML-KEM-768** (FIPS 203) in the v2 P2P handshake, in
   place of the elliptic-curve exchange of BIP324. On by default, so the wire is
   covered as well as the coins.
@@ -33,24 +38,70 @@ starts on the other side of that line.
   Merkle trees — and **SHA3-256d** for proof of work. Address and script hashes
   are `Hash160 = RIPEMD160(SHA3-256)`, Bitcoin's two-stage shape over a SHA3
   inner digest, so the short hash is not a prefix of the long one.
+- **No witness discount.** `WITNESS_SCALE_FACTOR` is 1: a vbyte is a byte and
+  weight is serialized size. Segwit's discount was priced for 72-byte
+  signatures; it is not obvious what it should mean for a 2420-byte one, so it
+  means nothing. The block is 32 MB instead, which is where the room comes from.
 - **Everything else is deliberately unchanged.** The 2016-block difficulty
   retarget, the ten-minute target, the 210 000-block halving, Script. A
   post-quantum chain is already enough novelty for one project.
 
-The cost is honest and worth stating: an ML-DSA-44 input is 3732 bytes against
-104 for ECDSA, so a transaction is roughly 17× a Bitcoin transaction, and a
-payment costs proportionally more in fees at equal congestion. Nothing about the
-signature scheme is free.
+### What it costs, measured
+
+A lattice signature is large and no amount of engineering makes it small. These
+are measured, not estimated — the wallet's own figures for a spend, and for a
+whole one-input two-output transaction:
+
+| | input | transaction | per 32 MB block |
+| --- | ---: | ---: | ---: |
+| secp256k1 (P2WPKH) | 149 B | 222 B | 144 144 |
+| Falcon-512 | 1 612 B | 1 686 B | 18 979 |
+| ML-DSA-44 | 3 781 B | 3 855 B | 8 300 |
+
+An ML-DSA-44 spend is 25× a curve spend and a Falcon-512 spend is 11×. The block
+is 32× Bitcoin's, so the throughput that comes out the other side is **1.8×
+Bitcoin's in ML-DSA-44 and 4.2× in Falcon-512** — against roughly 4 500
+transactions in a 1 MB-equivalent Bitcoin block. The signatures cost more; the
+chain buys the room back and then some.
+
+Falcon-512 is the cheaper of the two by a factor of two and a half. ML-DSA-44 is
+the wallet's default anyway, because Falcon signs by sampling a discrete
+Gaussian in floating point and stands on a draft standard, where ML-DSA is final
+and signs in integers. Verification of both is integer-only, so consensus does
+not turn on that choice — a signing key does. Falcon stays one `-addresstype`
+away.
 
 ## Status
 
-**Mainnet genesis is dated 19 August 2026.** Genesis is mined and the parameters
-are fixed. The network is young and thinly connected; consensus rules may still
-change while it has little weight behind it, and after that they will not.
+**Pre-launch.** There is no public network yet. Mainnet genesis is mined and
+dated 19 August 2026, and the node runs: it mines, hands out addresses of all
+six types, and spends from every one of them. What has not happened is two nodes
+talking to each other outside a laboratory, so the identity values in
+`src/kernel/chainparams.cpp` — network magic, ports, address prefixes, bech32
+HRPs — are still marked provisional and can be revised until the chain has
+weight behind it. After that they cannot.
 
 The chain begins at **difficulty 1** — the same target Bitcoin's genesis used —
-so an ordinary CPU can mine from the first block. On a modern desktop that is a
-few minutes per block until the difficulty finds its level.
+so an ordinary CPU can mine from the first block.
+
+## Address types
+
+Six, and the wallet will hand out any of them. The first four are Bitcoin's,
+unchanged; the last two are the reason this project exists.
+
+| `-addresstype` | Example (mainnet) | Script | Scheme |
+| --- | --- | --- | --- |
+| `legacy` | `Le6qc6Lj2Jxb…` | P2PKH | secp256k1 |
+| `p2sh-segwit` | `MMxTBs9ADojX…` | P2SH-P2WPKH | secp256k1 |
+| `bech32` | `la1qhf08uylmp…` | witness v0 | secp256k1 |
+| `bech32m` | `la1pfksejfp7n…` | witness v1, Taproot | secp256k1 |
+| `falcon512` | `la1zjm3p4xspf…` | witness v2 | Falcon-512 |
+| `mldsa44` | `la1zkq6ceg378…` | witness v2 | ML-DSA-44 |
+
+The default is `mldsa44`. Both lattice types encode identically — `la1z…`, where
+`z` is bech32m's character for witness version 2 — because both are a 20-byte
+hash under that version. The key itself, 897 bytes or 1312, never appears in an
+address; it appears in the witness, when the output is spent.
 
 ## Binaries
 
@@ -88,9 +139,11 @@ opt-in.
 ```bash
 # regtest — a private network for development
 latticad -regtest -daemon
-lattica-cli -regtest getblockchaininfo
-lattica-cli -regtest -generate 10
-lattica-cli -regtest getnewaddress
+lattica-cli -regtest createwallet w
+lattica-cli -regtest getnewaddress                 # a witness v2 address
+lattica-cli -regtest getnewaddress "" falcon512    # or ask for the cheaper scheme
+lattica-cli -regtest -generate 101
+lattica-cli -regtest sendtoaddress <address> 1
 ```
 
 ## Mining
@@ -117,16 +170,18 @@ needs at difficulty 1. It is meant for regtest, not for mining.
 | --- | --- | --- | --- |
 | P2P port | 12333 | 22333 | 22444 |
 | RPC port | 12332 | 22332 | 22443 |
-| Address prefix | `L` | `t` | `t` |
-| bech32 prefix | `la` | `tl` | `lart` |
+| base58 prefix | `L` (P2PKH), `M` (P2SH) | `t`, `x` | `t`, `x` |
+| bech32 HRP | `la` | `tl` | `lart` |
 | Data directory | `~/.lattica` | | |
 
 ## Repository layout
 
 ```
 src/            node, consensus, wallet, P2P, RPC, crypto
-  ML-DSA-44/    vendored FIPS 204 signature implementation
-  ML-KEM-768/   vendored FIPS 203 key encapsulation
+  secp256k1/    vendored libsecp256k1, for the base and witness v0/v1 schemes
+  mldsa44/      vendored FIPS 204 signature implementation
+  falcon512/    vendored FIPS 206 draft signature implementation
+  mlkem768/     vendored FIPS 203 key encapsulation
   qt/           the Qt Widgets GUI
   test/         unit tests (run via ctest)
 tools/          offline helpers, including the genesis miner

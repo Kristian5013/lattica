@@ -7,16 +7,17 @@
 # library/target decomposition to src/CMakeLists.txt (consensus / crypto / util
 # / common / node / wallet / cli libraries, sharing flags via core_interface).
 #
-# Consensus core in C++20: SHA3-256 hashing, SHA3-256d proof-of-work,
-# vendored ML-DSA-44 signatures (src/mldsa44, PQClean/FIPS 204), and the UTXO +
+# Consensus core in C++20: SHA3-256 hashing, SHA3-256d proof-of-work, three
+# signature schemes named by witness version (secp256k1, and the vendored
+# Falcon-512 and ML-DSA-44 of src/falcon512 and src/mldsa44), and the UTXO +
 # validation stack.
 
 cmake_minimum_required(VERSION 3.22)
 
 project(lattica
     VERSION 0.1.0
-    DESCRIPTION "Lattica — UTXO chain with SHA3-256d PoW and PQC signatures (ML-DSA-44)"
-    HOMEPAGE_URL "https://github.com/gettessera-project/tessera"
+    DESCRIPTION "Lattica — UTXO chain with SHA3-256d PoW and post-quantum signatures (Falcon-512, ML-DSA-44)"
+    HOMEPAGE_URL "https://github.com/Kristian5013/lattica"
     LANGUAGES C CXX)
 
 # cmake/ module path (Core-style helper modules: AddWindowsResources,

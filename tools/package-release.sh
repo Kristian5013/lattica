@@ -19,6 +19,11 @@ WIN_BUILD=${3:-}
 OUT=${4:?output directory required}
 
 BINARIES=(latticad lattica-cli lattica-tx lattica-util lattica-wallet lattica-miner lattica-qt)
+# Built only where their dependency was found, so their absence is a fact about
+# the build machine and not a defect in the release: packaged when present,
+# passed over in silence when not. lattica-qt is not among them -- a release
+# without the GUI is a release someone should be told about.
+OPTIONAL_BINARIES=(lattica-miner-gpu)
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 mkdir -p "$OUT"
@@ -44,6 +49,9 @@ if [[ -n $LINUX_BUILD && -d $LINUX_BUILD ]]; then
             missing+=("$b")
         fi
     done
+    for b in "${OPTIONAL_BINARIES[@]}"; do
+        [[ -f "$LINUX_BUILD/$b" ]] && install -m 755 "$LINUX_BUILD/$b" "$WORK/$NAME/bin/"
+    done
     [[ ${#missing[@]} -gt 0 ]] && echo "warning: linux archive is missing ${missing[*]}" >&2
     stage_common "$WORK/$NAME"
     tar -C "$WORK" --owner=0 --group=0 --numeric-owner \
@@ -67,6 +75,9 @@ if [[ -n $WIN_BUILD && -d $WIN_BUILD ]]; then
         else
             missing+=("$b.exe")
         fi
+    done
+    for b in "${OPTIONAL_BINARIES[@]}"; do
+        [[ -f "$WIN_BUILD/$b.exe" ]] && install -m 755 "$WIN_BUILD/$b.exe" "$WORK/$NAME/"
     done
     [[ ${#missing[@]} -gt 0 ]] && echo "warning: windows archive is missing ${missing[*]}" >&2
     stage_common "$WORK/$NAME"
