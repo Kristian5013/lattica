@@ -1,5 +1,13 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
+//
+// Text forms of keys and addresses: base58check for the legacy pair and for
+// keys, bech32 and bech32m for the witness versions.
+//
+// Two things differ from Bitcoin's. WIF is an envelope for a 32-byte scalar, so
+// only a secp256k1 secret has one. And an extended key is as long as the key it
+// carries, so neither the private nor the public form has Bitcoin's fixed size;
+// both bounds are written out from the types rather than taken as constants.
 
 #ifndef LATTICA_KEY_IO_H
 #define LATTICA_KEY_IO_H

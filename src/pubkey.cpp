@@ -1,5 +1,13 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
+//
+// Verification for the three schemes, and the curve operations Taproot needs.
+//
+// Every entry point that has to know which scheme it is holding switches on
+// size(): the length names the scheme, and the three lengths are pairwise
+// distinct (see pubkey.h). The secp256k1 arms are Bitcoin's own code, vendored
+// libsecp256k1 and all; the lattice arms hand the bytes to PQClean, which
+// enforces its own lengths internally.
 
 #include <pubkey.h>
 
@@ -406,34 +414,33 @@ bool CPubKey::Derive(CPubKey& pubkeyChild, ChainCode &ccChild, unsigned int nChi
     return true;
 }
 
-void CExtPubKey::Encode(unsigned char code[BIP32_EXTKEY_SIZE]) const {
+void CExtPubKey::Encode(std::span<unsigned char> code) const {
+    assert(code.size() == GetSerializedSize());
     code[0] = nDepth;
-    std::ranges::copy(fingerprint, code+1);
-    WriteBE32(code+5, nChild);
-    memcpy(code+9, chaincode.begin(), 32);
-    assert(pubkey.size() == CPubKey::SECP256K1_SIZE);
-    memcpy(code+41, pubkey.begin(), CPubKey::SECP256K1_SIZE);
+    std::ranges::copy(fingerprint, code.data() + 1);
+    WriteBE32(code.data() + 5, nChild);
+    memcpy(code.data() + 9, chaincode.begin(), 32);
+    memcpy(code.data() + HEADER_SIZE, pubkey.begin(), pubkey.size());
 }
 
-void CExtPubKey::Decode(const unsigned char code[BIP32_EXTKEY_SIZE]) {
+bool CExtPubKey::Decode(std::span<const unsigned char> code) {
+    // Everything past the header is the key, and only three lengths are keys, so
+    // the size of what was handed over decides the scheme. Core reads a fixed 33
+    // bytes and cannot be given the wrong length in the first place.
+    if (code.size() <= HEADER_SIZE) {
+        pubkey = CPubKey();
+        return false;
+    }
     nDepth = code[0];
-    std::copy_n(code + 1, fingerprint.size(), fingerprint.begin());
-    nChild = ReadBE32(code+5);
-    memcpy(chaincode.begin(), code+9, 32);
-    pubkey.Set(code+41, code+BIP32_EXTKEY_SIZE);
-    if ((nDepth == 0 && (nChild != 0 || ReadLE32(fingerprint.data()) != 0)) || !pubkey.IsFullyValid()) pubkey = CPubKey();
-}
-
-void CExtPubKey::EncodeWithVersion(unsigned char code[BIP32_EXTKEY_WITH_VERSION_SIZE]) const
-{
-    memcpy(code, version, 4);
-    Encode(&code[4]);
-}
-
-void CExtPubKey::DecodeWithVersion(const unsigned char code[BIP32_EXTKEY_WITH_VERSION_SIZE])
-{
-    memcpy(version, code, 4);
-    Decode(&code[4]);
+    std::copy_n(code.data() + 1, fingerprint.size(), fingerprint.begin());
+    nChild = ReadBE32(code.data() + 5);
+    memcpy(chaincode.begin(), code.data() + 9, 32);
+    pubkey.Set(code.data() + HEADER_SIZE, code.data() + code.size());
+    if ((nDepth == 0 && (nChild != 0 || ReadLE32(fingerprint.data()) != 0)) || !pubkey.IsFullyValid()) {
+        pubkey = CPubKey();
+        return false;
+    }
+    return true;
 }
 
 //! BIP32 public derivation: tweak the point by a hash of the chain code, the

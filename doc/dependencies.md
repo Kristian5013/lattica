@@ -4,7 +4,7 @@ These are the dependencies used by Lattica.
 You can find installation instructions in the `/doc/build-*.md` file for your platform.
 
 The consensus-critical and bundled libraries (LevelDB, crc32c, minisketch,
-univalue, ML-DSA-44/ML-KEM-768 and, for IPC,
+univalue, mldsa44/falcon512/mlkem768 and, for IPC,
 libmultiprocess) are vendored in the source tree and require no separate
 installation.
 

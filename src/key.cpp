@@ -1,5 +1,17 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
+//
+// Key generation, signing and hierarchical derivation for the three schemes.
+//
+// The secp256k1 half is Bitcoin's own code against vendored libsecp256k1, down
+// to the DER import/export helpers and the low-R grinding loop. The lattice half
+// hands the bytes to PQClean and seeds its keygen through the entropy seam in
+// randombytes.h, which is what makes derivation deterministic.
+//
+// CExtKey::Derive is the one place where the tree departs from BIP32 outright:
+// it hashes the parent's secret node seed into the child's, for every scheme,
+// because adding a scalar to a scalar is not an operation a lattice secret has.
+// See the note on CExtPubKey::Derive for what that costs.
 
 #include <key.h>
 

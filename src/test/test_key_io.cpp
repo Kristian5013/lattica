@@ -256,16 +256,26 @@ int main()
               !DecodeExtKey(xprv, *regtest).key.IsValid());
         Check("garbage is not an extended key", !DecodeExtKey("not an xprv", *main).key.IsValid());
 
-        // The public half is 74 bytes, secp256k1's, and only that scheme has one
-        // that encodes; see CExtKey::Neuter.
-        CExtKey secp_master;
-        secp_master.SetSeed(seed, CKey::SECP256K1_SIZE);
-        const CExtPubKey xpub = secp_master.Neuter();
-        const std::string xpub_str = EncodeExtPubKey(xpub, *main);
-        Check("a secp256k1 extended public key round-trips",
-              !xpub_str.empty() && DecodeExtPubKey(xpub_str, *main) == xpub);
-        Check("an extended public key is not an extended private key",
-              !DecodeExtKey(xpub_str, *main).key.IsValid());
+        // The public half of a node is as long as the key it holds: 74 bytes for
+        // secp256k1, which is Bitcoin's constant, and 938 or 1353 for the lattice
+        // schemes. Every one of them has to survive base58.
+        bool xpubs_round_trip = true;
+        for (unsigned int secret_size : {CKey::SECP256K1_SIZE, CKey::FALCON512_SIZE, CKey::MLDSA44_SIZE}) {
+            CExtKey master;
+            master.SetSeed(seed, secret_size);
+            const CExtPubKey xpub = master.Neuter();
+            if (xpub.GetSerializedSize() != CExtPubKey::HEADER_SIZE + xpub.pubkey.size()) xpubs_round_trip = false;
+            const std::string str = EncodeExtPubKey(xpub, *main);
+            if (str.empty() || DecodeExtPubKey(str, *main) != xpub) xpubs_round_trip = false;
+            // ...and must not be readable as the private form, nor on another network.
+            if (DecodeExtKey(str, *main).key.IsValid()) xpubs_round_trip = false;
+            if (DecodeExtPubKey(str, *regtest).pubkey.IsValid()) xpubs_round_trip = false;
+        }
+        Check("an extended public key of every scheme round-trips through base58", xpubs_round_trip);
+
+        CExtPubKey empty;
+        Check("an extended public key with no key does not encode", EncodeExtPubKey(empty, *main).empty());
+        Check("garbage is not an extended public key", !DecodeExtPubKey("not an xpub", *main).pubkey.IsValid());
     }
 
     // ---- Error reporting via the error_str / error_locations overload.

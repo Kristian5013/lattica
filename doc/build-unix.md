@@ -32,7 +32,7 @@ Dependencies
 ------------
 
 The consensus-critical and bundled libraries (LevelDB, crc32c, minisketch,
-univalue, ML-DSA-44/ML-KEM-768 and, for IPC,
+univalue, mldsa44/falcon512/mlkem768 and, for IPC,
 libmultiprocess) are **vendored** in the source tree and built automatically —
 you do not need to install them.
 

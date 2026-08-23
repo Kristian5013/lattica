@@ -1,5 +1,19 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
+//
+// Public keys of three signature schemes: secp256k1, Falcon-512 and ML-DSA-44.
+//
+// Nothing tags the scheme. The length names it, which is Bitcoin's own habit —
+// there GetLen() turns a header byte into a length and the length is what the
+// rest of the code reasons about — carried one step further, to a set of three
+// lengths that are pairwise distinct by construction. Every place that has to
+// know which scheme it is holding asks size().
+//
+// The consequences run through this file: a CPubKey stores its bytes in a vector
+// because there is no header byte to recover a length from and the largest key
+// is 1312 bytes; XOnlyPubKey takes an x coordinate, so only a secp256k1 key has
+// one; and a node of the key tree, CExtPubKey, is as long as the key it holds
+// rather than Bitcoin's constant 74.
 
 #ifndef LATTICA_PUBKEY_H
 #define LATTICA_PUBKEY_H
@@ -15,9 +29,6 @@
 #include <optional>
 #include <utility>
 #include <vector>
-
-inline constexpr unsigned int BIP32_EXTKEY_SIZE = 74;
-inline constexpr unsigned int BIP32_EXTKEY_WITH_VERSION_SIZE = 78;
 
 using KeyFingerprint = std::array<unsigned char, 4>;
 
@@ -41,9 +52,7 @@ class CPubKey
 public:
     /**
      * secp256k1, Falcon-512 (PQClean falcon-padded-512), ML-DSA-44 (FIPS 204),
-     * and the signature each produces. Nothing tags the scheme: the length
-     * names it, as in Bitcoin, where GetLen() turns a header byte into a length
-     * and the length is what the rest of the code reasons about.
+     * and the signature each produces.
      *
      * SIZE and SIGNATURE_SIZE are the largest of each, the bound a caller uses
      * when it must allocate before knowing the scheme. A secp256k1 signature is
@@ -90,7 +99,8 @@ private:
 
 public:
 
-    //! Whether this length is one an implemented scheme uses.
+    //! Whether this length is one an implemented scheme uses. Core's counterpart
+    //! reads the header byte, which is the same question asked of a curve point.
     bool static ValidSize(size_t len) {
       return len == SECP256K1_SIZE || len == FALCON512_SIZE || len == MLDSA44_SIZE;
     }
@@ -205,6 +215,14 @@ public:
         return size() > 0;
     }
 
+    /** Check if a public key is a syntactically valid compressed secp256k1 key.
+     *  Core also admits the uncompressed 0x04 form; one scheme cannot have two
+     *  lengths here, so a secp256k1 key is compressed and nothing else. */
+    bool IsValidNonHybrid() const noexcept
+    {
+        return size() == SECP256K1_SIZE && (vch[0] == 0x02 || vch[0] == 0x03);
+    }
+
     /**
      * Fully validate whether this is a valid public key (more expensive than
      * IsValid()).
@@ -216,14 +234,6 @@ public:
      * caller must therefore not read a true here as "a matching private key
      * exists" for the lattice schemes.
      */
-    /** Check if a public key is a syntactically valid compressed secp256k1 key.
-     *  Core also admits the uncompressed 0x04 form; one scheme cannot have two
-     *  lengths here, so a secp256k1 key is compressed and nothing else. */
-    bool IsValidNonHybrid() const noexcept
-    {
-        return size() == SECP256K1_SIZE && (vch[0] == 0x02 || vch[0] == 0x03);
-    }
-
     bool IsFullyValid() const;
 
     //! Check whether this is a compressed public key. True exactly for secp256k1.
@@ -253,7 +263,13 @@ public:
     //! Recover a public key from a compact signature.
     bool RecoverCompact(const uint256& hash, const std::vector<unsigned char>& vchSig);
 
-    //! Derive BIP32 child pubkey.
+    /**
+     * Derive a BIP32 child pubkey by tweaking this point.
+     *
+     * secp256k1 only, and see CExtPubKey::Derive for what it is and is not good
+     * for: this chain's key tree is hardened at every step, so this does not
+     * continue it.
+     */
     [[nodiscard]] bool Derive(CPubKey& pubkeyChild, ChainCode &ccChild, unsigned int nChild, const ChainCode& cc, uint256* bip32_tweak_out = nullptr) const;
 
     /**
@@ -364,13 +380,34 @@ public:
 // Core's EllSwiftPubKey belongs to the BIP324 transport; this transport is
 // ML-KEM-768, see v2cipher.h.
 
+/**
+ * The public half of a node of the key tree.
+ *
+ * It is a label and a cache record, not a derivation root. CExtKey::Derive puts
+ * the parent's secret node seed in every child's preimage — for all three
+ * schemes, secp256k1 included — so Derive() below does not continue the tree;
+ * see its definition.
+ *
+ * Core's counterpart has a fixed serialized size of 74 bytes and four leading
+ * version bytes for BIP32's base58 form. Here the node is as long as the key it
+ * holds, and the version bytes belong to the encoder (key_io.cpp) rather than to
+ * the node, so they are not a field.
+ */
 struct CExtPubKey {
-    unsigned char version[4];
-    unsigned char nDepth;
-    KeyFingerprint fingerprint;
-    unsigned int nChild;
+    unsigned char nDepth{0};
+    KeyFingerprint fingerprint{};
+    unsigned int nChild{0};
     ChainCode chaincode;
     CPubKey pubkey;
+
+    //! The four BIP32 fields that precede the key in a serialized node.
+    static constexpr size_t HEADER_SIZE = 1 + 4 + 4 + 32;
+    //! The largest a serialized node can be, which is an ML-DSA-44 one.
+    static constexpr size_t MAX_SIZE = HEADER_SIZE + CPubKey::SIZE;
+
+    //! The serialized size of this node. Bitcoin's is the constant 74, which is
+    //! this one for a secp256k1 key.
+    size_t GetSerializedSize() const { return HEADER_SIZE + pubkey.size(); }
 
     friend bool operator==(const CExtPubKey &a, const CExtPubKey &b)
     {
@@ -396,20 +433,17 @@ struct CExtPubKey {
         return pubkey.GetID().fingerprint();
     }
 
-    //! Encode/Decode are BIP32's fixed 74 bytes and so are secp256k1's; Encode
-    //! asserts a 33-byte key. They are the base58 form, which only that scheme
-    //! has.
-    void Encode(unsigned char code[BIP32_EXTKEY_SIZE]) const;
-    void Decode(const unsigned char code[BIP32_EXTKEY_SIZE]);
-    void EncodeWithVersion(unsigned char code[BIP32_EXTKEY_WITH_VERSION_SIZE]) const;
-    void DecodeWithVersion(const unsigned char code[BIP32_EXTKEY_WITH_VERSION_SIZE]);
+    //! The base58 payload of this node. Core's pair takes a fixed 74-byte buffer,
+    //! which only holds a 33-byte key; these take the span the key's own length
+    //! calls for. Decode reports whether what it was handed was a node at all.
+    void Encode(std::span<unsigned char> code) const;
+    [[nodiscard]] bool Decode(std::span<const unsigned char> code);
+
     [[nodiscard]] bool Derive(CExtPubKey& out, unsigned int nChild, uint256* bip32_tweak_out = nullptr) const;
 
     //! Serialization, for records that hold a node of the key tree. Core has none
     //! and writes Encode()'s fixed 74 bytes instead, which it can because every
-    //! key it caches is 33 bytes. A node here may hold a Falcon-512 or ML-DSA-44
-    //! public key, so the key carries its own length. The version bytes are not
-    //! part of a node and are left out.
+    //! key it caches is 33 bytes.
     SERIALIZE_METHODS(CExtPubKey, obj)
     {
         READWRITE(obj.nDepth, obj.fingerprint, obj.nChild, obj.chaincode, obj.pubkey);

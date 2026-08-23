@@ -8,7 +8,7 @@
 # / common / node / wallet / cli libraries, sharing flags via core_interface).
 #
 # Consensus core in C++20: SHA3-256 hashing, SHA3-256d proof-of-work,
-# vendored ML-DSA-44 signatures (src/ML-DSA-44, PQClean/FIPS 204), and the UTXO +
+# vendored ML-DSA-44 signatures (src/mldsa44, PQClean/FIPS 204), and the UTXO +
 # validation stack.
 
 cmake_minimum_required(VERSION 3.22)
@@ -145,8 +145,8 @@ target_include_directories(core_interface INTERFACE
     # ML-DSA-44 / ML-KEM-768 headers (api.h, …) are referenced across consensus,
     # common, crypto and the tests; the symbols are linked via the mldsa44 target
     # where used.
-    ${CMAKE_SOURCE_DIR}/src/ML-DSA-44
-    ${CMAKE_SOURCE_DIR}/src/ML-KEM-768
+    ${CMAKE_SOURCE_DIR}/src/mldsa44
+    ${CMAKE_SOURCE_DIR}/src/mlkem768
     ${CMAKE_BINARY_DIR})
 # -UNDEBUG keeps assertions on in every build type (util/check.h's Assert()).
 target_compile_options(core_interface INTERFACE -UNDEBUG)

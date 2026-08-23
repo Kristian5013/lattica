@@ -16,16 +16,16 @@
 #
 # Built before core_interface so the vendored C keeps its own build policy.
 add_library(mlkem768 STATIC
-    ${PROJECT_SOURCE_DIR}/src/ML-KEM-768/cbd.c
-    ${PROJECT_SOURCE_DIR}/src/ML-KEM-768/indcpa.c
-    ${PROJECT_SOURCE_DIR}/src/ML-KEM-768/kem.c
-    ${PROJECT_SOURCE_DIR}/src/ML-KEM-768/ntt.c
-    ${PROJECT_SOURCE_DIR}/src/ML-KEM-768/poly.c
-    ${PROJECT_SOURCE_DIR}/src/ML-KEM-768/polyvec.c
-    ${PROJECT_SOURCE_DIR}/src/ML-KEM-768/reduce.c
-    ${PROJECT_SOURCE_DIR}/src/ML-KEM-768/symmetric-shake.c
-    ${PROJECT_SOURCE_DIR}/src/ML-KEM-768/verify.c)
+    ${PROJECT_SOURCE_DIR}/src/mlkem768/cbd.c
+    ${PROJECT_SOURCE_DIR}/src/mlkem768/indcpa.c
+    ${PROJECT_SOURCE_DIR}/src/mlkem768/kem.c
+    ${PROJECT_SOURCE_DIR}/src/mlkem768/ntt.c
+    ${PROJECT_SOURCE_DIR}/src/mlkem768/poly.c
+    ${PROJECT_SOURCE_DIR}/src/mlkem768/polyvec.c
+    ${PROJECT_SOURCE_DIR}/src/mlkem768/reduce.c
+    ${PROJECT_SOURCE_DIR}/src/mlkem768/symmetric-shake.c
+    ${PROJECT_SOURCE_DIR}/src/mlkem768/verify.c)
 target_include_directories(mlkem768 PUBLIC
-    ${PROJECT_SOURCE_DIR}/src/ML-KEM-768)
+    ${PROJECT_SOURCE_DIR}/src/mlkem768)
 # fips202 (SHA3/SHAKE) + randombytes live in the mldsa44 target (PQClean common/).
 target_link_libraries(mlkem768 PUBLIC mldsa44)

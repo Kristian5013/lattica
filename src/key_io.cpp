@@ -313,9 +313,11 @@ CExtPubKey DecodeExtPubKey(const std::string& str, const CChainParams& params)
     CExtPubKey key;
     std::vector<unsigned char> data;
     const std::vector<unsigned char>& prefix = params.Base58Prefix(CChainParams::EXT_PUBLIC_KEY);
-    if (DecodeBase58Check(str, data, prefix.size() + BIP32_EXTKEY_SIZE)) {
-        if (data.size() == BIP32_EXTKEY_SIZE + prefix.size() && std::equal(prefix.begin(), prefix.end(), data.begin())) {
-            key.Decode(data.data() + prefix.size());
+    // The payload is as long as the public key inside it, which is what names the
+    // scheme; Core's is the constant 74, a 33-byte key's.
+    if (DecodeBase58Check(str, data, prefix.size() + CExtPubKey::MAX_SIZE)) {
+        if (data.size() > prefix.size() && std::equal(prefix.begin(), prefix.end(), data.begin())) {
+            if (!key.Decode(std::span{data}.subspan(prefix.size()))) key = CExtPubKey();
         }
     }
     return key;
@@ -323,10 +325,11 @@ CExtPubKey DecodeExtPubKey(const std::string& str, const CChainParams& params)
 
 std::string EncodeExtPubKey(const CExtPubKey& key, const CChainParams& params)
 {
+    if (!key.pubkey.IsValid()) return "";
     std::vector<unsigned char> data = params.Base58Prefix(CChainParams::EXT_PUBLIC_KEY);
     size_t size = data.size();
-    data.resize(size + BIP32_EXTKEY_SIZE);
-    key.Encode(data.data() + size);
+    data.resize(size + key.GetSerializedSize());
+    key.Encode(std::span{data}.subspan(size));
     std::string ret = EncodeBase58Check(data);
     return ret;
 }
@@ -336,11 +339,9 @@ CExtKey DecodeExtKey(const std::string& str, const CChainParams& params)
     CExtKey key;
     std::vector<unsigned char> data;
     const std::vector<unsigned char>& prefix = params.Base58Prefix(CChainParams::EXT_SECRET_KEY);
-    // CExtKey::SIZE where Core has BIP32_EXTKEY_SIZE, and the bound written out
-    // rather than left as Core's constant 78: an extended key here carries the
-    // 32-byte node seed a child is derived from and the two bytes that name its
-    // scheme, so it is 75 bytes and not 74, and the shorter bound made every
-    // extended key fail to decode.
+    // CExtKey::SIZE where Core has BIP32_EXTKEY_SIZE: an extended key here
+    // carries the 32-byte node seed a child is derived from and the two bytes
+    // that name its scheme, so it is 75 bytes rather than 74.
     if (DecodeBase58Check(str, data, prefix.size() + CExtKey::SIZE)) {
         if (data.size() == CExtKey::SIZE + prefix.size() && std::equal(prefix.begin(), prefix.end(), data.begin())) {
             key.Decode(data.data() + prefix.size());

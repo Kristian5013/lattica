@@ -30,16 +30,16 @@
 #
 # Built before core_interface so the vendored C keeps its own build policy.
 add_library(falcon512 STATIC
-    ${PROJECT_SOURCE_DIR}/src/FALCON-512/codec.c
-    ${PROJECT_SOURCE_DIR}/src/FALCON-512/common.c
-    ${PROJECT_SOURCE_DIR}/src/FALCON-512/fft.c
-    ${PROJECT_SOURCE_DIR}/src/FALCON-512/fpr.c
-    ${PROJECT_SOURCE_DIR}/src/FALCON-512/keygen.c
-    ${PROJECT_SOURCE_DIR}/src/FALCON-512/pqclean.c
-    ${PROJECT_SOURCE_DIR}/src/FALCON-512/rng.c
-    ${PROJECT_SOURCE_DIR}/src/FALCON-512/sign.c
-    ${PROJECT_SOURCE_DIR}/src/FALCON-512/vrfy.c)
+    ${PROJECT_SOURCE_DIR}/src/falcon512/codec.c
+    ${PROJECT_SOURCE_DIR}/src/falcon512/common.c
+    ${PROJECT_SOURCE_DIR}/src/falcon512/fft.c
+    ${PROJECT_SOURCE_DIR}/src/falcon512/fpr.c
+    ${PROJECT_SOURCE_DIR}/src/falcon512/keygen.c
+    ${PROJECT_SOURCE_DIR}/src/falcon512/pqclean.c
+    ${PROJECT_SOURCE_DIR}/src/falcon512/rng.c
+    ${PROJECT_SOURCE_DIR}/src/falcon512/sign.c
+    ${PROJECT_SOURCE_DIR}/src/falcon512/vrfy.c)
 target_include_directories(falcon512 PRIVATE
-    ${PROJECT_SOURCE_DIR}/src/FALCON-512)
+    ${PROJECT_SOURCE_DIR}/src/falcon512)
 # fips202 (SHAKE256) + randombytes live in the mldsa44 target (PQClean common/).
 target_link_libraries(falcon512 PUBLIC mldsa44)

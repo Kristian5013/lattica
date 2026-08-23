@@ -471,7 +471,7 @@ llvm-cov show \
     --object=build/bin/latticad \
     -Xdemangler=llvm-cxxfilt \
     --instr-profile=build/coverage.profdata \
-    --ignore-filename-regex="src/crc32c/|src/leveldb/|src/minisketch/|src/ML-DSA-44/|src/ML-KEM-768/|src/test/" \
+    --ignore-filename-regex="src/crc32c/|src/leveldb/|src/minisketch/|src/mldsa44/|src/falcon512/|src/mlkem768/|src/test/" \
     --format=html \
     --show-instantiation-summary \
     --show-line-counts-or-regions \
@@ -515,7 +515,7 @@ llvm-cov show \
     --object=build/bin/fuzz \
     -Xdemangler=llvm-cxxfilt \
     --instr-profile=build/coverage.profdata \
-    --ignore-filename-regex="src/crc32c/|src/leveldb/|src/minisketch/|src/ML-DSA-44/|src/ML-KEM-768/|src/test/" \
+    --ignore-filename-regex="src/crc32c/|src/leveldb/|src/minisketch/|src/mldsa44/|src/falcon512/|src/mlkem768/|src/test/" \
     --format=html \
     --show-instantiation-summary \
     --show-line-counts-or-regions \

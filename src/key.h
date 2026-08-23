@@ -1,5 +1,25 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
+//
+// Private keys of three signature schemes, and the hierarchical tree they are
+// derived in.
+//
+// As in pubkey.h, nothing tags the scheme: the length of the secret names it,
+// and the three lengths are pairwise distinct so that it can. Two consequences
+// shape this file.
+//
+// A CKey carries its public key. Core recomputes one from the secret and stores
+// nothing, which only a curve allows; ML-DSA cannot at all, since its secret
+// packs t0 while its public key packs t1. So the public key is captured at
+// generation and travels with the secret — which is also why Set() takes one
+// instead of Core's compression flag.
+//
+// A CExtKey chains a 32-byte node seed rather than the secret itself. Core's
+// BIP32 adds a scalar to a scalar; there is no such operation for a lattice
+// secret, so a child expands from a seed the parent hashes out. That makes the
+// tree hardened at every step for every scheme — see CExtPubKey::Derive — and it
+// is what lets one tree shape carry all three, the scheme entering the master
+// node's preimage so that one seed gives three unrelated trees.
 
 #ifndef LATTICA_KEY_H
 #define LATTICA_KEY_H
