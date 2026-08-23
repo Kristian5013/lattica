@@ -14,7 +14,7 @@ RPCMethod walletpassphrase()
     return RPCMethod{
         "walletpassphrase",
         "Stores the wallet decryption key in memory for 'timeout' seconds.\n"
-                "This is needed prior to performing transactions related to private keys such as sending latticas\n"
+                "This is needed prior to performing transactions related to private keys such as sending bitcoins\n"
             "\nNote:\n"
             "Issuing the walletpassphrase command while the wallet is already unlocked will set a new unlock\n"
             "time that overrides the old one.\n",
@@ -59,8 +59,8 @@ RPCMethod walletpassphrase()
         if (nSleepTime < 0) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Timeout cannot be negative.");
         }
-        // Clamp timeout
-        constexpr int64_t MAX_SLEEP_TIME = 100000000; // larger values trigger a macos/libevent bug?
+        // Clamp timeout to ~3 years to avoid overflow when computing the relock time
+        constexpr int64_t MAX_SLEEP_TIME = 100000000;
         if (nSleepTime > MAX_SLEEP_TIME) {
             nSleepTime = MAX_SLEEP_TIME;
         }
@@ -75,9 +75,15 @@ RPCMethod walletpassphrase()
                 throw JSONRPCError(RPC_WALLET_PASSPHRASE_INCORRECT, "Error: The wallet passphrase entered was incorrect.");
             } else {
                 throw JSONRPCError(RPC_WALLET_PASSPHRASE_INCORRECT, "Error: The wallet passphrase entered is incorrect. "
-                                                                    "It contains a null character (ie - a zero byte).");
+                                                                    "It contains a null character (ie - a zero byte). "
+                                                                    "If the passphrase was set with a version of this software prior to 25.0, "
+                                                                    "please try again with only the characters up to — but not including — "
+                                                                    "the first null character. If this is successful, please set a new "
+                                                                    "passphrase to avoid this issue in the future.");
             }
         }
+
+        pwallet->TopUpKeyPool();
 
         pwallet->nRelockTime = GetTime() + nSleepTime;
         relock_time = pwallet->nRelockTime;
@@ -131,6 +137,10 @@ RPCMethod walletpassphrasechange()
         throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an unencrypted wallet, but walletpassphrasechange was called.");
     }
 
+    if (pwallet->IsScanningWithPassphrase()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before changing the passphrase.");
+    }
+
     LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
 
     SecureString strOldWalletPass;
@@ -151,7 +161,10 @@ RPCMethod walletpassphrasechange()
             throw JSONRPCError(RPC_WALLET_PASSPHRASE_INCORRECT, "Error: The wallet passphrase entered was incorrect.");
         } else {
             throw JSONRPCError(RPC_WALLET_PASSPHRASE_INCORRECT, "Error: The old wallet passphrase entered is incorrect. "
-                                                                "It contains a null character (ie - a zero byte).");
+                                                                "It contains a null character (ie - a zero byte). "
+                                                                "If the old passphrase was set with a version of this software prior to 25.0, "
+                                                                "please try again with only the characters up to — but not including — "
+                                                                "the first null character.");
         }
     }
 
@@ -189,6 +202,10 @@ RPCMethod walletlock()
         throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an unencrypted wallet, but walletlock was called.");
     }
 
+    if (pwallet->IsScanningWithPassphrase()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before locking the wallet.");
+    }
+
     LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
 
     pwallet->Lock();
@@ -208,7 +225,11 @@ RPCMethod encryptwallet()
         "After this, any calls that interact with private keys such as sending or signing \n"
         "will require the passphrase to be set prior to making these calls.\n"
                 "Use the walletpassphrase call for this, and then walletlock call.\n"
-                "If the wallet is already encrypted, use the walletpassphrasechange call.\n",
+                "If the wallet is already encrypted, use the walletpassphrasechange call.\n"
+                "** IMPORTANT **\n"
+                "For security reasons, the encryption process will generate a new HD seed, resulting\n"
+                "in the creation of a fresh set of active descriptors. Therefore, it is crucial to\n"
+                "securely back up the newly generated wallet file using the backupwallet RPC.\n",
                 {
                     {"passphrase", RPCArg::Type::STR, RPCArg::Optional::NO, "The pass phrase to encrypt the wallet with. It must be at least 1 character, but should be long."},
                 },
@@ -216,7 +237,7 @@ RPCMethod encryptwallet()
                 RPCExamples{
             "\nEncrypt your wallet\n"
             + HelpExampleCli("encryptwallet", "\"my pass phrase\"") +
-            "\nNow set the passphrase to use the wallet, such as for signing or sending lattica\n"
+            "\nNow set the passphrase to use the wallet, such as for signing or sending bitcoin\n"
             + HelpExampleCli("walletpassphrase", "\"my pass phrase\"") +
             "\nNow we can do something like sign\n"
             + HelpExampleCli("signmessage", "\"address\" \"test message\"") +
@@ -238,6 +259,10 @@ RPCMethod encryptwallet()
         throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an encrypted wallet, but encryptwallet was called.");
     }
 
+    if (pwallet->IsScanningWithPassphrase()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before encrypting the wallet.");
+    }
+
     LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
 
     SecureString strWalletPass;
@@ -252,10 +277,7 @@ RPCMethod encryptwallet()
         throw JSONRPCError(RPC_WALLET_ENCRYPTION_FAILED, "Error: Failed to encrypt the wallet.");
     }
 
-    // Lattica seals the existing HD seed in place (the whole key tree re-derives
-    // from it), so unlike Core there is no seed rotation or keypool flush and the
-    // pre-encryption backup remains valid. Encourage a fresh backup regardless.
-    return "wallet encrypted; You should make a new backup of the wallet file with the backupwallet RPC.";
+    return "wallet encrypted; The keypool has been flushed and a new HD seed was generated. You need to make a new backup with the backupwallet RPC.";
 },
     };
 }

@@ -4,10 +4,7 @@
 #include <wallet/dump.h>
 
 #include <common/args.h>
-#include <hash.h>
-#include <streams.h>
 #include <util/fs.h>
-#include <util/strencodings.h>
 #include <util/translation.h>
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
@@ -20,7 +17,7 @@
 #include <vector>
 
 namespace wallet {
-static const std::string DUMP_MAGIC = "LATTICA_WALLET_DUMP";
+static const std::string DUMP_MAGIC = "BITCOIN_CORE_WALLET_DUMP";
 uint32_t DUMP_VERSION = 1;
 
 bool DumpWallet(const ArgsManager& args, WalletDatabase& db, bilingual_str& error)
@@ -63,11 +60,17 @@ bool DumpWallet(const ArgsManager& args, WalletDatabase& db, bilingual_str& erro
 
     // Write out the file format
     std::string format = db.Format();
+    // BDB files that are opened using BerkeleyRODatabase have its format as "bdb_ro"
+    // We want to override that format back to "bdb"
+    if (format == "bdb_ro") {
+        format = "bdb";
+    }
     line = strprintf("%s,%s\n", "format", format);
     dump_file.write(line.data(), line.size());
     hasher << std::span{line};
 
     if (ret) {
+
         // Read the records
         while (true) {
             DataStream ss_key{};
@@ -106,7 +109,8 @@ bool DumpWallet(const ArgsManager& args, WalletDatabase& db, bilingual_str& erro
 }
 
 // The standard wallet deleter function blocks on the validation interface
-// queue, which doesn't exist for lattica-wallet. Define our own deleter here.
+// queue, which doesn't exist for the bitcoin-wallet. Define our own
+// deleter here.
 static void WalletToolReleaseWallet(CWallet* wallet)
 {
     wallet->WalletLogPrintf("Releasing wallet\n");
@@ -158,7 +162,7 @@ bool CreateFromDump(const ArgsManager& args, const std::string& name, const fs::
         return false;
     }
     if (*ver != DUMP_VERSION) {
-        error = strprintf(_("Error: Dumpfile version is not supported. This version of lattica-wallet only supports version 1 dumpfiles. Got dumpfile with version %s"), version_value);
+        error = strprintf(_("Error: Dumpfile version is not supported. This version of bitcoin-wallet only supports version 1 dumpfiles. Got dumpfile with version %s"), version_value);
         dump_file.close();
         return false;
     }
@@ -175,7 +179,10 @@ bool CreateFromDump(const ArgsManager& args, const std::string& name, const fs::
         dump_file.close();
         return false;
     }
-    // Lattica only has a SQLite backend.
+    // Make sure that the dump was created from a sqlite database only as that is the only
+    // type of database that we still support.
+    // Other formats such as BDB should not be loaded into a sqlite database since they also
+    // use a different type of wallet entirely which is no longer compatible with this software.
     if (format_value != "sqlite") {
         error = strprintf(_("Error: Dumpfile specifies an unsupported database format (%s). Only sqlite database dumps are supported"), format_value);
         return false;
@@ -185,7 +192,9 @@ bool CreateFromDump(const ArgsManager& args, const std::string& name, const fs::
 
     DatabaseOptions options;
     DatabaseStatus status;
+    ReadDatabaseArgs(args, options);
     options.require_create = true;
+    options.require_format = DatabaseFormat::SQLITE;
     std::unique_ptr<WalletDatabase> database = MakeDatabase(wallet_path, options, status, error);
     if (!database) return false;
 

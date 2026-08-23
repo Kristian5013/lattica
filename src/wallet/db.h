@@ -1,16 +1,10 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
-//
-// The wallet database abstraction, ported from Bitcoin Core's wallet/db.h. The
-// interface (DatabaseCursor / DatabaseBatch with its typed Read/Write/Erase/Exists
-// helpers, WalletDatabase, DatabaseOptions/Status) is scheme-agnostic and ported
-// faithfully. Lattica keeps Core's SQLite wallet backend (see wallet/sqlite.cpp)
-// but only that one -- Core's legacy BDB backend and its BDB/SQLite format-sniffing
-// don't apply, so MakeDatabase dispatches straight to the SQLite backend (db.cpp).
 
 #ifndef LATTICA_WALLET_DB_H
 #define LATTICA_WALLET_DB_H
 
+#include <clientversion.h>
 #include <streams.h>
 #include <support/allocators/secure.h>
 #include <util/fs.h>
@@ -18,15 +12,13 @@
 #include <atomic>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
-#include <vector>
 
+class ArgsManager;
 struct bilingual_str;
 
 namespace wallet {
-
-//! BytePrefix compares equality with other byte spans that begin with the same prefix.
+// BytePrefix compares equality with other byte spans that begin with the same prefix.
 struct BytePrefix {
     std::span<const std::byte> prefix;
 };
@@ -42,7 +34,8 @@ public:
     DatabaseCursor(const DatabaseCursor&) = delete;
     DatabaseCursor& operator=(const DatabaseCursor&) = delete;
 
-    enum class Status {
+    enum class Status
+    {
         FAIL,
         MORE,
         DONE,
@@ -106,6 +99,7 @@ public:
         DataStream ssKey{};
         ssKey.reserve(1000);
         ssKey << key;
+
         return EraseKey(std::move(ssKey));
     }
 
@@ -115,9 +109,9 @@ public:
         DataStream ssKey{};
         ssKey.reserve(1000);
         ssKey << key;
+
         return HasKey(std::move(ssKey));
     }
-
     virtual bool ErasePrefix(std::span<const std::byte> prefix) = 0;
 
     virtual std::unique_ptr<DatabaseCursor> GetNewCursor() = 0;
@@ -128,65 +122,91 @@ public:
     virtual bool HasActiveTxn() = 0;
 };
 
-/** An instance of this class represents one database. */
+/** An instance of this class represents one database.
+ **/
 class WalletDatabase
 {
 public:
+    /** Create dummy DB handle */
     WalletDatabase() = default;
     virtual ~WalletDatabase() = default;
 
     /** Open the database if it is not already opened. */
     virtual void Open() = 0;
 
-    //! Counts the number of active database users, so the database is not closed while in use.
+    //! Counts the number of active database users to be sure that the database is not closed while someone is using it
     std::atomic<int> m_refcount{0};
 
-    /** Rewrite the entire database on disk. */
+    /** Rewrite the entire database on disk
+     */
     virtual bool Rewrite() = 0;
 
-    /** Back up the entire database to a file. */
+    /** Back up the entire database to a file.
+     */
     virtual bool Backup(const std::string& strDest) const = 0;
 
-    /** Flush to the database file and close the database. */
+    /** Flush to the database file and close the database.
+     *  Also close the environment if no other databases are open in it.
+     */
     virtual void Close() = 0;
 
     /** Return path to main database file for logs and error messages. */
     virtual std::string Filename() = 0;
 
-    /** Return paths to all database created files. */
+    /** Return paths to all database created files */
     virtual std::vector<fs::path> Files() = 0;
 
     virtual std::string Format() = 0;
 
-    /** Make a DatabaseBatch connected to this database. */
+    /** Make a DatabaseBatch connected to this database */
     virtual std::unique_ptr<DatabaseBatch> MakeBatch() = 0;
+};
+
+enum class DatabaseFormat {
+    SQLITE,
+    BERKELEY_RO,
 };
 
 struct DatabaseOptions {
     bool require_existing = false;
     bool require_create = false;
-    bool verify = true;           //!< Check data integrity on load.
-    bool use_unsafe_sync = false; //!< Disable file sync for faster performance.
-    uint64_t create_flags = 0;    //!< Wallet flags to set on a freshly created wallet.
-    SecureString create_passphrase; //!< If non-empty, encrypt a freshly created wallet with this.
+    std::optional<DatabaseFormat> require_format;
+    uint64_t create_flags = 0;
+    SecureString create_passphrase;
+
+    // Specialized options. Not every option is supported by every backend.
+    bool verify = true;             //!< Check data integrity on load.
+    bool use_unsafe_sync = false;   //!< Disable file sync for faster performance.
+    bool use_shared_memory = false; //!< Let other processes access the database.
+    int64_t max_log_mb = 100;       //!< Max log size to allow before consolidating.
 };
 
 enum class DatabaseStatus {
     SUCCESS,
     FAILED_BAD_PATH,
+    FAILED_BAD_FORMAT,
+    FAILED_LEGACY_DISABLED,
+    FAILED_ALREADY_LOADED,
     FAILED_ALREADY_EXISTS,
     FAILED_NOT_FOUND,
     FAILED_CREATE,
     FAILED_LOAD,
     FAILED_VERIFY,
+    FAILED_ENCRYPT,
+    FAILED_INVALID_BACKUP_FILE,
+    FAILED_NEW_UNNAMED,
 };
 
-//! Open (or create) the wallet database at `path` (backed by SQLite).
+/** Recursively list database paths in directory. */
+std::vector<std::pair<fs::path, std::string>> ListDatabases(const fs::path& path);
+
+void ReadDatabaseArgs(const ArgsManager& args, DatabaseOptions& options);
 std::unique_ptr<WalletDatabase> MakeDatabase(const fs::path& path, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
 
-//! Path to the SQLite data file inside a wallet directory.
+fs::path BDBDataFile(const fs::path& path);
 fs::path SQLiteDataFile(const fs::path& path);
-
+bool IsBDBFile(const fs::path& path);
+bool IsSQLiteFile(const fs::path& path);
 } // namespace wallet
 
 #endif // LATTICA_WALLET_DB_H

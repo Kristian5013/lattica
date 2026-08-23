@@ -3,23 +3,20 @@
 
 #include <wallet/wallettool.h>
 
-#include <chainparams.h>
 #include <common/args.h>
 #include <util/check.h>
 #include <util/fs.h>
-#include <util/string.h>
 #include <util/translation.h>
 #include <wallet/dump.h>
 #include <wallet/wallet.h>
-#include <wallet/walletdb.h>
-
-#include <iostream>
+#include <wallet/walletutil.h>
 
 namespace wallet {
 namespace WalletTool {
 
 // The standard wallet deleter function blocks on the validation interface
-// queue, which doesn't exist for lattica-wallet. Define our own deleter here.
+// queue, which doesn't exist for the bitcoin-wallet. Define our own
+// deleter here.
 static void WalletToolReleaseWallet(CWallet* wallet)
 {
     wallet->WalletLogPrintf("Releasing wallet\n");
@@ -33,18 +30,18 @@ static void WalletCreate(CWallet* wallet_instance, uint64_t wallet_creation_flag
 
     wallet_instance->InitWalletFlags(wallet_creation_flags);
 
-    // Lattica has no descriptor ScriptPubKeyMan or keypool; the HD ML-DSA seed is
-    // the keystore. Generate it unless the wallet is blank / private-keys-disabled.
-    if (!wallet_instance->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) &&
-        !wallet_instance->IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET)) {
-        wallet_instance->GenerateNewSeed();
-    }
+    Assert(wallet_instance->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
+    wallet_instance->SetupDescriptorScriptPubKeyMans();
+
+    tfm::format(std::cout, "Topping up keypool...\n");
+    wallet_instance->TopUpKeyPool();
 }
 
 static std::shared_ptr<CWallet> MakeWallet(const std::string& name, const fs::path& path, DatabaseOptions options)
 {
     DatabaseStatus status;
     bilingual_str error;
+    std::vector<bilingual_str> warnings;
     std::unique_ptr<WalletDatabase> database = MakeDatabase(path, options, status, error);
     if (!database) {
         tfm::format(std::cerr, "%s\n", error.original);
@@ -53,16 +50,23 @@ static std::shared_ptr<CWallet> MakeWallet(const std::string& name, const fs::pa
 
     // dummy chain interface
     std::shared_ptr<CWallet> wallet_instance{new CWallet(/*chain=*/nullptr, name, std::move(database)), WalletToolReleaseWallet};
-    wallet_instance->SetChainParams(Params());
     DBErrors load_wallet_ret;
     try {
-        load_wallet_ret = wallet_instance->PopulateWalletFromDB();
+        load_wallet_ret = wallet_instance->PopulateWalletFromDB(error, warnings);
     } catch (const std::runtime_error&) {
         tfm::format(std::cerr, "Error loading %s. Is wallet being used by another process?\n", name);
         return nullptr;
     }
 
-    if (load_wallet_ret != DBErrors::LOAD_OK) {
+    if (!error.empty()) {
+        tfm::format(std::cerr, "%s", error.original);
+    }
+
+    for (const auto &warning : warnings) {
+        tfm::format(std::cerr, "%s", warning.original);
+    }
+
+    if (load_wallet_ret != DBErrors::LOAD_OK && load_wallet_ret != DBErrors::NONCRITICAL_ERROR && load_wallet_ret != DBErrors::NEED_RESCAN) {
         return nullptr;
     }
 
@@ -78,8 +82,10 @@ static void WalletShowInfo(CWallet* wallet_instance)
     tfm::format(std::cout, "Wallet info\n===========\n");
     tfm::format(std::cout, "Name: %s\n", wallet_instance->GetName());
     tfm::format(std::cout, "Format: %s\n", wallet_instance->GetDatabase().Format());
+    tfm::format(std::cout, "Descriptors: %s\n", wallet_instance->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS) ? "yes" : "no");
     tfm::format(std::cout, "Encrypted: %s\n", wallet_instance->HasEncryptionKeys() ? "yes" : "no");
     tfm::format(std::cout, "HD (hd seed available): %s\n", wallet_instance->IsHDEnabled() ? "yes" : "no");
+    tfm::format(std::cout, "Keypool Size: %u\n", wallet_instance->GetKeyPoolSize());
     tfm::format(std::cout, "Transactions: %zu\n", wallet_instance->mapWallet.size());
     tfm::format(std::cout, "Address Book: %zu\n", wallet_instance->m_address_book.size());
 }
@@ -98,9 +104,12 @@ bool ExecuteWalletToolFunc(const ArgsManager& args, const std::string& command)
         return false;
     }
     const std::string name = args.GetArg("-wallet", "");
-    // Lattica opens wallets by name -> <walletdir>/<name> (single SQLite backend);
-    // there is no GetWalletPath/format-dispatch the way Core's BDB+SQLite build has.
-    const fs::path path = GetWalletDir(args) / fs::PathFromString(name);
+    util::Result<fs::path> path_res = GetWalletPath(name);
+    if (!path_res) {
+        tfm::format(std::cerr, "%s\n", util::ErrorString(path_res).original);
+        return false;
+    }
+    const fs::path& path = *path_res;
 
     if (command == "create") {
         if (name.empty()) {
@@ -108,7 +117,10 @@ bool ExecuteWalletToolFunc(const ArgsManager& args, const std::string& command)
             return false;
         }
         DatabaseOptions options;
+        ReadDatabaseArgs(args, options);
         options.require_create = true;
+        options.create_flags |= WALLET_FLAG_DESCRIPTORS;
+        options.require_format = DatabaseFormat::SQLITE;
 
         const std::shared_ptr<CWallet> wallet_instance = MakeWallet(name, path, options);
         if (wallet_instance) {
@@ -117,6 +129,7 @@ bool ExecuteWalletToolFunc(const ArgsManager& args, const std::string& command)
         }
     } else if (command == "info") {
         DatabaseOptions options;
+        ReadDatabaseArgs(args, options);
         options.require_existing = true;
         const std::shared_ptr<CWallet> wallet_instance = MakeWallet(name, path, options);
         if (!wallet_instance) return false;
@@ -124,8 +137,13 @@ bool ExecuteWalletToolFunc(const ArgsManager& args, const std::string& command)
         wallet_instance->Close();
     } else if (command == "dump") {
         DatabaseOptions options;
+        ReadDatabaseArgs(args, options);
         options.require_existing = true;
         DatabaseStatus status;
+
+        if (IsBDBFile(BDBDataFile(path))) {
+            options.require_format = DatabaseFormat::BERKELEY_RO;
+        }
 
         bilingual_str error;
         std::unique_ptr<WalletDatabase> database = MakeDatabase(path, options, status, error);
@@ -139,7 +157,7 @@ bool ExecuteWalletToolFunc(const ArgsManager& args, const std::string& command)
             tfm::format(std::cerr, "%s\n", error.original);
             return ret;
         }
-        tfm::format(std::cout, "The dumpfile may contain private keys. To ensure the safety of your Lattica, do not share the dumpfile.\n");
+        tfm::format(std::cout, "The dumpfile may contain private keys. To ensure the safety of your Bitcoin, do not share the dumpfile.\n");
         return ret;
     } else if (command == "createfromdump") {
         bilingual_str error;

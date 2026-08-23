@@ -15,6 +15,13 @@
 #include <span>
 #include <vector>
 
+/** How many of BIP324's short message ids this codebase implements.
+ *
+ *  The short-id table is part of the packet framing, which follows BIP324 even
+ *  though the key agreement does not; Core keeps this constant in bip324.h,
+ *  which has no counterpart here. */
+inline constexpr unsigned V2_SHORTIDS_IMPLEMENTED{38};
+
 /** The Lattica v2 transport packet cipher: a post-quantum analog of BIP324.
  *
  * Key agreement is ML-KEM-768 — the initiator ships an ephemeral encapsulation key,

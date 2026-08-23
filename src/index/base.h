@@ -64,14 +64,15 @@ protected:
     {
     public:
         DB(const fs::path& path, size_t n_cache_size,
-           bool f_memory = false, bool f_wipe = false, bool f_obfuscate = false);
+           bool f_memory = false, bool f_wipe = false, bool f_obfuscate = false, bool f_bloom = true);
+        virtual ~DB() = default;
 
         /// Read block locator of the chain that the index is in sync with.
         /// Note, the returned locator will be empty if no record exists.
-        CBlockLocator ReadBestBlock() const;
+        virtual CBlockLocator ReadBestBlock() const;
 
         /// Write block locator of the chain that the index is in sync with.
-        void WriteBestBlock(CDBBatch& batch, const CBlockLocator& locator);
+        virtual void WriteBestBlock(CDBBatch& batch, const CBlockLocator& locator);
     };
 
 private:
@@ -93,7 +94,6 @@ private:
     CThreadInterrupt m_interrupt;
 
     /// Write the current index state (eg. chain block locator and subclass-specific items) to disk.
-    ///
     /// Will skip the commit if no block has been indexed yet or if the index's best block is
     /// ahead of the chainstate's last flushed block. This avoids persisting state an unclean shutdown
     /// could not roll back from. A later call commits when the chainstate has flushed far enough.

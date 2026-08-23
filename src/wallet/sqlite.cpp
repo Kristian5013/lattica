@@ -1,9 +1,12 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
 
+#include <lattica-build-config.h> // IWYU pragma: keep
 
 #include <wallet/sqlite.h>
 
+#include <chainparams.h>
+#include <crypto/common.h>
 #include <sync.h>
 #include <util/check.h>
 #include <util/fs_helpers.h>
@@ -21,9 +24,6 @@
 
 namespace wallet {
 static constexpr int32_t WALLET_SCHEMA_VERSION = 0;
-// Lattica: fixed wallet application_id (Core uses the network magic via the
-// global Params(), which Lattica does not have).
-static constexpr uint32_t LATTICA_WALLET_APP_ID = 0xF10C0DA7;
 
 static std::span<const std::byte> SpanFromBlob(sqlite3_stmt* stmt, int col)
 {
@@ -115,7 +115,7 @@ SQLiteDatabase::SQLiteDatabase(const fs::path& dir_path, const fs::path& file_pa
 {}
 
 SQLiteDatabase::SQLiteDatabase(const fs::path& dir_path, const fs::path& file_path, const DatabaseOptions& options, int additional_flags)
-    : WalletDatabase(), m_dir_path(dir_path), m_file_path(fs::PathToString(file_path)), m_write_semaphore(1), m_use_unsafe_sync(options.use_unsafe_sync)
+    : WalletDatabase(), m_dir_path(dir_path), m_file_path(fs::PathToString(file_path)), m_additional_flags(additional_flags), m_write_semaphore(1), m_use_unsafe_sync(options.use_unsafe_sync)
 {
     {
         LOCK(g_sqlite_mutex);
@@ -138,7 +138,7 @@ SQLiteDatabase::SQLiteDatabase(const fs::path& dir_path, const fs::path& file_pa
     }
 
     try {
-        Open(additional_flags);
+        Open(m_additional_flags);
     } catch (const std::runtime_error&) {
         // If open fails, cleanup this object and rethrow the exception
         Cleanup();
@@ -195,7 +195,7 @@ bool SQLiteDatabase::Verify(bilingual_str& error)
     auto read_result = ReadPragmaInteger(m_db, "application_id", "the application id", error);
     if (!read_result.has_value()) return false;
     uint32_t app_id = static_cast<uint32_t>(read_result.value());
-    uint32_t net_magic = LATTICA_WALLET_APP_ID;
+    uint32_t net_magic = ReadBE32(Params().MessageStart().data());
     if (app_id != net_magic) {
         error = strprintf(_("SQLiteDatabase: Unexpected application id. Expected %u, got %u"), net_magic, app_id);
         return false;
@@ -246,7 +246,10 @@ bool SQLiteDatabase::Verify(bilingual_str& error)
 
 void SQLiteDatabase::Open()
 {
-    Open(/*additional_flags*/0);
+    if (m_additional_flags & SQLITE_OPEN_MEMORY) {
+        throw std::runtime_error("SQLiteDatabase: Cannot reopen an in-memory database");
+    }
+    Open(m_additional_flags);
 }
 
 void SQLiteDatabase::Open(int additional_flags)
@@ -288,7 +291,7 @@ void SQLiteDatabase::Open(int additional_flags)
     // Now begin a transaction to acquire the exclusive lock. This lock won't be released until we close because of the exclusive locking mode.
     int ret = sqlite3_exec(m_db, "BEGIN EXCLUSIVE TRANSACTION", nullptr, nullptr, nullptr);
     if (ret != SQLITE_OK) {
-        throw std::runtime_error("SQLiteDatabase: Unable to obtain an exclusive lock on the database, is it being used by another instance of Lattica?\n");
+        throw std::runtime_error("SQLiteDatabase: Unable to obtain an exclusive lock on the database, is it being used by another instance of " CLIENT_NAME "?\n");
     }
     ret = sqlite3_exec(m_db, "COMMIT", nullptr, nullptr, nullptr);
     if (ret != SQLITE_OK) {
@@ -332,7 +335,7 @@ void SQLiteDatabase::Open(int additional_flags)
         }
 
         // Set the application id
-        uint32_t app_id = LATTICA_WALLET_APP_ID;
+        uint32_t app_id = ReadBE32(Params().MessageStart().data());
         SetPragma(m_db, "application_id", strprintf("%d", static_cast<int32_t>(app_id)),
                   "Failed to set the application id");
 
@@ -447,6 +450,9 @@ void SQLiteBatch::Close()
     }
 
     if (force_conn_refresh) {
+        if (m_database.m_additional_flags & SQLITE_OPEN_MEMORY) {
+            throw std::runtime_error("SQLiteDatabase: Cannot recover in-memory database connection");
+        }
         m_database.Close();
         try {
             m_database.Open();
@@ -713,6 +719,15 @@ std::unique_ptr<SQLiteDatabase> MakeSQLiteDatabase(const fs::path& path, const D
         error = Untranslated(e.what());
         return nullptr;
     }
+}
+
+InMemoryWalletDatabase::InMemoryWalletDatabase()
+    : SQLiteDatabase(fs::path{}, fs::path{":memory:"}, DatabaseOptions(), SQLITE_OPEN_MEMORY)
+{}
+
+std::unique_ptr<WalletDatabase> MakeInMemoryWalletDatabase()
+{
+    return std::make_unique<InMemoryWalletDatabase>();
 }
 
 std::string SQLiteDatabaseVersion()

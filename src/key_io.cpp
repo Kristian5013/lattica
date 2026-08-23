@@ -323,6 +323,7 @@ CExtPubKey DecodeExtPubKey(const std::string& str, const CChainParams& params)
     return key;
 }
 
+
 std::string EncodeExtPubKey(const CExtPubKey& key, const CChainParams& params)
 {
     if (!key.pubkey.IsValid()) return "";

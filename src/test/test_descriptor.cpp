@@ -418,11 +418,15 @@ int main()
         auto desc = ParseOne("pqpkh(" + xprv + "/0h/*)", out, error);
         if (Check("a ranged pqpkh() over an xprv parses", desc != nullptr)) {
             Check("...and is ranged", desc->IsRange());
-            Check("...and is private-only", desc->IsPrivateOnly());
-            Check("...and warns that it cannot be published",
-                  !desc->Warnings().empty() &&
-                  desc->Warnings()[0].find("no public form") != std::string::npos);
-            Check("...and can expand itself", desc->CanSelfExpand());
+            // The secret went to the provider and the expression keeps the public
+            // half, as in Core -- except that what travels is the whole extended
+            // key, a node's secret here being the seed the key expands out of.
+            Check("...leaving the extended key with the provider",
+                  out.extkeys.size() == 1 && out.extkeys.begin()->second == master);
+            Check("...and printing as an xpub",
+                  desc->ToString().find(EncodeExtPubKey(master.Neuter(), Params())) != std::string::npos);
+            // Every step is hardened, so it can never expand from public data.
+            Check("...and cannot expand itself", !desc->CanSelfExpand());
             Check("...and has the private keys", desc->HavePrivateKeys(out));
 
             FlatSigningProvider keys0, keys1;
@@ -467,14 +471,32 @@ int main()
         FlatSigningProvider secp_out;
         auto secp_desc = ParseOne("wpkh(" + EncodeExtKey(secp_master, Params()) + "/0/*)", secp_out, error);
         if (Check("a ranged wpkh() over a secp256k1 xprv parses", secp_desc != nullptr)) {
-            Check("...and is private-only too", secp_desc->IsPrivateOnly());
+            Check("...and cannot expand itself either", !secp_desc->CanSelfExpand());
         }
 
-        // The xpub form is refused outright rather than silently deriving keys
-        // the xprv would not agree with.
+        // The xpub form parses, and is what the descriptor prints. What it cannot
+        // do is expand on its own: without the extended key it has nothing to
+        // derive from and no cache to read.
         const CExtPubKey xpub = secp_master.Neuter();
-        Check("an xpub key expression is refused",
-              FailsWith("wpkh(" + EncodeExtPubKey(xpub, Params()) + "/0/*)", "cannot derive"));
+        FlatSigningProvider pub_out;
+        auto pub_desc = ParseOne("wpkh(" + EncodeExtPubKey(xpub, Params()) + "/0/*)", pub_out, error);
+        if (Check("a ranged wpkh() over an xpub parses", pub_desc != nullptr)) {
+            Check("...leaving no key behind", pub_out.extkeys.empty() && pub_out.keys.empty());
+            std::vector<CScript> s;
+            FlatSigningProvider k;
+            Check("...and cannot expand without the extended key", !pub_desc->Expand(0, pub_out, s, k));
+            // Hand it the extended key and the same expression expands.
+            FlatSigningProvider with_key;
+            with_key.extkeys.emplace(xpub.pubkey.GetID(), secp_master);
+            std::vector<CScript> s2;
+            FlatSigningProvider k2;
+            Check("...and expands once it is given one", pub_desc->Expand(0, with_key, s2, k2) && s2.size() == 1);
+            // ...to the very same script the xprv spelling produces.
+            std::vector<CScript> s3;
+            FlatSigningProvider k3;
+            Check("...to the same script the xprv spelling gives",
+                  secp_desc && secp_desc->Expand(0, secp_out, s3, k3) && s3.size() == 1 && s2.size() == 1 && s2[0] == s3[0]);
+        }
     }
 
     // ---- A constant secp256k1 key can be written as WIF; a lattice key cannot,

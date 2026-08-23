@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
+
 #include <wallet/coinselection.h>
 
 #include <common/system.h>

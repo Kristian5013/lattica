@@ -32,34 +32,32 @@ fs::path GetWalletDir(const ArgsManager& args)
     return dir;
 }
 
-WalletDescriptor GenerateWalletDescriptor(const CExtKey& master_key, const OutputType& addr_type, bool internal)
+WalletDescriptor GenerateWalletDescriptor(const CExtPubKey& master_key, const OutputType& addr_type, bool internal)
 {
     int64_t creation_time = GetTime();
 
-    // The xprv, not an xpub: this tree has no public derivation, so the key
-    // expression carries the secret. See descriptor.cpp.
-    std::string xprv = EncodeExtKey(master_key, Params());
-    assert(!xprv.empty());
+    std::string xpub = EncodeExtPubKey(master_key, Params());
+    assert(!xpub.empty());
 
     // Build descriptor string
     std::string desc_prefix;
     std::string desc_suffix = "/*)";
     switch (addr_type) {
     case OutputType::LEGACY: {
-        desc_prefix = "pkh(" + xprv + "/44h";
+        desc_prefix = "pkh(" + xpub + "/44h";
         break;
     }
     case OutputType::P2SH_SEGWIT: {
-        desc_prefix = "sh(wpkh(" + xprv + "/49h";
+        desc_prefix = "sh(wpkh(" + xpub + "/49h";
         desc_suffix += ")";
         break;
     }
     case OutputType::BECH32: {
-        desc_prefix = "wpkh(" + xprv + "/84h";
+        desc_prefix = "wpkh(" + xpub + "/84h";
         break;
     }
     case OutputType::BECH32M: {
-        desc_prefix = "tr(" + xprv + "/86h";
+        desc_prefix = "tr(" + xpub + "/86h";
         break;
     }
     case OutputType::FALCON512:
@@ -68,7 +66,7 @@ WalletDescriptor GenerateWalletDescriptor(const CExtKey& master_key, const Outpu
         // two schemes share the purpose because they share the script type; what
         // separates their keys is the tree, the scheme being part of the master
         // node's preimage rather than a step in the path.
-        desc_prefix = "pqpkh(" + xprv + "/88h";
+        desc_prefix = "pqpkh(" + xpub + "/88h";
         break;
     }
     case OutputType::UNKNOWN: {

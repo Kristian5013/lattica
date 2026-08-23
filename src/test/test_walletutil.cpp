@@ -4,11 +4,12 @@
 // Tests for wallet/walletutil.cpp: the descriptors a wallet builds for itself,
 // and the WalletDescriptor record they are stored as.
 //
-// Core builds these from the master xpub. There is no xpub here — derivation is
-// hardened at every step — so they are built from the extended private key, and
-// the tree the key belongs to must be the one whose scheme the output type
-// names. Both of those are things a wallet can get wrong silently, so they are
-// checked against the scripts the descriptors actually expand to.
+// Built from the master xpub, as Core builds them. Two things differ and both
+// are silent if got wrong, so both are checked against the scripts the
+// descriptors actually expand to: the tree handed over must be the one whose
+// scheme the output type names, one seed giving three unrelated trees; and no
+// descriptor here expands from public data alone, derivation being hardened at
+// every step, so the extended key has to be in the signing provider.
 
 #include <wallet/walletutil.h>
 
@@ -58,20 +59,24 @@ int main()
     for (OutputType type : OUTPUT_TYPES) {
         const std::string name = FormatOutputType(type);
         const CExtKey master = MasterFor(type, seed);
-        wallet::WalletDescriptor wdesc = wallet::GenerateWalletDescriptor(master, type, /*internal=*/false);
+        wallet::WalletDescriptor wdesc = wallet::GenerateWalletDescriptor(master.Neuter(), type, /*internal=*/false);
+
+        // The descriptor names the tree by its public half; expanding it needs
+        // the extended key, every step of the tree being hardened.
+        FlatSigningProvider tree;
+        tree.extkeys.emplace(master.Neuter().pubkey.GetID(), master);
 
         if (!Check((name + ": a descriptor is generated").c_str(), wdesc.descriptor != nullptr)) continue;
         Check((name + ": it is ranged").c_str(), wdesc.descriptor->IsRange());
         Check((name + ": it is solvable").c_str(), wdesc.descriptor->IsSolvable());
-        Check((name + ": it can expand itself").c_str(), wdesc.descriptor->CanSelfExpand());
-        // Every key expression is an xprv, so every wallet descriptor is private.
-        Check((name + ": it is private-only").c_str(), wdesc.descriptor->IsPrivateOnly());
+        // Hardened at every step, so it never expands from public data alone.
+        Check((name + ": it cannot expand itself").c_str(), !wdesc.descriptor->CanSelfExpand());
         Check((name + ": it names that output type").c_str(), wdesc.descriptor->GetOutputType() == type);
 
         FlatSigningProvider keys;
         std::vector<CScript> scripts;
         if (!Check((name + ": it expands at position 0").c_str(),
-                   wdesc.descriptor->Expand(0, keys, scripts, keys) && scripts.size() == 1)) {
+                   wdesc.descriptor->Expand(0, tree, scripts, keys) && scripts.size() == 1)) {
             continue;
         }
         std::vector<std::vector<unsigned char>> solutions;
@@ -99,21 +104,23 @@ int main()
         FlatSigningProvider keys1;
         std::vector<CScript> scripts1;
         Check((name + ": position 1 is a different script").c_str(),
-              wdesc.descriptor->Expand(1, keys1, scripts1, keys1) && scripts1.size() == 1 && scripts1[0] != scripts[0]);
+              wdesc.descriptor->Expand(1, tree, scripts1, keys1) && scripts1.size() == 1 && scripts1[0] != scripts[0]);
     }
 
     // ---- The internal (change) chain is a different branch, so it hands out
     // different addresses than the external one.
     {
         const CExtKey master = MasterFor(OutputType::MLDSA44, seed);
-        auto ext = wallet::GenerateWalletDescriptor(master, OutputType::MLDSA44, /*internal=*/false);
-        auto in = wallet::GenerateWalletDescriptor(master, OutputType::MLDSA44, /*internal=*/true);
+        FlatSigningProvider tree;
+        tree.extkeys.emplace(master.Neuter().pubkey.GetID(), master);
+        auto ext = wallet::GenerateWalletDescriptor(master.Neuter(), OutputType::MLDSA44, /*internal=*/false);
+        auto in = wallet::GenerateWalletDescriptor(master.Neuter(), OutputType::MLDSA44, /*internal=*/true);
         Check("the internal chain is a different descriptor", ext.id != in.id);
 
         FlatSigningProvider ke, ki;
         std::vector<CScript> se, si;
         Check("...expanding to different scripts",
-              ext.descriptor->Expand(0, ke, se, ke) && in.descriptor->Expand(0, ki, si, ki) &&
+              ext.descriptor->Expand(0, tree, se, ke) && in.descriptor->Expand(0, tree, si, ki) &&
               se.size() == 1 && si.size() == 1 && se[0] != si[0]);
     }
 
@@ -124,8 +131,8 @@ int main()
         const CExtKey mldsa = MasterFor(OutputType::MLDSA44, seed);
         Check("one seed gives two unrelated witness v2 trees", falcon.nodeseed != mldsa.nodeseed);
 
-        auto f = wallet::GenerateWalletDescriptor(falcon, OutputType::FALCON512, /*internal=*/false);
-        auto m = wallet::GenerateWalletDescriptor(mldsa, OutputType::MLDSA44, /*internal=*/false);
+        auto f = wallet::GenerateWalletDescriptor(falcon.Neuter(), OutputType::FALCON512, /*internal=*/false);
+        auto m = wallet::GenerateWalletDescriptor(mldsa.Neuter(), OutputType::MLDSA44, /*internal=*/false);
         Check("...and two different descriptors", f.id != m.id);
         Check("...both spelled pqpkh()",
               f.descriptor->ToString().rfind("pqpkh(", 0) == 0 &&
@@ -136,7 +143,7 @@ int main()
     // back the same one, id included.
     {
         const CExtKey master = MasterFor(OutputType::MLDSA44, seed);
-        wallet::WalletDescriptor wdesc = wallet::GenerateWalletDescriptor(master, OutputType::MLDSA44, /*internal=*/false);
+        wallet::WalletDescriptor wdesc = wallet::GenerateWalletDescriptor(master.Neuter(), OutputType::MLDSA44, /*internal=*/false);
         wdesc.range_end = 100;
         wdesc.next_index = 7;
 
@@ -172,9 +179,9 @@ int main()
     // addresses on mainnet and on regtest.
     {
         const CExtKey master = MasterFor(OutputType::MLDSA44, seed);
-        const std::string on_main = wallet::GenerateWalletDescriptor(master, OutputType::MLDSA44, false).descriptor->ToString();
+        const std::string on_main = wallet::GenerateWalletDescriptor(master.Neuter(), OutputType::MLDSA44, false).descriptor->ToString();
         SelectParams(ChainType::REGTEST);
-        const std::string on_regtest = wallet::GenerateWalletDescriptor(master, OutputType::MLDSA44, false).descriptor->ToString();
+        const std::string on_regtest = wallet::GenerateWalletDescriptor(master.Neuter(), OutputType::MLDSA44, false).descriptor->ToString();
         SelectParams(ChainType::MAIN);
         Check("mainnet and regtest derive at different coin types", on_main != on_regtest);
     }

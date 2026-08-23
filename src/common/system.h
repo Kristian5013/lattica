@@ -5,9 +5,9 @@
 #define LATTICA_COMMON_SYSTEM_H
 
 #include <lattica-build-config.h> // IWYU pragma: keep
+
 #include <util/time.h>
 
-#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -33,6 +33,6 @@ int GetNumCores();
 /**
  * Return the total RAM available on the current system, if detectable.
  */
-std::optional<size_t> GetTotalRAM();
+std::optional<uint64_t> TryGetTotalRam();
 
 #endif // LATTICA_COMMON_SYSTEM_H

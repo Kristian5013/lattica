@@ -16,6 +16,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 class COutPoint;
@@ -24,7 +25,7 @@ class uint256;
 //! User-controlled performance and debug options.
 struct CoinsViewOptions {
     //! Maximum database write batch size in bytes.
-    size_t batch_write_bytes{DEFAULT_DB_CACHE_BATCH};
+    uint64_t batch_write_bytes{DEFAULT_DB_CACHE_BATCH};
     //! If non-zero, randomly exit when the database is flushed with (1/ratio) probability.
     int simulate_crash_ratio{0};
 };
@@ -49,7 +50,8 @@ public:
     uint256 GetBestBlock() const override;
     std::vector<uint256> GetHeadBlocks() const override;
     void BatchWrite(CoinsViewCacheCursor& cursor, const uint256& block_hash) override;
-    std::unique_ptr<CCoinsViewCursor> Cursor() const override;
+    //! Get a cursor to iterate over the whole state.
+    std::unique_ptr<CCoinsViewCursor> Cursor() const;
 
     //! Whether an unsupported database format is used.
     bool NeedsUpgrade();
@@ -59,7 +61,10 @@ public:
     void ResizeCache(size_t new_cache_size) EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_db_mutex);
 
     //! Perform a full compaction of the underlying LevelDB on a one-shot background thread.
-    std::shared_future<void> CompactFull() EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_db_mutex);
+    std::shared_future<void> CompactFullAsync() EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_db_mutex);
+
+    //! Return an underlying LevelDB property value, if available.
+    std::optional<std::string> GetDBProperty(const std::string& property);
 };
 
 #endif // LATTICA_TXDB_H

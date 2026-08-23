@@ -3,10 +3,10 @@
 
 #include <rpc/rawtransaction_util.h>
 
-#include <chainparams.h>
 #include <coins.h>
 #include <consensus/amount.h>
 #include <core_io.h>
+#include <chainparams.h>
 #include <key_io.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
@@ -305,6 +305,42 @@ void ParsePrevouts(const UniValue& prevTxsUnival, FlatSigningProvider* keystore,
                 }
             }
         }
+    }
+}
+
+void SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, const std::map<COutPoint, Coin>& coins, const UniValue& hashType, UniValue& result)
+{
+    std::optional<int> nHashType = ParseSighashString(hashType);
+    if (!nHashType) {
+        nHashType = SIGHASH_DEFAULT;
+    }
+
+    // Script verification errors
+    std::map<int, bilingual_str> input_errors;
+
+    bool complete = SignTransaction(mtx, keystore, coins, {.sighash_type = *nHashType}, input_errors);
+    SignTransactionResultToJSON(mtx, complete, coins, input_errors, result);
+}
+
+void SignTransactionResultToJSON(CMutableTransaction& mtx, bool complete, const std::map<COutPoint, Coin>& coins, const std::map<int, bilingual_str>& input_errors, UniValue& result)
+{
+    // Make errors UniValue
+    UniValue vErrors(UniValue::VARR);
+    for (const auto& err_pair : input_errors) {
+        if (err_pair.second.original == "Missing amount") {
+            // This particular error needs to be an exception for some reason
+            throw JSONRPCError(RPC_TYPE_ERROR, strprintf("Missing amount for %s", coins.at(mtx.vin.at(err_pair.first).prevout).out.ToString()));
+        }
+        TxInErrorToJSON(mtx.vin.at(err_pair.first), vErrors, err_pair.second.original);
+    }
+
+    result.pushKV("hex", EncodeHexTx(CTransaction(mtx)));
+    result.pushKV("complete", complete);
+    if (!vErrors.empty()) {
+        if (result.exists("errors")) {
+            vErrors.push_backV(result["errors"].getValues());
+        }
+        result.pushKV("errors", std::move(vErrors));
     }
 }
 

@@ -41,6 +41,12 @@ bool HidingSigningProvider::GetKey(const CKeyID& keyid, CKey& key) const
     return m_provider->GetKey(keyid, key);
 }
 
+bool HidingSigningProvider::GetExtKey(const CKeyID& keyid, CExtKey& extkey) const
+{
+    if (m_hide_secret) return false;
+    return m_provider->GetExtKey(keyid, extkey);
+}
+
 bool HidingSigningProvider::GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const
 {
     if (m_hide_origin) return false;
@@ -96,6 +102,7 @@ bool FlatSigningProvider::HaveKey(const CKeyID &keyid) const
     return LookupHelper(keys, keyid, key);
 }
 bool FlatSigningProvider::GetKey(const CKeyID& keyid, CKey& key) const { return LookupHelper(keys, keyid, key); }
+bool FlatSigningProvider::GetExtKey(const CKeyID& keyid, CExtKey& extkey) const { return LookupHelper(extkeys, keyid, extkey); }
 bool FlatSigningProvider::GetTaprootSpendData(const XOnlyPubKey& output_key, TaprootSpendData& spenddata) const
 {
     TaprootBuilder builder;
@@ -149,6 +156,7 @@ FlatSigningProvider& FlatSigningProvider::Merge(FlatSigningProvider&& b)
     scripts.merge(b.scripts);
     pubkeys.merge(b.pubkeys);
     keys.merge(b.keys);
+    extkeys.merge(b.extkeys);
     origins.merge(b.origins);
     tr_trees.merge(b.tr_trees);
     aggregate_pubkeys.merge(b.aggregate_pubkeys);
@@ -349,6 +357,14 @@ bool MultiSigningProvider::GetKey(const CKeyID& keyid, CKey& key) const
 {
     for (const auto& provider: m_providers) {
         if (provider->GetKey(keyid, key)) return true;
+    }
+    return false;
+}
+
+bool MultiSigningProvider::GetExtKey(const CKeyID& keyid, CExtKey& extkey) const
+{
+    for (const auto& provider: m_providers) {
+        if (provider->GetExtKey(keyid, extkey)) return true;
     }
     return false;
 }

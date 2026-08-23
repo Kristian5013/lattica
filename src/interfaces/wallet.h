@@ -21,18 +21,18 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-class ArgsManager;
 class CFeeRate;
 class CKey;
 enum class FeeReason;
 enum class OutputType;
-struct CMutableTransaction;
+class PartiallySignedTransaction;
 struct bilingual_str;
 namespace common {
 enum class PSBTError;
@@ -58,9 +58,6 @@ struct WalletTx;
 struct WalletTxOut;
 struct WalletTxStatus;
 struct WalletMigrationResult;
-
-using WalletOrderForm = std::vector<std::pair<std::string, std::string>>;
-using WalletValueMap = std::map<std::string, std::string>;
 
 //! Interface for accessing a wallet.
 class Wallet
@@ -128,6 +125,9 @@ public:
     //! Save or remove receive request.
     virtual bool setAddressReceiveRequest(const CTxDestination& dest, const std::string& id, const std::string& value) = 0;
 
+    //! Display address on external signer
+    virtual util::Result<void> displayAddress(const CTxDestination& dest) = 0;
+
     //! Lock coin.
     virtual bool lockCoin(const COutPoint& output, bool write_to_db) = 0;
 
@@ -147,9 +147,7 @@ public:
         std::optional<unsigned int> change_pos) = 0;
 
     //! Commit transaction.
-    virtual void commitTransaction(CTransactionRef tx,
-        WalletValueMap value_map,
-        WalletOrderForm order_form) = 0;
+    virtual void commitTransaction(CTransactionRef tx, const std::vector<std::string>& messages) = 0;
 
     //! Return whether transaction can be abandoned.
     virtual bool transactionCanBeAbandoned(const Txid& txid) = 0;
@@ -195,9 +193,16 @@ public:
     //! Get transaction details.
     virtual WalletTx getWalletTxDetails(const Txid& txid,
         WalletTxStatus& tx_status,
-        WalletOrderForm& order_form,
+        std::vector<std::string>& messages,
+        std::vector<std::string>& payment_requests,
         bool& in_mempool,
         int& num_blocks) = 0;
+
+    //! Fill PSBT.
+    virtual std::optional<common::PSBTError> fillPSBT(const common::PSBTFillOptions& options,
+        size_t* n_signed,
+        PartiallySignedTransaction& psbtx,
+        bool& complete) = 0;
 
     //! Get balances.
     virtual WalletBalances getBalances() = 0;
@@ -237,7 +242,7 @@ public:
     //! Get minimum fee.
     virtual CAmount getMinimumFee(unsigned int tx_bytes,
         const wallet::CCoinControl& coin_control,
-        int* returned_target,
+        std::optional<int>* returned_target,
         FeeReason* reason) = 0;
 
     //! Get tx confirm target.
@@ -252,6 +257,12 @@ public:
     // Return whether private keys enabled.
     virtual bool privateKeysDisabled() = 0;
 
+    // Return whether the wallet contains a Taproot scriptPubKeyMan
+    virtual bool taprootEnabled() = 0;
+
+    // Return whether wallet uses an external signer.
+    virtual bool hasExternalSigner() = 0;
+
     // Get default address type.
     virtual OutputType getDefaultAddressType() = 0;
 
@@ -260,15 +271,6 @@ public:
 
     // Remove wallet.
     virtual void remove() = 0;
-
-    // --- Methods in Core's interfaces::Wallet that Lattica omits (omitted, not faked): ---
-    //
-    // No post-quantum / witness-only analog (will not be ported):
-    //   fillPSBT             -- BIP-174 PSBT, an ECDSA/descriptor serialization
-    //   taprootEnabled       -- BIP-341 Taproot (Schnorr over secp256k1)
-    //   hasExternalSigner / displayAddress
-    //                        -- HWI hardware signers (PSBT- and EC-based)
-    // (WalletLoader likewise omits migrateWallet.)
 
     //! Register handler for unload message.
     using UnloadFn = std::function<void()>;
@@ -300,6 +302,9 @@ public:
 
     //! Return pointer to internal wallet class, useful for testing.
     virtual wallet::CWallet* wallet() { return nullptr; }
+
+    //! Export a watchonly wallet file. See CWallet::ExportWatchOnlyWallet
+    virtual util::Result<std::string> exportWatchOnlyWallet(const fs::path& destination) = 0;
 };
 
 //! Wallet chain client that in addition to having chain client methods for
@@ -314,11 +319,14 @@ public:
     //! Load existing wallet.
     virtual util::Result<std::unique_ptr<Wallet>> loadWallet(const std::string& name, std::vector<bilingual_str>& warnings) = 0;
 
+    //! Return default wallet directory.
+    virtual std::string getWalletDir() = 0;
+
     //! Restore backup wallet
     virtual util::Result<std::unique_ptr<Wallet>> restoreWallet(const fs::path& backup_file, const std::string& wallet_name, std::vector<bilingual_str>& warnings, bool load_after_restore) = 0;
 
-    //! Return default wallet directory.
-    virtual std::string getWalletDir() = 0;
+    //! Migrate a wallet
+    virtual util::Result<WalletMigrationResult> migrateWallet(const std::string& name, const SecureString& passphrase, bool load_wallet) = 0;
 
     //! Returns true if wallet stores encryption keys
     virtual bool isEncrypted(const std::string& wallet_name) = 0;
@@ -383,7 +391,10 @@ struct WalletTx
     CAmount debit;
     CAmount change;
     int64_t time;
-    std::map<std::string, std::string> value_map;
+    std::optional<std::string> from; // Deprecated
+    std::optional<std::string> message; // Deprecated
+    std::optional<std::string> comment;
+    std::optional<std::string> comment_to;
     bool is_coinbase;
 
     bool operator<(const WalletTx& a) const { return tx->GetHash() < a.tx->GetHash(); }

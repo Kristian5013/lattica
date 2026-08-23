@@ -394,6 +394,7 @@ public:
  * the node, so they are not a field.
  */
 struct CExtPubKey {
+    unsigned char version[4]{};
     unsigned char nDepth{0};
     KeyFingerprint fingerprint{};
     unsigned int nChild{0};
@@ -404,10 +405,13 @@ struct CExtPubKey {
     static constexpr size_t HEADER_SIZE = 1 + 4 + 4 + 32;
     //! The largest a serialized node can be, which is an ML-DSA-44 one.
     static constexpr size_t MAX_SIZE = HEADER_SIZE + CPubKey::SIZE;
+    //! ...and with BIP32's four version bytes in front of it.
+    static constexpr size_t MAX_SIZE_WITH_VERSION = 4 + MAX_SIZE;
 
     //! The serialized size of this node. Bitcoin's is the constant 74, which is
     //! this one for a secp256k1 key.
     size_t GetSerializedSize() const { return HEADER_SIZE + pubkey.size(); }
+    size_t GetSerializedSizeWithVersion() const { return 4 + GetSerializedSize(); }
 
     friend bool operator==(const CExtPubKey &a, const CExtPubKey &b)
     {
@@ -438,6 +442,8 @@ struct CExtPubKey {
     //! calls for. Decode reports whether what it was handed was a node at all.
     void Encode(std::span<unsigned char> code) const;
     [[nodiscard]] bool Decode(std::span<const unsigned char> code);
+    void EncodeWithVersion(std::span<unsigned char> code) const;
+    [[nodiscard]] bool DecodeWithVersion(std::span<const unsigned char> code);
 
     [[nodiscard]] bool Derive(CExtPubKey& out, unsigned int nChild, uint256* bip32_tweak_out = nullptr) const;
 

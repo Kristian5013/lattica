@@ -276,6 +276,7 @@ int main()
         CExtPubKey empty;
         Check("an extended public key with no key does not encode", EncodeExtPubKey(empty, *main).empty());
         Check("garbage is not an extended public key", !DecodeExtPubKey("not an xpub", *main).pubkey.IsValid());
+
     }
 
     // ---- Error reporting via the error_str / error_locations overload.

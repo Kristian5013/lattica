@@ -7,6 +7,7 @@
 #include <arith_uint256.h>
 #include <attributes.h>
 #include <chain.h>
+#include <crypto/sha256.h>
 #include <checkqueue.h>
 #include <coins.h>
 #include <consensus/amount.h>
@@ -71,9 +72,9 @@ class SignalInterrupt;
 } // namespace util
 
 /** Block files containing a block-height within MIN_BLOCKS_TO_KEEP of ActiveChain().Tip() will not be pruned. */
-static const unsigned int MIN_BLOCKS_TO_KEEP = 288;
-static const signed int DEFAULT_CHECKBLOCKS = 6;
-static constexpr int DEFAULT_CHECKLEVEL{3};
+inline constexpr unsigned int MIN_BLOCKS_TO_KEEP = 288;
+inline constexpr signed int DEFAULT_CHECKBLOCKS = 6;
+inline constexpr int DEFAULT_CHECKLEVEL{3};
 // Require that user allocate at least 550 MiB for block & undo files (blk???.dat and rev???.dat)
 // At 1MB per block, 288 blocks = 288MB.
 // Add 15% for Undo data = 331MB
@@ -82,13 +83,13 @@ static constexpr int DEFAULT_CHECKLEVEL{3};
 // full block file chunks, we need the high water mark which triggers the prune to be
 // one 128MB block file + added 15% undo data = 147MB greater for a total of 545MB
 // Setting the target to >= 550 MiB will make it likely we can respect the target.
-static const uint64_t MIN_DISK_SPACE_FOR_BLOCK_FILES{550_MiB};
+inline constexpr uint64_t MIN_DISK_SPACE_FOR_BLOCK_FILES{550_MiB};
 
 /** Maximum number of dedicated script-checking threads allowed */
-static constexpr int MAX_SCRIPTCHECK_THREADS{15};
+inline constexpr int MAX_SCRIPTCHECK_THREADS{15};
 
 /** Maximum number of dedicated threads allowed for prefetching block input prevouts */
-static constexpr int32_t MAX_PREVOUTFETCH_THREADS{16};
+inline constexpr int32_t MAX_PREVOUTFETCH_THREADS{16};
 
 /** Current sync state passed to tip changed callbacks. */
 enum class SynchronizationState {
@@ -372,7 +373,7 @@ class ValidationCache
 {
 private:
     //! Pre-initialized hasher to avoid having to recreate it for every hash calculation.
-    SHA3_256 m_script_execution_cache_hasher;
+    CSHA256 m_script_execution_cache_hasher;
 
 public:
     CuckooCache::cache<uint256, SignatureCacheHasher> m_script_execution_cache;
@@ -384,7 +385,7 @@ public:
     ValidationCache& operator=(const ValidationCache&) = delete;
 
     //! Return a copy of the pre-initialized hasher.
-    SHA3_256 ScriptExecutionCacheHasher() const { return m_script_execution_cache_hasher; }
+    CSHA256 ScriptExecutionCacheHasher() const { return m_script_execution_cache_hasher; }
 };
 
 /** Functions for validating blocks and updating the block tree */
@@ -810,8 +811,6 @@ public:
 
     /** Whether the chain state needs to be redownloaded due to lack of witness data */
     [[nodiscard]] bool NeedsRedownload() const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
-    /** Ensures we have a genesis block in the block tree, possibly writing one to disk. */
-    bool LoadGenesisBlock();
 
     /** Add a block to the candidate set if it has as much work as the current tip. */
     void TryAddBlockIndexCandidate(CBlockIndex* pindex) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -1089,6 +1088,9 @@ public:
     //! The total number of bytes available for us to use across all leveldb
     //! coins databases. This will be split somehow across chainstates.
     size_t m_total_coinsdb_cache{0};
+
+    /// Ensures a genesis block is in the block tree, possibly writing one to disk.
+    [[nodiscard]] bool LoadGenesisBlock();
 
     //! Instantiate a new chainstate.
     //!

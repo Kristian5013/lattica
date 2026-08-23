@@ -8,6 +8,8 @@
 
 #include <wallet/db.h>
 
+#include <chainparams.h>
+#include <chainparamsbase.h>
 #include <streams.h>
 #include <util/fs.h>
 #include <util/translation.h>
@@ -42,6 +44,11 @@ std::unique_ptr<wallet::WalletDatabase> Open(const fs::path& dir)
 
 int main()
 {
+    // A SQLite wallet stamps the network's magic into the file as its
+    // application_id, and refuses a file carrying another network's, so opening
+    // one at all needs a network to have been chosen.
+    SelectParams(ChainType::MAIN);
+
     const char* lad = std::getenv("LOCALAPPDATA");
     const std::string base = (lad && *lad) ? (std::string(lad) + "/lattica_walletdb_test")
                                            : std::string("lattica_walletdb_test");

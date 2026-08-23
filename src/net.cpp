@@ -273,7 +273,7 @@ void ClearLocal()
 }
 
 // learn a new local address
-bool AddLocal(const CService& addr_, int nScore)
+bool AddLocal(const CService& addr_, int nScore, bool add_even_if_unreachable)
 {
     CService addr{MaybeFlipIPv6toCJDNS(addr_)};
 
@@ -283,7 +283,7 @@ bool AddLocal(const CService& addr_, int nScore)
     if (!fDiscover && nScore < LOCAL_MANUAL)
         return false;
 
-    if (!g_reachable_nets.Contains(addr))
+    if (!g_reachable_nets.Contains(addr) && !add_even_if_unreachable)
         return false;
 
     if (fLogIPs) {
@@ -303,9 +303,9 @@ bool AddLocal(const CService& addr_, int nScore)
     return true;
 }
 
-bool AddLocal(const CNetAddr &addr, int nScore)
+bool AddLocal(const CNetAddr& addr, int nScore, bool add_even_if_unreachable)
 {
-    return AddLocal(CService(addr, GetListenPort()), nScore);
+    return AddLocal(CService(addr, GetListenPort()), nScore, add_even_if_unreachable);
 }
 
 void RemoveLocal(const CService& addr)
@@ -915,12 +915,11 @@ size_t V1Transport::GetSendMemoryUsage() const noexcept
 
 namespace {
 
-/** List of short messages for the v2 transport, in order (the same short-id scheme as BIP324).
+/** List of short messages as defined in BIP324, in order.
  *
  * Only message types that are actually implemented in this codebase need to be listed, as other
  * messages get ignored anyway - whether we know how to decode them or not.
  */
-constexpr size_t V2_SHORTIDS_IMPLEMENTED{38};
 const std::array<std::string, V2_SHORTIDS_IMPLEMENTED> V2_MESSAGE_IDS = {
     "", // 12 bytes follow encoding the message type like in V1
     NetMsgType::ADDR,
@@ -978,7 +977,14 @@ public:
 };
 
 const V2MessageMap V2_MESSAGE_MAP;
-
+// ---------------------------------------------------------------------------
+// The v2 transport. Everything above and below this block is Bitcoin Core's;
+// this block is not, and cannot be: Core's v2 transport is BIP324, whose key
+// agreement is X25519 over ElligatorSwift. Key agreement here is ML-KEM-768
+// (FIPS 203) -- see v2cipher.h -- because a curve is exactly what a
+// post-quantum chain cannot rest its transport on. The packet framing, the
+// garbage terminators and the state machine follow BIP324's shape.
+// ---------------------------------------------------------------------------
 std::vector<uint8_t> GenerateRandomGarbage() noexcept
 {
     std::vector<uint8_t> ret;
@@ -1704,7 +1710,7 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
     return {nSentSize, data_left};
 }
 
-/** Try to find a connection to evict when the node is full.
+/** Try to find an inbound connection to evict.
  *  Extreme care must be taken to avoid opening the node to attacker
  *   triggered network partitioning.
  *  The strategy used here is to protect a small number of peers
@@ -1712,7 +1718,7 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
  *   to forge.  In order to partition a node the attacker must be
  *   simultaneously better at all of them than honest peers.
  */
-bool CConnman::AttemptToEvictConnection()
+bool CConnman::AttemptToEvictConnection(bool evict_tx_relay_peer_only, std::optional<NodeId> protect_peer)
 {
     AssertLockNotHeld(m_nodes_mutex);
 
@@ -1723,6 +1729,12 @@ bool CConnman::AttemptToEvictConnection()
         for (const CNode* node : m_nodes) {
             if (node->fDisconnect)
                 continue;
+            if (protect_peer.has_value() && node->GetId() == protect_peer) {
+                continue;
+            }
+            if (evict_tx_relay_peer_only && !node->m_relays_txs) {
+                continue;
+            }
             NodeEvictionCandidate candidate{
                 .id = node->GetId(),
                 .m_connected = node->m_connected,
@@ -1851,7 +1863,7 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
 
     if (nInbound >= m_max_inbound)
     {
-        if (!AttemptToEvictConnection()) {
+        if (!AttemptToEvictConnection(/*evict_tx_relay_peer_only=*/false)) {
             // No connection to evict, disconnect the new connection
             LogDebug(BCLog::NET, "failed to find an eviction candidate - connection dropped (full)\n");
             return;
@@ -2421,9 +2433,6 @@ void CConnman::ThreadDNSAddressSeed()
                 const auto addresses{LookupHost(host, nMaxIPs, true)};
                 if (!addresses.empty()) {
                     for (const CNetAddr& ip : addresses) {
-                        // requiredServiceBits stays in the query string above -- that
-                        // is what the seed filters on. What we record locally is what
-                        // we assume of the peer, which includes v2 transport.
                         CAddress addr = CAddress(CService(ip, m_params.GetDefaultPort()), SeedsAssumedServiceFlags());
                         addr.nTime = rng.rand_uniform_delay(Now<NodeSeconds>() - 3 * 24h, -4 * 24h); // use a random age between 3 and 7 days old
                         vAdd.push_back(addr);
@@ -2551,6 +2560,23 @@ int CConnman::GetExtraBlockRelayCount() const
         }
     }
     return std::max(block_relay_peers - m_max_outbound_block_relay, 0);
+}
+
+bool CConnman::EvictTxPeerIfFull(std::optional<NodeId> protect_peer)
+{
+    int tx_inbound_peers{0};
+    {
+        LOCK(m_nodes_mutex);
+        for (const CNode* pnode : m_nodes) {
+            if (!pnode->fDisconnect && pnode->IsInboundConn() && pnode->m_relays_txs) {
+                ++tx_inbound_peers;
+            }
+        }
+    }
+    if (tx_inbound_peers > m_max_inbound_full_relay) {
+        return AttemptToEvictConnection(/*evict_tx_relay_peer_only=*/true, protect_peer);
+    }
+    return true;
 }
 
 std::unordered_set<Network> CConnman::GetReachableEmptyNetworks() const

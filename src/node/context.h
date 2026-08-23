@@ -17,12 +17,13 @@ class ArgsManager;
 class AddrMan;
 class BanMan;
 class BaseIndex;
-class CBlockPolicyEstimator;
 class CConnman;
+class FeeRateEstimatorManager;
 class ValidationSignals;
 class CScheduler;
 class CTxMemPool;
 class ChainstateManager;
+class ECC_Context;
 class NetGroupManager;
 class PeerManager;
 class TorController;
@@ -57,6 +58,7 @@ class Warnings;
 struct NodeContext {
     //! libbitcoin_kernel context
     std::unique_ptr<kernel::Context> kernel;
+    std::unique_ptr<ECC_Context> ecc_context;
     //! Init interface for initializing current process and connecting to other processes.
     interfaces::Init* init{nullptr};
     //! Function to request a shutdown.
@@ -67,7 +69,7 @@ struct NodeContext {
     std::unique_ptr<CConnman> connman;
     std::unique_ptr<CTxMemPool> mempool;
     std::unique_ptr<const NetGroupManager> netgroupman;
-    std::unique_ptr<CBlockPolicyEstimator> fee_estimator;
+    std::unique_ptr<FeeRateEstimatorManager> fee_estimator_man;
     std::unique_ptr<PeerManager> peerman;
     std::unique_ptr<TorController> tor_controller;
     std::unique_ptr<ChainstateManager> chainman;

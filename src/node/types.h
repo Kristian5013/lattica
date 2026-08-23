@@ -24,6 +24,7 @@ enum class TransactionError {
     MAX_FEE_EXCEEDED,
     MAX_BURN_EXCEEDED,
     INVALID_PACKAGE,
+    PRIVATE_BROADCAST_FULL,
 };
 
 /**

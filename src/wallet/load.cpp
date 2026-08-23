@@ -5,43 +5,42 @@
 
 #include <common/args.h>
 #include <interfaces/chain.h>
-#include <logging.h>
 #include <scheduler.h>
-#include <tinyformat.h>
+#include <util/check.h>
 #include <util/fs.h>
+#include <util/string.h>
 #include <util/translation.h>
 #include <wallet/context.h>
-#include <wallet/db.h>
+#include <wallet/spend.h>
 #include <wallet/wallet.h>
+#include <wallet/walletdb.h>
 
 #include <univalue.h>
 
-#include <chrono>
-#include <set>
-#include <string>
 #include <system_error>
-#include <vector>
+
+using util::Join;
 
 namespace wallet {
 bool VerifyWallets(WalletContext& context)
 {
     interfaces::Chain& chain = *context.chain;
-    ArgsManager& args = *context.args;
+    ArgsManager& args = *Assert(context.args);
 
     if (args.IsArgSet("-walletdir")) {
         const fs::path wallet_dir{args.GetPathArg("-walletdir")};
-        std::error_code ec;
-        // The canonical path cleans the path, preventing >1 database environment
-        // for the same directory, and strips trailing slashes so the exists /
-        // is_directory checks below pass on Windows.
-        fs::path canonical_wallet_dir = fs::canonical(wallet_dir, ec);
-        if (ec || !fs::exists(canonical_wallet_dir)) {
+        std::error_code error;
+        // The canonical path cleans the path, preventing >1 Berkeley environment instances for the same directory
+        // It also lets the fs::exists and fs::is_directory checks below pass on windows, since they return false
+        // if a path has trailing slashes, and it strips trailing slashes.
+        fs::path canonical_wallet_dir = fs::canonical(wallet_dir, error);
+        if (error || !fs::exists(canonical_wallet_dir)) {
             chain.initError(strprintf(_("Specified -walletdir \"%s\" does not exist"), fs::PathToString(wallet_dir)));
             return false;
         } else if (!fs::is_directory(canonical_wallet_dir)) {
             chain.initError(strprintf(_("Specified -walletdir \"%s\" is not a directory"), fs::PathToString(wallet_dir)));
             return false;
-        // The canonical path transforms relative paths into absolute ones, so we check the non-canonical version.
+        // The canonical path transforms relative paths into absolute ones, so we check the non-canonical version
         } else if (!wallet_dir.is_absolute()) {
             chain.initError(strprintf(_("Specified -walletdir \"%s\" is a relative path"), fs::PathToString(wallet_dir)));
             return false;
@@ -49,85 +48,138 @@ bool VerifyWallets(WalletContext& context)
         args.ForceSetArg("-walletdir", fs::PathToString(canonical_wallet_dir));
     }
 
-    // Lattica verifies lazily on open (MakeDatabase runs the SQLite integrity
-    // check via DatabaseOptions::verify); here we just ensure the wallet directory
-    // exists and reject duplicate wallet names across the merged settings list.
-    (void)GetWalletDir(*context.args);
-    std::set<std::string> seen;
-    for (const common::SettingsValue& wallet : context.chain->getSettingsList("wallet")) {
-        if (!wallet.isStr()) {
-            LogError("Invalid value detected for '-wallet': requires a string value.");
-            return false;
-        }
-        if (!seen.insert(wallet.get_str()).second) {
-            LogWarning("Ignoring duplicate -wallet %s.", wallet.get_str());
+    LogInfo("Using wallet directory %s", fs::PathToString(GetWalletDir(gArgs)));
+    // Print general DB information
+    LogDBInfo();
+
+    chain.initMessage(_("Verifying wallet(s)…"));
+
+    // For backwards compatibility if an unnamed top level wallet exists in the
+    // wallets directory, include it in the default list of wallets to load.
+    if (!args.IsArgSet("wallet")) {
+        DatabaseOptions options;
+        DatabaseStatus status;
+        ReadDatabaseArgs(args, options);
+        bilingual_str error_string;
+        options.require_existing = true;
+        options.verify = false;
+        if (MakeWalletDatabase("", options, status, error_string)) {
+            common::SettingsValue wallets(common::SettingsValue::VARR);
+            wallets.push_back(""); // Default wallet name is ""
+            // Pass write=false because no need to write file and probably
+            // better not to. If unnamed wallet needs to be added next startup
+            // and the setting is empty, this code will just run again.
+            chain.overwriteRwSetting("wallet", std::move(wallets), interfaces::SettingsAction::SKIP_WRITE);
         }
     }
+
+    // Keep track of each wallet absolute path to detect duplicates.
+    std::set<fs::path> wallet_paths;
+
+    for (const auto& wallet : chain.getSettingsList("wallet")) {
+        if (!wallet.isStr()) {
+            chain.initError(_("Invalid value detected for '-wallet' or '-nowallet'. "
+                              "'-wallet' requires a string value, while '-nowallet' accepts only '1' to disable all wallets"));
+            return false;
+        }
+        const auto& wallet_file = wallet.get_str();
+        const fs::path path = fsbridge::AbsPathJoin(GetWalletDir(gArgs), fs::PathFromString(wallet_file));
+
+        if (!wallet_paths.insert(path).second) {
+            chain.initWarning(strprintf(_("Ignoring duplicate -wallet %s."), wallet_file));
+            continue;
+        }
+
+        DatabaseOptions options;
+        DatabaseStatus status;
+        ReadDatabaseArgs(args, options);
+        options.require_existing = true;
+        options.verify = true;
+        bilingual_str error_string;
+        if (!MakeWalletDatabase(wallet_file, options, status, error_string)) {
+            if (status == DatabaseStatus::FAILED_NOT_FOUND) {
+                chain.initWarning(Untranslated(strprintf("Skipping -wallet path that doesn't exist. %s", error_string.original)));
+            } else if (status == DatabaseStatus::FAILED_LEGACY_DISABLED) {
+                // Skipping legacy wallets as they will not be loaded.
+                // This will be properly communicated to the user during the loading process.
+                continue;
+            } else {
+                chain.initError(error_string);
+                return false;
+            }
+        }
+    }
+
     return true;
 }
 
 bool LoadWallets(WalletContext& context)
 {
-    // The "wallet" settings list merges -wallet command-line args with the
-    // persistent settings.json load list, so wallets the user asked to load on
-    // startup (via createwallet/loadwallet/restorewallet load_on_startup) come up
-    // automatically here.
-    std::set<std::string> seen;
-    for (const common::SettingsValue& wallet : context.chain->getSettingsList("wallet")) {
-        if (!wallet.isStr()) {
-            LogError("Invalid value detected for '-wallet': requires a string value.");
-            return false;
+    interfaces::Chain& chain = *context.chain;
+    try {
+        std::set<fs::path> wallet_paths;
+        for (const auto& wallet : chain.getSettingsList("wallet")) {
+            if (!wallet.isStr()) {
+                chain.initError(_("Invalid value detected for '-wallet' or '-nowallet'. "
+                                  "'-wallet' requires a string value, while '-nowallet' accepts only '1' to disable all wallets"));
+                return false;
+            }
+            const auto& name = wallet.get_str();
+            if (!wallet_paths.insert(fs::PathFromString(name)).second) {
+                continue;
+            }
+            DatabaseOptions options;
+            DatabaseStatus status;
+            ReadDatabaseArgs(*context.args, options);
+            options.require_existing = true;
+            options.verify = false; // No need to verify, assuming verified earlier in VerifyWallets()
+            bilingual_str error;
+            std::vector<bilingual_str> warnings;
+            std::unique_ptr<WalletDatabase> database = MakeWalletDatabase(name, options, status, error);
+            if (!database) {
+                if (status == DatabaseStatus::FAILED_NOT_FOUND) continue;
+                if (status == DatabaseStatus::FAILED_LEGACY_DISABLED) {
+                    // Inform user that legacy wallet is not loaded and suggest upgrade options
+                    chain.initWarning(error);
+                    continue;
+                }
+            }
+            chain.initMessage(_("Loading wallet…"));
+            std::shared_ptr<CWallet> pwallet = database ? CWallet::LoadExisting(context, name, std::move(database), error, warnings) : nullptr;
+            if (!warnings.empty()) chain.initWarning(Join(warnings, Untranslated("\n")));
+            if (!pwallet) {
+                chain.initError(error);
+                return false;
+            }
+
+            NotifyWalletLoaded(context, pwallet);
+            AddWallet(context, pwallet);
         }
-        const std::string name{wallet.get_str()};
-        if (!seen.insert(name).second) continue; // already loaded (de-dup CLI + settings)
-        DatabaseOptions options;
-        DatabaseStatus status;
-        bilingual_str error;
-        std::vector<bilingual_str> warnings;
-        options.require_existing = true;
-        options.verify = false; // already verified above
-        if (!LoadWallet(context, name, /*load_on_start=*/std::nullopt, options, status, error, warnings)) {
-            LogError("Failed to load wallet %s: %s", name, error.original);
-            return false;
-        }
-        LogInfo("Loaded wallet %s", name);
+        return true;
+    } catch (const std::runtime_error& e) {
+        chain.initError(Untranslated(e.what()));
+        return false;
     }
-    return true;
 }
 
-void StartWallets(WalletContext& context, CScheduler& scheduler)
+void StartWallets(WalletContext& context)
 {
     for (const std::shared_ptr<CWallet>& pwallet : GetWallets(context)) {
         pwallet->postInitProcess();
     }
 
-    // Rebroadcast unconfirmed wallet transactions periodically, so a payment that
-    // gets evicted from peers' mempools is re-announced instead of stalling forever.
-    scheduler.scheduleEvery([&context] { MaybeResendWalletTxs(context); }, std::chrono::minutes{1});
-}
-
-void FlushWallets(WalletContext& context)
-{
-    // The SQLite backend commits each write synchronously, so there is nothing
-    // to flush between operations (Core's BDB backend needed an explicit flush).
-    (void)context;
-}
-
-void StopWallets(WalletContext& context)
-{
-    for (const auto& wallet : GetWallets(context)) {
-        wallet->GetDatabase().Close();
-    }
+    context.scheduler->scheduleEvery([&context] { MaybeResendWalletTxs(context); }, 1min);
 }
 
 void UnloadWallets(WalletContext& context)
 {
-    auto wallets{GetWallets(context)};
+    auto wallets = GetWallets(context);
     while (!wallets.empty()) {
-        auto wallet{wallets.back()};
+        auto wallet = wallets.back();
         wallets.pop_back();
-        RemoveWallet(context, wallet);
+        std::vector<bilingual_str> warnings;
+        RemoveWallet(context, wallet, /* load_on_start= */ std::nullopt, warnings);
+        WaitForDeleteWallet(std::move(wallet));
     }
 }
-
 } // namespace wallet

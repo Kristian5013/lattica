@@ -4,7 +4,7 @@
 #ifndef LATTICA_WALLET_RPC_WALLET_H
 #define LATTICA_WALLET_RPC_WALLET_H
 
-#include <span>
+#include <span.h>
 
 class CRPCCommand;
 

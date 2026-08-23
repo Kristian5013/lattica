@@ -4,27 +4,19 @@
 #include <chainparams.h>
 #include <core_io.h>
 #include <key_io.h>
+#include <policy/rbf.h>
 #include <primitives/transaction_identifier.h>
 #include <rpc/util.h>
 #include <rpc/rawtransaction_util.h>
+#include <rpc/blockchain.h>
 #include <util/vector.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/util.h>
 #include <wallet/wallet.h>
 
-#include <univalue.h>
-
 using interfaces::FoundBlock;
 
 namespace wallet {
-//! Push the "address" field for a destination, if it has one.
-static void MaybePushAddress(UniValue& entry, const CTxDestination& dest)
-{
-    if (IsValidDestination(dest)) {
-        entry.pushKV("address", EncodeDestination(dest, Params()));
-    }
-}
-
 static void WalletTxToJSON(const CWallet& wallet, const CWalletTx& wtx, UniValue& entry)
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
@@ -46,6 +38,12 @@ static void WalletTxToJSON(const CWallet& wallet, const CWalletTx& wtx, UniValue
     }
     entry.pushKV("txid", wtx.GetHash().GetHex());
     entry.pushKV("wtxid", wtx.GetWitnessHash().GetHex());
+    UniValue alternate_wtxids(UniValue::VARR);
+    for (const auto& [wtxid, _] : wtx.GetTxs()) {
+        if (wtxid == wtx.GetWitnessHash()) continue;
+        alternate_wtxids.push_back(wtxid.GetHex());
+    }
+    entry.pushKV("alternate_wtxids", alternate_wtxids);
     UniValue conflicts(UniValue::VARR);
     for (const Txid& conflict : wallet.GetTxConflicts(wtx))
         conflicts.push_back(conflict.GetHex());
@@ -57,12 +55,23 @@ static void WalletTxToJSON(const CWallet& wallet, const CWalletTx& wtx, UniValue
     entry.pushKV("time", wtx.GetTxTime());
     entry.pushKV("timereceived", wtx.nTimeReceived);
 
-    // The legacy bip125-replaceable field is omitted: Lattica's interfaces::Chain
-    // does not expose rpcEnableDeprecated / isRBFOptIn (the field was deprecated in
-    // Core). RBF itself is supported; it is simply not surfaced here.
+    // Add opt-in RBF status
+    if (chain.rpcEnableDeprecated("bip125")) {
+        std::string rbfStatus = "no";
+        if (confirms <= 0) {
+            RBFTransactionState rbfState = chain.isRBFOptIn(*wtx.GetTx());
+            if (rbfState == RBFTransactionState::UNKNOWN)
+                rbfStatus = "unknown";
+            else if (rbfState == RBFTransactionState::REPLACEABLE_BIP125)
+                rbfStatus = "yes";
+        }
+        entry.pushKV("bip125-replaceable", rbfStatus);
+    }
 
-    for (const std::pair<const std::string, std::string>& item : wtx.mapValue)
-        entry.pushKV(item.first, item.second);
+    if (wtx.m_comment) entry.pushKV("comment", *wtx.m_comment);
+    if (wtx.m_comment_to) entry.pushKV("to", *wtx.m_comment_to);
+    if (wtx.m_replaces_txid) entry.pushKV("replaces_txid", wtx.m_replaces_txid->ToString());
+    if (wtx.m_replaced_by_txid) entry.pushKV("replaced_by_txid", wtx.m_replaced_by_txid->ToString());
 }
 
 struct tallyitem
@@ -107,7 +116,7 @@ static UniValue ListReceived(const CWallet& wallet, const UniValue& params, cons
             continue;
         }
 
-        for (const CTxOut& txout : wtx.tx->vout) {
+        for (const CTxOut& txout : wtx.GetTx()->vout) {
             CTxDestination address;
             if (!ExtractDestination(txout.scriptPubKey, address))
                 continue;
@@ -130,12 +139,17 @@ static UniValue ListReceived(const CWallet& wallet, const UniValue& params, cons
     UniValue ret(UniValue::VARR);
     std::map<std::string, tallyitem> label_tally;
 
-    const auto& func = [&](const CTxDestination& address, const std::string& label, bool is_change, const std::optional<AddressPurpose>& purpose) {
+    const auto& func = [&](const CTxDestination& address, const std::string& label, bool is_change,
+                            const std::optional<AddressPurpose>& purpose) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet) {
         if (is_change) return; // no change addresses
 
+        // Entries in mapTally are only ever added for wallet.IsMine() addresses (see the tally
+        // loop above), so it's only addresses missing from mapTally that need the IsMine() check.
         auto it = mapTally.find(address);
-        if (it == mapTally.end() && !fIncludeEmpty)
-            return;
+        if (it == mapTally.end()) {
+            if (!fIncludeEmpty) return;
+            if (!wallet.IsMine(address)) return; // exclude addresses not owned by the wallet (e.g. "send" purpose)
+        }
 
         CAmount nAmount = 0;
         int nConf = std::numeric_limits<int>::max();
@@ -266,7 +280,7 @@ RPCMethod listreceivedbylabel()
                 RPCExamples{
                     HelpExampleCli("listreceivedbylabel", "")
             + HelpExampleCli("listreceivedbylabel", "6 true")
-            + HelpExampleRpc("listreceivedbylabel", "6, true, true")
+            + HelpExampleRpc("listreceivedbylabel", "6, true, true, true")
                 },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -284,6 +298,13 @@ RPCMethod listreceivedbylabel()
     return ListReceived(*pwallet, request.params, true, include_immature_coinbase);
 },
     };
+}
+
+static void MaybePushAddress(UniValue & entry, const CTxDestination &dest)
+{
+    if (IsValidDestination(dest)) {
+        entry.pushKV("address", EncodeDestination(dest, Params()));
+    }
 }
 
 /**
@@ -344,7 +365,7 @@ static void ListTransactions(const CWallet& wallet, const CWalletTx& wtx, int nM
             }
             UniValue entry(UniValue::VOBJ);
             MaybePushAddress(entry, r.destination);
-            // Lattica has no output descriptors, so no parent_descs are pushed.
+            PushParentDescriptors(wallet, wtx.GetTx()->vout.at(r.vout).scriptPubKey, entry);
             if (wtx.IsCoinBase())
             {
                 if (wallet.GetTxDepthInMainChain(wtx) < 1)
@@ -385,6 +406,10 @@ static std::vector<RPCResult> TransactionDescriptionString()
            {RPCResult::Type::NUM_TIME, "blocktime", /*optional=*/true, "The block time expressed in " + UNIX_EPOCH_TIME + "."},
            {RPCResult::Type::STR_HEX, "txid", "The transaction id."},
            {RPCResult::Type::STR_HEX, "wtxid", "The hash of serialized transaction, including witness data."},
+           {RPCResult::Type::ARR, "alternate_wtxids", "The wtxids of transactions with different witness data but the same txid.",
+           {
+               {RPCResult::Type::STR_HEX, "wtxid", "The witness transaction id."},
+           }},
            {RPCResult::Type::ARR, "walletconflicts", "Confirmed transactions that have been detected by the wallet to conflict with this transaction.",
            {
                {RPCResult::Type::STR_HEX, "txid", "The transaction id."},
@@ -399,6 +424,11 @@ static std::vector<RPCResult> TransactionDescriptionString()
            {RPCResult::Type::NUM_TIME, "time", "The transaction time expressed in " + UNIX_EPOCH_TIME + "."},
            {RPCResult::Type::NUM_TIME, "timereceived", "The time received expressed in " + UNIX_EPOCH_TIME + "."},
            {RPCResult::Type::STR, "comment", /*optional=*/true, "If a comment is associated with the transaction, only present if not empty."},
+           {RPCResult::Type::STR, "bip125-replaceable", /*optional=*/true, "(\"yes|no|unknown\") (DEPRECATED) Whether this transaction signals BIP125 replaceability or has an unconfirmed ancestor signaling BIP125 replaceability.\n"
+               "May be unknown for unconfirmed transactions not in the mempool because their unconfirmed ancestors are unknown."},
+           {RPCResult::Type::ARR, "parent_descs", /*optional=*/true, "Only if 'category' is 'received'. List of parent descriptors for the output script of this coin.", {
+               {RPCResult::Type::STR, "desc", "The descriptor string."},
+           }},
            };
 }
 
@@ -408,7 +438,10 @@ RPCMethod listtransactions()
         "listtransactions",
         "If a label name is provided, this will return only incoming transactions paying to addresses with the specified label.\n"
                 "Returns up to 'count' most recent transactions ordered from oldest to newest while skipping the first number of \n"
-                "transactions specified in the 'skip' argument.\n",
+                "transactions specified in the 'skip' argument. A transaction can have multiple entries in this RPC response. \n"
+                "For instance, a wallet transaction that pays three addresses — one wallet-owned and two external — will produce \n"
+                "four entries. The payment to the wallet-owned address appears both as a send entry and as a receive entry. \n"
+                "As a result, the RPC response will contain one entry in the receive category and three entries in the send category.\n",
                 {
                     {"label", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "If set, should be a valid label name to return only incoming transactions\n"
                           "with the specified label, or \"*\" to disable filtering and return all transactions."},
@@ -421,7 +454,7 @@ RPCMethod listtransactions()
                     {
                         {RPCResult::Type::OBJ, "", "", Cat(Cat<std::vector<RPCResult>>(
                         {
-                            {RPCResult::Type::STR, "address",  /*optional=*/true, "The lattica address of the transaction (not returned if the output does not have an address, e.g. OP_RETURN null data)."},
+                            {RPCResult::Type::STR, "address",  /*optional=*/true, "The bitcoin address of the transaction (not returned if the output does not have an address, e.g. OP_RETURN null data)."},
                             {RPCResult::Type::STR, "category", "The transaction category.\n"
                                 "\"send\"                  Transactions sent.\n"
                                 "\"receive\"               Non-coinbase transactions received.\n"
@@ -481,17 +514,12 @@ RPCMethod listtransactions()
     {
         LOCK(pwallet->cs_wallet);
 
-        // Lattica's CWallet does not maintain an ordered tx index (Core's
-        // wtxOrdered); build one on the fly, keyed by nOrderPos.
-        std::multimap<int64_t, const CWalletTx*> txOrdered;
-        for (const auto& [_, wtx] : pwallet->mapWallet) {
-            txOrdered.emplace(wtx.nOrderPos, &wtx);
-        }
+        const CWallet::TxItems & txOrdered = pwallet->wtxOrdered;
 
         // iterate backwards until we have nCount items to return:
-        for (auto it = txOrdered.rbegin(); it != txOrdered.rend(); ++it)
+        for (CWallet::TxItems::const_reverse_iterator it = txOrdered.rbegin(); it != txOrdered.rend(); ++it)
         {
-            const CWalletTx* const pwtx = it->second;
+            CWalletTx *const pwtx = (*it).second;
             ListTransactions(*pwallet, *pwtx, 0, true, ret, filter_label);
             if ((int)ret.size() >= (nCount+nFrom)) break;
         }
@@ -516,7 +544,7 @@ static std::vector<RPCResult> ListSinceBlockTxFields()
 {
     return Cat<std::vector<RPCResult>>(
         {
-            {RPCResult::Type::STR, "address", /*optional=*/true, "The lattica address of the transaction (not returned if the output does not have an address, e.g. OP_RETURN null data)."},
+            {RPCResult::Type::STR, "address", /*optional=*/true, "The bitcoin address of the transaction (not returned if the output does not have an address, e.g. OP_RETURN null data)."},
             {RPCResult::Type::STR, "category", "The transaction category.\n"
                 "\"send\"                  Transactions sent.\n"
                 "\"receive\"               Non-coinbase transactions received.\n"
@@ -685,7 +713,7 @@ RPCMethod gettransaction()
                         {
                             {RPCResult::Type::OBJ, "", "",
                             {
-                                {RPCResult::Type::STR, "address", /*optional=*/true, "The lattica address involved in the transaction."},
+                                {RPCResult::Type::STR, "address", /*optional=*/true, "The bitcoin address involved in the transaction."},
                                 {RPCResult::Type::STR, "category", "The transaction category.\n"
                                     "\"send\"                  Transactions sent.\n"
                                     "\"receive\"               Non-coinbase transactions received.\n"
@@ -698,6 +726,9 @@ RPCMethod gettransaction()
                                 {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The amount of the fee in " + CURRENCY_UNIT + ". This is negative and only available for the \n"
                                     "'send' category of transactions."},
                                 {RPCResult::Type::BOOL, "abandoned", "'true' if the transaction has been abandoned (inputs are respendable)."},
+                                {RPCResult::Type::ARR, "parent_descs", /*optional=*/true, "Only if 'category' is 'received'. List of parent descriptors for the output script of this coin.", {
+                                    {RPCResult::Type::STR, "desc", "The descriptor string."},
+                                }},
                             }},
                         }},
                         {RPCResult::Type::STR_HEX, "hex", "Raw data for transaction"},
@@ -739,7 +770,7 @@ RPCMethod gettransaction()
     CAmount nCredit = CachedTxGetCredit(*pwallet, wtx, /*avoid_reuse=*/false);
     CAmount nDebit = CachedTxGetDebit(*pwallet, wtx, /*avoid_reuse=*/false);
     CAmount nNet = nCredit - nDebit;
-    CAmount nFee = (CachedTxIsFromMe(*pwallet, wtx) ? wtx.tx->GetValueOut() - nDebit : 0);
+    CAmount nFee = (CachedTxIsFromMe(*pwallet, wtx) ? wtx.GetTx()->GetValueOut() - nDebit : 0);
 
     entry.pushKV("amount", ValueFromAmount(nNet - nFee));
     if (CachedTxIsFromMe(*pwallet, wtx))
@@ -751,11 +782,11 @@ RPCMethod gettransaction()
     ListTransactions(*pwallet, wtx, 0, false, details, /*filter_label=*/std::nullopt);
     entry.pushKV("details", std::move(details));
 
-    entry.pushKV("hex", EncodeHexTx(*wtx.tx));
+    entry.pushKV("hex", EncodeHexTx(*wtx.GetTx()));
 
     if (verbose) {
         UniValue decoded(UniValue::VOBJ);
-        TxToUniv(*wtx.tx,
+        TxToUniv(*wtx.GetTx(),
                 /*block_hash=*/uint256(),
                 /*entry=*/decoded,
                 /*include_hex=*/false,
@@ -821,7 +852,9 @@ RPCMethod rescanblockchain()
     return RPCMethod{
         "rescanblockchain",
         "Rescan the local blockchain for wallet related transactions.\n"
-                "Note: Use \"getwalletinfo\" to query the scanning progress.\n",
+                "Note: Use \"getwalletinfo\" to query the scanning progress.\n"
+                "The rescan is significantly faster if block filters are available\n"
+                "(using startup option \"-blockfilterindex=1\").\n",
                 {
                     {"start_height", RPCArg::Type::NUM, RPCArg::Default{0}, "block height where the rescan should start"},
                     {"stop_height", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "the last block height that should be scanned. If none is provided it will rescan up to the tip at return time of this call."},
@@ -918,6 +951,8 @@ RPCMethod abortrescan()
                 {},
                 RPCResult{RPCResult::Type::BOOL, "", "Whether the abort was successful"},
                 RPCExamples{
+            "\nImport a private key\n"
+            + HelpExampleCli("rescanblockchain", "") +
             "\nAbort the running wallet rescan\n"
             + HelpExampleCli("abortrescan", "") +
             "\nAs a JSON-RPC call\n"

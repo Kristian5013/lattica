@@ -1,9 +1,8 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
 
-#include <core_io.h>
-
 #include <chainparams.h>
+#include <core_io.h>
 
 #include <addresstype.h>
 #include <coins.h>
@@ -15,6 +14,7 @@
 #include <prevector.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
+#include <script/descriptor.h>
 #include <script/interpreter.h>
 #include <script/script.h>
 #include <script/signingprovider.h>
@@ -264,7 +264,7 @@ bool DecodeHexBlk(CBlock& block, const std::string& strHexBlk)
 util::Result<int> SighashFromStr(const std::string& sighash)
 {
     static const std::map<std::string, int> map_sighash_values = {
-        // Lattica has no SIGHASH_DEFAULT (a Taproot/BIP341 value; Lattica is witness-v0 only).
+        {std::string("DEFAULT"), int(SIGHASH_DEFAULT)},
         {std::string("ALL"), int(SIGHASH_ALL)},
         {std::string("ALL|ANYONECANPAY"), int(SIGHASH_ALL|SIGHASH_ANYONECANPAY)},
         {std::string("NONE"), int(SIGHASH_NONE)},
@@ -371,9 +371,24 @@ std::string ScriptToAsmStr(const CScript& script, const bool fAttemptSighashDeco
                 str += strprintf("%d", CScriptNum(vch, false).getint());
             } else {
                 // the IsUnspendable check makes sure not to try to decode OP_RETURN data that may match the format of a signature
-                // Lattica's ML-DSA signatures are not ECDSA-DER-encoded, so the sighash-type
-                // decode Core attempts here (CheckSignatureEncoding) has no Lattica analog.
-                str += HexStr(vch);
+                if (fAttemptSighashDecode && !script.IsUnspendable()) {
+                    std::string strSigHashDecode;
+                    // goal: only attempt to decode a defined sighash type from data that looks like a signature within a scriptSig.
+                    // this won't decode correctly formatted public keys in Pubkey or Multisig scripts due to
+                    // the restrictions on the pubkey formats (see IsCompressedOrUncompressedPubKey) being incongruous with the
+                    // checks in CheckSignatureEncoding.
+                    if (CheckSignatureEncoding(vch, SCRIPT_VERIFY_STRICTENC, nullptr)) {
+                        const unsigned char chSigHashType = vch.back();
+                        const auto it = mapSigHashTypes.find(chSigHashType);
+                        if (it != mapSigHashTypes.end()) {
+                            strSigHashDecode = "[" + it->second + "]";
+                            vch.pop_back(); // remove the sighash type byte. it will be replaced by the decode.
+                        }
+                    }
+                    str += HexStr(vch) + strSigHashDecode;
+                } else {
+                    str += HexStr(vch);
+                }
             }
         } else {
             str += GetOpName(opcode);
@@ -395,6 +410,7 @@ void ScriptToUniv(const CScript& script, UniValue& out, bool include_hex, bool i
 
     out.pushKV("asm", ScriptToAsmStr(script));
     if (include_address) {
+        out.pushKV("desc", InferDescriptor(script, provider ? *provider : DUMMY_SIGNING_PROVIDER)->ToString());
     }
     if (include_hex) {
         out.pushKV("hex", HexStr(script));

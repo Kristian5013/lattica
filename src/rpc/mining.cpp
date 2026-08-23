@@ -39,6 +39,7 @@
 #include <rpc/server.h>
 #include <rpc/server_util.h>
 #include <rpc/util.h>
+#include <script/descriptor.h>
 #include <script/script.h>
 #include <script/signingprovider.h>
 #include <serialize.h>
@@ -209,7 +210,78 @@ static UniValue generateBlocks(ChainstateManager& chainman, Mining& miner, const
     return blockHashes;
 }
 
+static bool getScriptFromDescriptor(std::string_view descriptor, CScript& script, std::string& error)
+{
+    FlatSigningProvider key_provider;
+    const auto descs = Parse(descriptor, key_provider, error, /* require_checksum = */ false);
+    if (descs.empty()) return false;
+    if (descs.size() > 1) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Multipath descriptor not accepted");
+    }
+    const auto& desc = descs.at(0);
+    if (desc->IsRange()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?");
+    }
 
+    FlatSigningProvider provider;
+    std::vector<CScript> scripts;
+    if (!desc->Expand(0, key_provider, scripts, provider)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Cannot derive script without private keys");
+    }
+
+    // Combo descriptors can have 2 or 4 scripts, so we can't just check scripts.size() == 1
+    CHECK_NONFATAL(scripts.size() > 0 && scripts.size() <= 4);
+
+    if (scripts.size() == 1) {
+        script = scripts.at(0);
+    } else if (scripts.size() == 4) {
+        // For uncompressed keys, take the 3rd script, since it is p2wpkh
+        script = scripts.at(2);
+    } else {
+        // Else take the 2nd script, since it is p2pkh
+        script = scripts.at(1);
+    }
+
+    return true;
+}
+
+static RPCMethod generatetodescriptor()
+{
+    return RPCMethod{
+        "generatetodescriptor",
+        "Mine to a specified descriptor and return the block hashes.",
+        {
+            {"num_blocks", RPCArg::Type::NUM, RPCArg::Optional::NO, "How many blocks are generated."},
+            {"descriptor", RPCArg::Type::STR, RPCArg::Optional::NO, "The descriptor to send the newly generated bitcoin to."},
+            {"maxtries", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_MAX_TRIES}, "How many iterations to try."},
+        },
+        RPCResult{
+            RPCResult::Type::ARR, "", "hashes of blocks generated",
+            {
+                {RPCResult::Type::STR_HEX, "", "blockhash"},
+            }
+        },
+        RPCExamples{
+            "\nGenerate 11 blocks to mydesc\n" + HelpExampleCli("generatetodescriptor", "11 \"mydesc\"")},
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+{
+    const auto num_blocks{self.Arg<int>("num_blocks")};
+    const auto max_tries{self.Arg<uint64_t>("maxtries")};
+
+    CScript coinbase_output_script;
+    std::string error;
+    if (!getScriptFromDescriptor(self.Arg<std::string_view>("descriptor"), coinbase_output_script, error)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error);
+    }
+
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    Mining& miner = EnsureMining(node);
+    ChainstateManager& chainman = EnsureChainman(node);
+
+    return generateBlocks(chainman, miner, coinbase_output_script, num_blocks, max_tries);
+},
+    };
+}
 
 static RPCMethod generate()
 {
@@ -262,10 +334,10 @@ static RPCMethod generatetoaddress()
 static RPCMethod generateblock()
 {
     return RPCMethod{"generateblock",
-        "Mine a set of ordered transactions to a specified address and return the block hash.\n"
+        "Mine a set of ordered transactions to a specified address or descriptor and return the block hash.\n"
         "Transaction fees are not collected in the block reward.",
         {
-            {"output", RPCArg::Type::STR, RPCArg::Optional::NO, "The address to send the newly generated coins to."},
+            {"output", RPCArg::Type::STR, RPCArg::Optional::NO, "The address or descriptor to send the newly generated bitcoin to."},
             {"transactions", RPCArg::Type::ARR, RPCArg::Optional::NO, "An array of hex strings which are either txids or raw transactions.\n"
                 "Txids must reference transactions currently in the mempool.\n"
                 "All transactions must be valid and in valid order, otherwise the block will be rejected.",
@@ -288,13 +360,18 @@ static RPCMethod generateblock()
         },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
 {
-    // Lattica has no descriptors, so the coinbase target is an address only.
-    const auto address = request.params[0].get_str();
-    const auto destination = DecodeDestination(address, Params());
-    if (!IsValidDestination(destination)) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Error: Invalid address");
+    const auto address_or_descriptor = request.params[0].get_str();
+    CScript coinbase_output_script;
+    std::string error;
+
+    if (!getScriptFromDescriptor(address_or_descriptor, coinbase_output_script, error)) {
+        const auto destination = DecodeDestination(address_or_descriptor, Params());
+        if (!IsValidDestination(destination)) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Error: Invalid address or descriptor");
+        }
+
+        coinbase_output_script = GetScriptForDestination(destination);
     }
-    CScript coinbase_output_script = GetScriptForDestination(destination);
 
     NodeContext& node = EnsureAnyNodeContext(request.context);
     Mining& miner = EnsureMining(node);
@@ -384,7 +461,6 @@ static RPCMethod getmininginfo()
                         {RPCResult::Type::NUM, "pooledtx", "The size of the mempool"},
                         {RPCResult::Type::STR_AMOUNT, "blockmintxfee", "Minimum feerate of packages selected for block inclusion in " + CURRENCY_UNIT + "/kvB"},
                         {RPCResult::Type::STR, "chain", "current network name (" LIST_CHAIN_NAMES ")"},
-                        {RPCResult::Type::STR_HEX, "signet_challenge", /*optional=*/true, "The block challenge (aka. block script), in hexadecimal (only present if the current network is a signet)"},
                         {RPCResult::Type::OBJ, "next", "The next block",
                         {
                             {RPCResult::Type::NUM, "height", "The next height"},
@@ -452,7 +528,8 @@ static RPCMethod prioritisetransaction()
                 {
                     {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The transaction id."},
                     {"dummy", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "API-Compatibility for previous API. Must be zero or null.\n"
-            "                  DEPRECATED. For forward compatibility use named arguments and omit this parameter."},
+            "                  DEPRECATED. For forward compatibility use named arguments and omit this parameter.",
+                        RPCArgOptions{.placeholder = true}},
                     {"fee_delta", RPCArg::Type::NUM, RPCArg::Optional::NO, "The fee value (in satoshis) to add (or subtract, if negative).\n"
             "                  Note, that this value is not a fee rate. It is a value to modify absolute fee of the TX.\n"
             "                  The fee is not actually paid, only the algorithm for selecting transactions into a block\n"
@@ -642,7 +719,6 @@ static RPCMethod getblocktemplate()
                 {RPCResult::Type::NUM_TIME, "curtime", "current timestamp in " + UNIX_EPOCH_TIME + ". Adjusted for the proposed BIP94 timewarp rule."},
                 {RPCResult::Type::STR, "bits", "compressed target of next block"},
                 {RPCResult::Type::NUM, "height", "The height of the next block"},
-                {RPCResult::Type::STR_HEX, "signet_challenge", /*optional=*/true, "Only on signet"},
                 {RPCResult::Type::STR_HEX, "default_witness_commitment", /*optional=*/true, "a valid witness commitment for the unmodified block template"},
             }},
         },
@@ -792,10 +868,6 @@ static RPCMethod getblocktemplate()
 
     const Consensus::Params& consensusParams = chainman.GetParams().GetConsensus();
 
-    // GBT must be called with 'signet' set in the rules for signet chains
-    if (consensusParams.signet_blocks && !setClientRules.contains("signet")) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "getblocktemplate must be called with the signet rule set (call with {\"rules\": [\"segwit\", \"signet\"]})");
-    }
 
     // GBT must be called with 'segwit' set in the rules
     if (!setClientRules.contains("segwit")) {
@@ -902,11 +974,6 @@ static RPCMethod getblocktemplate()
         aRules.push_back("!segwit");
         aRules.push_back("taproot");
     }
-    if (consensusParams.signet_blocks) {
-        // indicate to miner that they must understand signet rules
-        // when attempting to mine with this template
-        aRules.push_back("!signet");
-    }
 
     UniValue vbavailable(UniValue::VOBJ);
     const auto gbtstatus = chainman.m_versionbitscache.GBTStatus(*pindexPrev, consensusParams);
@@ -967,9 +1034,6 @@ static RPCMethod getblocktemplate()
     result.pushKV("bits", strprintf("%08x", block.nBits));
     result.pushKV("height", pindexPrev->nHeight + 1);
 
-    if (consensusParams.signet_blocks) {
-        result.pushKV("signet_challenge", HexStr(consensusParams.signet_challenge));
-    }
 
     if (auto coinbase{block_template->getCoinbaseTx()}; coinbase.required_outputs.size() > 0) {
         CHECK_NONFATAL(coinbase.required_outputs.size() == 1); // Only one output is currently expected
@@ -1008,7 +1072,8 @@ static RPCMethod submitblock()
         "See https://en.bitcoin.it/wiki/BIP_0022 for full specification.\n",
         {
             {"hexdata", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "the hex-encoded block data to submit"},
-            {"dummy", RPCArg::Type::STR, RPCArg::DefaultHint{"ignored"}, "dummy value, for compatibility with BIP22. This value is ignored."},
+            {"dummy", RPCArg::Type::STR, RPCArg::DefaultHint{"ignored"}, "dummy value, for compatibility with BIP22. This value is ignored.",
+                RPCArgOptions{.placeholder = true}},
         },
         {
             RPCResult{"If the block was accepted", RPCResult::Type::NONE, "", ""},
@@ -1103,6 +1168,7 @@ void RegisterMiningRPCCommands(CRPCTable& t)
         {"mining", &submitheader},
 
         {"hidden", &generatetoaddress},
+        {"hidden", &generatetodescriptor},
         {"hidden", &generateblock},
         {"hidden", &generate},
     };

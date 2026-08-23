@@ -13,9 +13,7 @@
 #include <consensus/amount.h>
 #include <consensus/merkle.h>
 #include <consensus/validation.h>
-#ifdef ENABLE_EXTERNAL_SIGNER
 #include <external_signer.h>
-#endif
 #include <httprpc.h>
 #include <index/blockfilterindex.h>
 #include <init.h>
@@ -25,11 +23,7 @@
 #include <interfaces/node.h>
 #include <interfaces/rpc.h>
 #include <interfaces/types.h>
-#include <kernel/chain.h>
 #include <kernel/context.h>
-#include <kernel/mempool_entry.h>
-#include <kernel/mempool_limits.h>
-#include <kernel/mempool_removal_reason.h>
 #include <key.h>
 #include <logging.h>
 #include <mapport.h>
@@ -51,7 +45,7 @@
 #include <node/types.h>
 #include <node/warnings.h>
 #include <policy/feerate.h>
-#include <policy/fees/block_policy_estimator.h>
+#include <policy/fees/estimator_man.h>
 #include <policy/policy.h>
 #include <policy/rbf.h>
 #include <primitives/block.h>
@@ -66,6 +60,8 @@
 #include <univalue.h>
 #include <util/btcsignals.h>
 #include <util/check.h>
+#include <util/expected.h>
+#include <util/fees.h>
 #include <util/result.h>
 #include <util/signalinterrupt.h>
 #include <util/string.h>
@@ -136,6 +132,7 @@ public:
 
         m_context->warnings = std::make_unique<node::Warnings>();
         m_context->kernel = std::make_unique<kernel::Context>();
+        m_context->ecc_context = std::make_unique<ECC_Context>();
         if (!AppInitSanityChecks(*m_context->kernel)) return false;
 
         if (!AppInitLockDirectories()) return false;
@@ -467,6 +464,417 @@ bool FillBlock(const CBlockIndex* index, const FoundBlock& block, UniqueLock<Rec
     return true;
 }
 
+class NotificationsProxy : public CValidationInterface
+{
+public:
+    explicit NotificationsProxy(std::shared_ptr<Chain::Notifications> notifications)
+        : m_notifications(std::move(notifications)) {}
+    virtual ~NotificationsProxy() = default;
+    void TransactionAddedToMempool(const NewMempoolTransactionInfo& tx, uint64_t mempool_sequence) override
+    {
+        m_notifications->transactionAddedToMempool(tx.info.m_tx);
+    }
+    void TransactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason reason, uint64_t mempool_sequence) override
+    {
+        m_notifications->transactionRemovedFromMempool(tx, reason);
+    }
+    void BlockConnected(const ChainstateRole& role, const std::shared_ptr<const CBlock>& block, const CBlockIndex* index) override
+    {
+        m_notifications->blockConnected(role, kernel::MakeBlockInfo(index, block.get()));
+    }
+    void BlockDisconnected(const std::shared_ptr<const CBlock>& block, const CBlockIndex* index) override
+    {
+        m_notifications->blockDisconnected(kernel::MakeBlockInfo(index, block.get()));
+    }
+    void UpdatedBlockTip(const CBlockIndex* index, const CBlockIndex* fork_index, bool is_ibd) override
+    {
+        m_notifications->updatedBlockTip();
+    }
+    void ChainStateFlushed(const ChainstateRole& role, const CBlockLocator& locator) override
+    {
+        m_notifications->chainStateFlushed(role, locator);
+    }
+    std::shared_ptr<Chain::Notifications> m_notifications;
+};
+
+class NotificationsHandlerImpl : public Handler
+{
+public:
+    explicit NotificationsHandlerImpl(ValidationSignals& signals, std::shared_ptr<Chain::Notifications> notifications)
+        : m_signals{signals}, m_proxy{std::make_shared<NotificationsProxy>(std::move(notifications))}
+    {
+        m_signals.RegisterSharedValidationInterface(m_proxy);
+    }
+    ~NotificationsHandlerImpl() override { disconnect(); }
+    void disconnect() override
+    {
+        if (m_proxy) {
+            m_signals.UnregisterSharedValidationInterface(m_proxy);
+            m_proxy.reset();
+        }
+    }
+    ValidationSignals& m_signals;
+    std::shared_ptr<NotificationsProxy> m_proxy;
+};
+
+class RpcHandlerImpl : public Handler
+{
+public:
+    explicit RpcHandlerImpl(const CRPCCommand& command) : m_command(command), m_wrapped_command(&command)
+    {
+        m_command.actor = [this](const JSONRPCRequest& request, UniValue& result, bool last_handler) {
+            if (!m_wrapped_command) return false;
+            try {
+                return m_wrapped_command->actor(request, result, last_handler);
+            } catch (const UniValue& e) {
+                // If this is not the last handler and a wallet not found
+                // exception was thrown, return false so the next handler can
+                // try to handle the request. Otherwise, reraise the exception.
+                if (!last_handler) {
+                    const UniValue& code = e["code"];
+                    if (code.isNum() && code.getInt<int>() == RPC_WALLET_NOT_FOUND) {
+                        return false;
+                    }
+                }
+                throw;
+            }
+        };
+        ::tableRPC.appendCommand(m_command.name, &m_command);
+    }
+
+    void disconnect() final
+    {
+        if (m_wrapped_command) {
+            m_wrapped_command = nullptr;
+            ::tableRPC.removeCommand(m_command.name, &m_command);
+        }
+    }
+
+    ~RpcHandlerImpl() override { disconnect(); }
+
+    CRPCCommand m_command;
+    const CRPCCommand* m_wrapped_command;
+};
+
+class ChainImpl : public Chain
+{
+public:
+    explicit ChainImpl(NodeContext& node) : m_node(node) {}
+    std::optional<int> getHeight() override
+    {
+        const int height{WITH_LOCK(::cs_main, return chainman().ActiveChain().Height())};
+        return height >= 0 ? std::optional{height} : std::nullopt;
+    }
+    uint256 getBlockHash(int height) override
+    {
+        LOCK(::cs_main);
+        return Assert(chainman().ActiveChain()[height])->GetBlockHash();
+    }
+    bool haveBlockOnDisk(int height) override
+    {
+        LOCK(::cs_main);
+        const CBlockIndex* block{chainman().ActiveChain()[height]};
+        return block && ((block->nStatus & BLOCK_HAVE_DATA) != 0) && block->nTx > 0;
+    }
+    std::optional<int> findLocatorFork(const CBlockLocator& locator) override
+    {
+        LOCK(::cs_main);
+        if (const CBlockIndex* fork = chainman().ActiveChainstate().FindForkInGlobalIndex(locator)) {
+            return fork->nHeight;
+        }
+        return std::nullopt;
+    }
+    bool hasBlockFilterIndex(BlockFilterType filter_type) override
+    {
+        return GetBlockFilterIndex(filter_type) != nullptr;
+    }
+    std::optional<bool> blockFilterMatchesAny(BlockFilterType filter_type, const uint256& block_hash, const GCSFilter::ElementSet& filter_set) override
+    {
+        const BlockFilterIndex* block_filter_index{GetBlockFilterIndex(filter_type)};
+        if (!block_filter_index) return std::nullopt;
+
+        BlockFilter filter;
+        const CBlockIndex* index{WITH_LOCK(::cs_main, return chainman().m_blockman.LookupBlockIndex(block_hash))};
+        if (index == nullptr || !block_filter_index->LookupFilter(index, filter)) return std::nullopt;
+        return filter.GetFilter().MatchAny(filter_set);
+    }
+    bool findBlock(const uint256& hash, const FoundBlock& block) override
+    {
+        WAIT_LOCK(cs_main, lock);
+        return FillBlock(chainman().m_blockman.LookupBlockIndex(hash), block, lock, chainman().ActiveChain(), chainman().m_blockman);
+    }
+    bool findFirstBlockWithTimeAndHeight(int64_t min_time, int min_height, const FoundBlock& block) override
+    {
+        WAIT_LOCK(cs_main, lock);
+        const CChain& active = chainman().ActiveChain();
+        return FillBlock(active.FindEarliestAtLeast(min_time, min_height), block, lock, active, chainman().m_blockman);
+    }
+    bool findAncestorByHeight(const uint256& block_hash, int ancestor_height, const FoundBlock& ancestor_out) override
+    {
+        WAIT_LOCK(cs_main, lock);
+        const CChain& active = chainman().ActiveChain();
+        if (const CBlockIndex* block = chainman().m_blockman.LookupBlockIndex(block_hash)) {
+            if (const CBlockIndex* ancestor = block->GetAncestor(ancestor_height)) {
+                return FillBlock(ancestor, ancestor_out, lock, active, chainman().m_blockman);
+            }
+        }
+        return FillBlock(nullptr, ancestor_out, lock, active, chainman().m_blockman);
+    }
+    bool findAncestorByHash(const uint256& block_hash, const uint256& ancestor_hash, const FoundBlock& ancestor_out) override
+    {
+        WAIT_LOCK(cs_main, lock);
+        const CBlockIndex* block = chainman().m_blockman.LookupBlockIndex(block_hash);
+        const CBlockIndex* ancestor = chainman().m_blockman.LookupBlockIndex(ancestor_hash);
+        if (block && ancestor && block->GetAncestor(ancestor->nHeight) != ancestor) ancestor = nullptr;
+        return FillBlock(ancestor, ancestor_out, lock, chainman().ActiveChain(), chainman().m_blockman);
+    }
+    bool findCommonAncestor(const uint256& block_hash1, const uint256& block_hash2, const FoundBlock& ancestor_out, const FoundBlock& block1_out, const FoundBlock& block2_out) override
+    {
+        WAIT_LOCK(cs_main, lock);
+        const CChain& active = chainman().ActiveChain();
+        const CBlockIndex* block1 = chainman().m_blockman.LookupBlockIndex(block_hash1);
+        const CBlockIndex* block2 = chainman().m_blockman.LookupBlockIndex(block_hash2);
+        const CBlockIndex* ancestor = block1 && block2 ? LastCommonAncestor(block1, block2) : nullptr;
+        // Using & instead of && below to avoid short circuiting and leaving
+        // output uninitialized. Cast bool to int to avoid -Wbitwise-instead-of-logical
+        // compiler warnings.
+        return int{FillBlock(ancestor, ancestor_out, lock, active, chainman().m_blockman)} &
+               int{FillBlock(block1, block1_out, lock, active, chainman().m_blockman)} &
+               int{FillBlock(block2, block2_out, lock, active, chainman().m_blockman)};
+    }
+    void findCoins(std::map<COutPoint, Coin>& coins) override { return FindCoins(m_node, coins); }
+    double guessVerificationProgress(const uint256& block_hash) override
+    {
+        LOCK(chainman().GetMutex());
+        return chainman().GuessVerificationProgress(chainman().m_blockman.LookupBlockIndex(block_hash));
+    }
+    bool hasBlocks(const uint256& block_hash, int min_height, std::optional<int> max_height) override
+    {
+        // hasBlocks returns true if all ancestors of block_hash in specified
+        // range have block data (are not pruned), false if any ancestors in
+        // specified range are missing data.
+        //
+        // For simplicity and robustness, min_height and max_height are only
+        // used to limit the range, and passing min_height that's too low or
+        // max_height that's too high will not crash or change the result.
+        LOCK(::cs_main);
+        if (const CBlockIndex* block = chainman().m_blockman.LookupBlockIndex(block_hash)) {
+            if (max_height && block->nHeight >= *max_height) block = block->GetAncestor(*max_height);
+            for (; block->nStatus & BLOCK_HAVE_DATA; block = block->pprev) {
+                // Check pprev to not segfault if min_height is too low
+                if (block->nHeight <= min_height || !block->pprev) return true;
+            }
+        }
+        return false;
+    }
+    RBFTransactionState isRBFOptIn(const CTransaction& tx) override
+    {
+        if (!m_node.mempool) return IsRBFOptInEmptyMempool(tx);
+        LOCK(m_node.mempool->cs);
+        return IsRBFOptIn(tx, *m_node.mempool);
+    }
+    bool isInMempool(const Txid& txid) override
+    {
+        if (!m_node.mempool) return false;
+        return m_node.mempool->exists(txid);
+    }
+    bool hasDescendantsInMempool(const Txid& txid) override
+    {
+        if (!m_node.mempool) return false;
+        return m_node.mempool->HasDescendants(txid);
+    }
+    bool broadcastTransaction(const CTransactionRef& tx,
+        const CAmount& max_tx_fee,
+        TxBroadcast broadcast_method,
+        std::string& err_string) override
+    {
+        const TransactionError err = BroadcastTransaction(m_node, tx, err_string, max_tx_fee, broadcast_method, /*wait_callback=*/false);
+        // Chain clients only care about failures to accept the tx to the mempool. Disregard non-mempool related failures.
+        // Note: this will need to be updated if BroadcastTransactions() is updated to return other non-mempool failures
+        // that Chain clients do not need to know about.
+        return TransactionError::OK == err;
+    }
+    void getTransactionAncestry(const Txid& txid, size_t& ancestors, size_t& cluster_count, size_t* ancestorsize, CAmount* ancestorfees) override
+    {
+        ancestors = cluster_count = 0;
+        if (!m_node.mempool) return;
+        m_node.mempool->GetTransactionAncestry(txid, ancestors, cluster_count, ancestorsize, ancestorfees);
+    }
+
+    std::map<COutPoint, CAmount> calculateIndividualBumpFees(const std::vector<COutPoint>& outpoints, const CFeeRate& target_feerate) override
+    {
+        if (!m_node.mempool) {
+            std::map<COutPoint, CAmount> bump_fees;
+            for (const auto& outpoint : outpoints) {
+                bump_fees.emplace(outpoint, 0);
+            }
+            return bump_fees;
+        }
+        return MiniMiner(*m_node.mempool, outpoints).CalculateBumpFees(target_feerate);
+    }
+
+    std::optional<CAmount> calculateCombinedBumpFee(const std::vector<COutPoint>& outpoints, const CFeeRate& target_feerate) override
+    {
+        if (!m_node.mempool) {
+            return 0;
+        }
+        return MiniMiner(*m_node.mempool, outpoints).CalculateTotalBumpFees(target_feerate);
+    }
+    void getPackageLimits(unsigned int& limit_ancestor_count, unsigned int& limit_descendant_count) override
+    {
+        const CTxMemPool::Limits default_limits{};
+
+        const CTxMemPool::Limits& limits{m_node.mempool ? m_node.mempool->m_opts.limits : default_limits};
+
+        limit_ancestor_count = limits.ancestor_count;
+        limit_descendant_count = limits.descendant_count;
+    }
+    util::Result<void> checkChainLimits(const CTransactionRef& tx) override
+    {
+        if (!m_node.mempool) return {};
+        if (!m_node.mempool->CheckPolicyLimits(tx)) {
+            return util::Error{Untranslated("too many unconfirmed transactions in cluster")};
+        }
+        return {};
+    }
+    util::Expected<FeeRateEstimation, FeeRateEstimationError> getFeeRateEstimate(int num_blocks, bool conservative) const override
+    {
+        if (!m_node.fee_estimator_man) return EstimationError(FeeRateEstimatorType::NONE, /*returned_target=*/0, /*error=*/{});
+        return m_node.fee_estimator_man->GetFeeRateEstimate(num_blocks, conservative);
+    }
+    unsigned int maximumFeeEstimationTargetBlocks() const override
+    {
+        if (!m_node.fee_estimator_man) return 0;
+        return m_node.fee_estimator_man->MaximumTarget();
+    }
+    CFeeRate mempoolMinFee() override
+    {
+        if (!m_node.mempool) return {};
+        return m_node.mempool->GetMinFee();
+    }
+    CFeeRate relayMinFee() override
+    {
+        if (!m_node.mempool) return CFeeRate{DEFAULT_MIN_RELAY_TX_FEE};
+        return m_node.mempool->m_opts.min_relay_feerate;
+    }
+    CFeeRate relayIncrementalFee() override
+    {
+        if (!m_node.mempool) return CFeeRate{DEFAULT_INCREMENTAL_RELAY_FEE};
+        return m_node.mempool->m_opts.incremental_relay_feerate;
+    }
+    CFeeRate relayDustFee() override
+    {
+        if (!m_node.mempool) return CFeeRate{DUST_RELAY_TX_FEE};
+        return m_node.mempool->m_opts.dust_relay_feerate;
+    }
+    bool havePruned() override
+    {
+        LOCK(::cs_main);
+        return chainman().m_blockman.m_have_pruned;
+    }
+    std::optional<int> getPruneHeight() override
+    {
+        LOCK(chainman().GetMutex());
+        return GetPruneHeight(chainman().m_blockman, chainman().ActiveChain());
+    }
+    bool isReadyToBroadcast() override { return !chainman().m_blockman.LoadingBlocks() && !isInitialBlockDownload(); }
+    bool isInitialBlockDownload() override
+    {
+        return chainman().IsInitialBlockDownload();
+    }
+    bool shutdownRequested() override { return ShutdownRequested(m_node); }
+    void initMessage(const std::string& message) override { ::uiInterface.InitMessage(message); }
+    void initWarning(const bilingual_str& message) override { InitWarning(message); }
+    void initError(const bilingual_str& message) override { InitError(message); }
+    void showProgress(const std::string& title, int progress, bool resume_possible) override
+    {
+        ::uiInterface.ShowProgress(title, progress, resume_possible);
+    }
+    std::unique_ptr<Handler> handleNotifications(std::shared_ptr<Notifications> notifications) override
+    {
+        return std::make_unique<NotificationsHandlerImpl>(validation_signals(), std::move(notifications));
+    }
+    void waitForNotificationsIfTipChanged(const uint256& old_tip) override
+    {
+        if (!old_tip.IsNull() && old_tip == WITH_LOCK(::cs_main, return chainman().ActiveChain().Tip()->GetBlockHash())) return;
+        validation_signals().SyncWithValidationInterfaceQueue();
+    }
+    void waitForNotifications() override
+    {
+        validation_signals().SyncWithValidationInterfaceQueue();
+    }
+    std::unique_ptr<Handler> handleRpc(const CRPCCommand& command) override
+    {
+        return std::make_unique<RpcHandlerImpl>(command);
+    }
+    bool rpcEnableDeprecated(const std::string& method) override { return IsDeprecatedRPCEnabled(method); }
+    common::SettingsValue getSetting(const std::string& name) override
+    {
+        return args().GetSetting(name);
+    }
+    std::vector<common::SettingsValue> getSettingsList(const std::string& name) override
+    {
+        return args().GetSettingsList(name);
+    }
+    common::SettingsValue getRwSetting(const std::string& name) override
+    {
+        common::SettingsValue result;
+        args().LockSettings([&](const common::Settings& settings) {
+            if (const common::SettingsValue* value = common::FindKey(settings.rw_settings, name)) {
+                result = *value;
+            }
+        });
+        return result;
+    }
+    bool updateRwSetting(const std::string& name,
+                         const interfaces::SettingsUpdate& update_settings_func) override
+    {
+        std::optional<interfaces::SettingsAction> action;
+        args().LockSettings([&](common::Settings& settings) {
+            if (auto* value = common::FindKey(settings.rw_settings, name)) {
+                action = update_settings_func(*value);
+                if (value->isNull()) settings.rw_settings.erase(name);
+            } else {
+                UniValue new_value;
+                action = update_settings_func(new_value);
+                if (!new_value.isNull()) settings.rw_settings[name] = std::move(new_value);
+            }
+        });
+        if (!action) return false;
+        // Now dump value to disk if requested
+        return *action != interfaces::SettingsAction::WRITE || args().WriteSettingsFile();
+    }
+    bool overwriteRwSetting(const std::string& name, common::SettingsValue value, interfaces::SettingsAction action) override
+    {
+        return updateRwSetting(name, [&](common::SettingsValue& settings) {
+            settings = std::move(value);
+            return action;
+        });
+    }
+    bool deleteRwSettings(const std::string& name, interfaces::SettingsAction action) override
+    {
+        return overwriteRwSetting(name, {}, action);
+    }
+    void requestMempoolTransactions(Notifications& notifications) override
+    {
+        if (!m_node.mempool) return;
+        LOCK2(::cs_main, m_node.mempool->cs);
+        for (const CTxMemPoolEntry& entry : m_node.mempool->entryAll()) {
+            notifications.transactionAddedToMempool(entry.GetSharedTx());
+        }
+    }
+    bool hasAssumedValidChain() override
+    {
+        LOCK(::cs_main);
+        return bool{chainman().CurrentChainstate().m_from_snapshot_blockhash};
+    }
+
+    NodeContext* context() override { return &m_node; }
+    ArgsManager& args() { return *Assert(m_node.args); }
+    ChainstateManager& chainman() { return *Assert(m_node.chainman); }
+    ValidationSignals& validation_signals() { return *Assert(m_node.validation_signals); }
+    NodeContext& m_node;
+};
 
 class BlockTemplateImpl : public BlockTemplate
 {
@@ -510,12 +918,11 @@ public:
         return TransactionMerklePath(m_block_template->block, 0);
     }
 
-    bool submitSolution(uint32_t version, uint32_t timestamp, uint32_t nonce, CTransactionRef coinbase) override
+    bool submitSolution(uint32_t version, uint32_t timestamp, uint32_t nonce, CTransactionRef coinbase, std::string& reason, std::string& debug) override
     {
+        if (!coinbase) return false;
         AddMerkleRootAndCoinbase(m_block_template->block, std::move(coinbase), version, timestamp, nonce);
-        std::string reason;
-        std::string debug;
-        return SubmitBlock(chainman(), std::make_shared<const CBlock>(m_block_template->block), /*new_block=*/nullptr, reason, debug);
+        return SubmitBlock(chainman(), std::make_shared<const CBlock>(m_block_template->block), reason, debug);
     }
 
     std::unique_ptr<BlockTemplate> waitNext(BlockWaitOptions options) override
@@ -545,7 +952,6 @@ public:
     KernelNotifications& notifications() { return *Assert(m_node.notifications); }
     const NodeContext& m_node;
 };
-
 
 class MinerImpl : public Mining
 {
@@ -619,13 +1025,33 @@ public:
 
     bool submitBlock(const CBlock& block_in, std::string& reason, std::string& debug) override
     {
-        auto block = std::make_shared<const CBlock>(block_in);
-        bool new_block;
-        const bool accepted = SubmitBlock(chainman(), block, &new_block, reason, debug);
-        // ProcessNewBlock() can accept and store a block before it is checked
-        // for validity. Treat duplicates as errors for mining clients, and only
-        // return success when validation completed without setting a reason.
-        return accepted && new_block && reason.empty();
+        return SubmitBlock(chainman(), std::make_shared<const CBlock>(block_in), reason, debug);
+    }
+
+    std::vector<CTransactionRef> getTransactionsByTxID(const std::vector<Txid>& txids) override
+    {
+        if (!m_node.mempool) return {};
+
+        std::vector<CTransactionRef> results;
+        results.reserve(txids.size());
+        LOCK(m_node.mempool->cs);
+        for (const auto& txid : txids) {
+            results.emplace_back(m_node.mempool->get(txid));
+        }
+        return results;
+    }
+
+    std::vector<CTransactionRef> getTransactionsByWitnessID(const std::vector<Wtxid>& wtxids) override
+    {
+        if (!m_node.mempool) return {};
+
+        std::vector<CTransactionRef> results;
+        results.reserve(wtxids.size());
+        LOCK(m_node.mempool->cs);
+        for (const auto& wtxid : wtxids) {
+            results.emplace_back(m_node.mempool->get(wtxid));
+        }
+        return results;
     }
 
     const NodeContext* context() override { return &m_node; }
@@ -653,13 +1079,12 @@ public:
 
     NodeContext& m_node;
 };
-
 } // namespace
 } // namespace node
 
 namespace interfaces {
 std::unique_ptr<Node> MakeNode(node::NodeContext& context) { return std::make_unique<node::NodeImpl>(context); }
-std::unique_ptr<Rpc> MakeRpc(node::NodeContext& context) { return std::make_unique<node::RpcImpl>(context); }
+std::unique_ptr<Chain> MakeChain(node::NodeContext& context) { return std::make_unique<node::ChainImpl>(context); }
 std::unique_ptr<Mining> MakeMining(const node::NodeContext& context, bool wait_loaded)
 {
     if (wait_loaded) {
@@ -673,404 +1098,5 @@ std::unique_ptr<Mining> MakeMining(const node::NodeContext& context, bool wait_l
     }
     return std::make_unique<node::MinerImpl>(context);
 }
-} // namespace interfaces
-
-// ===========================================================================
-// interfaces::Chain — the wallet-facing chain/mempool/notification adapter.
-// (Was src/interfaces/chain.cpp; Core keeps this in node/interfaces.cpp.)
-// ===========================================================================
-namespace interfaces {
-namespace {
-
-//! Bridge from the validation signal bus to a client's Chain::Notifications.
-class NotificationsProxy final : public CValidationInterface
-{
-public:
-    explicit NotificationsProxy(std::shared_ptr<Chain::Notifications> notifications)
-        : m_notifications(std::move(notifications)) {}
-    virtual ~NotificationsProxy() = default;
-
-    void TransactionAddedToMempool(const NewMempoolTransactionInfo& tx, uint64_t /*mempool_sequence*/) override
-    {
-        m_notifications->transactionAddedToMempool(tx.info.m_tx);
-    }
-    void TransactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason reason, uint64_t /*mempool_sequence*/) override
-    {
-        m_notifications->transactionRemovedFromMempool(tx, reason);
-    }
-    void BlockConnected(const kernel::ChainstateRole& role, const std::shared_ptr<const CBlock>& block, const CBlockIndex* index) override
-    {
-        m_notifications->blockConnected(role, kernel::MakeBlockInfo(index, block.get()));
-    }
-    void BlockDisconnected(const std::shared_ptr<const CBlock>& block, const CBlockIndex* index) override
-    {
-        m_notifications->blockDisconnected(kernel::MakeBlockInfo(index, block.get()));
-    }
-    void UpdatedBlockTip(const CBlockIndex* /*new_tip*/, const CBlockIndex* /*fork*/, bool /*initial_download*/) override
-    {
-        m_notifications->updatedBlockTip();
-    }
-    void ChainStateFlushed(const kernel::ChainstateRole& role, const CBlockLocator& locator) override
-    {
-        m_notifications->chainStateFlushed(role, locator);
-    }
-
-    std::shared_ptr<Chain::Notifications> m_notifications;
-};
-
-//! RPC command handler: registers the command with the global RPC table on
-//! construction and removes it on disconnect. Lets a chain client (the wallet)
-//! add RPCs to the node's RPC server (ported from Core's node/interfaces.cpp).
-class RpcHandlerImpl : public Handler
-{
-public:
-    explicit RpcHandlerImpl(const CRPCCommand& command) : m_command(command), m_wrapped_command(&command)
-    {
-        m_command.actor = [this](const JSONRPCRequest& request, UniValue& result, bool last_handler) {
-            if (!m_wrapped_command) return false;
-            try {
-                return m_wrapped_command->actor(request, result, last_handler);
-            } catch (const UniValue& e) {
-                // If this is not the last handler and a wallet not found
-                // exception was thrown, return false so the next handler can
-                // try to handle the request. Otherwise, reraise the exception.
-                if (!last_handler) {
-                    const UniValue& code = e["code"];
-                    if (code.isNum() && code.getInt<int>() == RPC_WALLET_NOT_FOUND) {
-                        return false;
-                    }
-                }
-                throw;
-            }
-        };
-        ::tableRPC.appendCommand(m_command.name, &m_command);
-    }
-
-    void disconnect() final
-    {
-        if (m_wrapped_command) {
-            m_wrapped_command = nullptr;
-            ::tableRPC.removeCommand(m_command.name, &m_command);
-        }
-    }
-
-    ~RpcHandlerImpl() override { disconnect(); }
-
-    CRPCCommand m_command;
-    const CRPCCommand* m_wrapped_command;
-};
-
-class ChainImpl final : public Chain
-{
-public:
-    ChainImpl(ChainstateManager& chainman, CTxMemPool& mempool, ValidationSignals& signals, CBlockPolicyEstimator* fee_estimator)
-        : m_chainman_explicit(&chainman), m_mempool_explicit(&mempool), m_signals_explicit(&signals), m_fee_estimator_explicit(fee_estimator) {}
-    explicit ChainImpl(node::NodeContext& node) : m_node(&node) {}
-
-    //! Fill a FoundBlock from a block index. Assumes ::cs_main is held (it reads
-    //! the active chain and may read block data from disk).
-    bool FillBlock(const CBlockIndex* index, const FoundBlock& block) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
-    {
-        if (!index) return false;
-        const CChain& active = chainman().ActiveChain();
-        if (block.m_hash) *block.m_hash = index->GetBlockHash();
-        if (block.m_height) *block.m_height = index->nHeight;
-        if (block.m_time) *block.m_time = index->GetBlockTime();
-        if (block.m_max_time) *block.m_max_time = index->GetBlockTimeMax();
-        if (block.m_mtp_time) *block.m_mtp_time = index->GetMedianTimePast();
-        if (block.m_in_active_chain) *block.m_in_active_chain = active.Contains(*index);
-        if (block.m_locator) *block.m_locator = GetLocator(index);
-        if (block.m_next_block) FillBlock(active.Contains(*index) ? active.Next(*index) : nullptr, *block.m_next_block);
-        if (block.m_data) {
-            if (!chainman().m_blockman.ReadBlock(*block.m_data, *index)) block.m_data->SetNull();
-        }
-        block.found = true;
-        return true;
-    }
-
-    std::optional<int> getHeight() override
-    {
-        LOCK(::cs_main);
-        const int height{chainman().ActiveChain().Height()};
-        if (height >= 0) return height;
-        return std::nullopt;
-    }
-    uint256 getBlockHash(int height) override
-    {
-        LOCK(::cs_main);
-        const CBlockIndex* block{chainman().ActiveChain()[height]};
-        assert(block);
-        return block->GetBlockHash();
-    }
-    bool haveBlockOnDisk(int height) override
-    {
-        LOCK(::cs_main);
-        const CBlockIndex* block{chainman().ActiveChain()[height]};
-        return block && ((block->nStatus & BLOCK_HAVE_DATA) != 0) && block->nTx > 0;
-    }
-    std::optional<int> findLocatorFork(const CBlockLocator& locator) override
-    {
-        LOCK(::cs_main);
-        if (const CBlockIndex* fork = chainman().ActiveChainstate().FindForkInGlobalIndex(locator)) {
-            return fork->nHeight;
-        }
-        return std::nullopt;
-    }
-    bool findBlock(const uint256& hash, const FoundBlock& block) override
-    {
-        LOCK(::cs_main);
-        return FillBlock(chainman().m_blockman.LookupBlockIndex(hash), block);
-    }
-    bool findFirstBlockWithTimeAndHeight(int64_t min_time, int min_height, const FoundBlock& block) override
-    {
-        LOCK(::cs_main);
-        return FillBlock(chainman().ActiveChain().FindEarliestAtLeast(min_time, min_height), block);
-    }
-    bool findAncestorByHeight(const uint256& block_hash, int ancestor_height, const FoundBlock& ancestor_out) override
-    {
-        LOCK(::cs_main);
-        const CBlockIndex* block{chainman().m_blockman.LookupBlockIndex(block_hash)};
-        const CBlockIndex* ancestor{block ? block->GetAncestor(ancestor_height) : nullptr};
-        return FillBlock(ancestor, ancestor_out);
-    }
-    bool findAncestorByHash(const uint256& block_hash, const uint256& ancestor_hash, const FoundBlock& ancestor_out) override
-    {
-        LOCK(::cs_main);
-        const CBlockIndex* block{chainman().m_blockman.LookupBlockIndex(block_hash)};
-        const CBlockIndex* ancestor{chainman().m_blockman.LookupBlockIndex(ancestor_hash)};
-        if (block && ancestor && block->GetAncestor(ancestor->nHeight) != ancestor) ancestor = nullptr;
-        return FillBlock(ancestor, ancestor_out);
-    }
-    bool findCommonAncestor(const uint256& block_hash1, const uint256& block_hash2, const FoundBlock& ancestor_out, const FoundBlock& block1_out, const FoundBlock& block2_out) override
-    {
-        LOCK(::cs_main);
-        const CBlockIndex* block1{chainman().m_blockman.LookupBlockIndex(block_hash1)};
-        const CBlockIndex* block2{chainman().m_blockman.LookupBlockIndex(block_hash2)};
-        const CBlockIndex* ancestor{block1 && block2 ? LastCommonAncestor(block1, block2) : nullptr};
-        // Using & instead of && below to avoid short circuiting and leaving
-        // output uninitialized. Cast bool to int to avoid -Wbitwise-instead-of-logical.
-        return int{FillBlock(ancestor, ancestor_out)} & int{FillBlock(block1, block1_out)} & int{FillBlock(block2, block2_out)};
-    }
-    void findCoins(std::map<COutPoint, Coin>& coins) override
-    {
-        LOCK2(::cs_main, mempool().cs);
-        CCoinsViewCache& chain_view{chainman().ActiveChainstate().CoinsTip()};
-        CCoinsViewMemPool mempool_view{&chain_view, mempool()};
-        for (auto& [outpoint, coin] : coins) {
-            if (auto c{mempool_view.GetCoin(outpoint)}) coin = std::move(*c);
-        }
-    }
-    double guessVerificationProgress(const uint256& block_hash) override
-    {
-        LOCK(::cs_main);
-        return chainman().GuessVerificationProgress(chainman().m_blockman.LookupBlockIndex(block_hash));
-    }
-    bool hasBlocks(const uint256& block_hash, int min_height, std::optional<int> max_height) override
-    {
-        LOCK(::cs_main);
-        if (const CBlockIndex* block{chainman().m_blockman.LookupBlockIndex(block_hash)}) {
-            if (max_height && block->nHeight >= *max_height) block = block->GetAncestor(*max_height);
-            for (; block->nStatus & BLOCK_HAVE_DATA; block = block->pprev) {
-                if (block->nHeight <= min_height) return true;
-            }
-        }
-        return false;
-    }
-    bool isInMempool(const Txid& txid) override
-    {
-        LOCK(mempool().cs);
-        return mempool().exists(txid);
-    }
-    bool hasDescendantsInMempool(const Txid& txid) override
-    {
-        LOCK(mempool().cs);
-        const auto it = mempool().GetIter(txid);
-        // GetDescendantCount includes the entry itself, so >1 means it has descendants.
-        return it && mempool().GetDescendantCount(*it) > 1;
-    }
-    bool broadcastTransaction(const CTransactionRef& tx, const CAmount& /*max_tx_fee*/, node::TxBroadcast /*broadcast_method*/, std::string& err_string) override
-    {
-        // Lattica has no P2P relay layer yet, so this only submits to the local
-        // mempool; the unbroadcast set records the txid so a future net layer can
-        // resend. The max_tx_fee gate and the relay/no-relay distinction are not
-        // honored until that layer exists.
-        const MempoolAcceptResult result = chainman().ProcessTransaction(tx, /*test_accept=*/false);
-        if (result.m_result_type != MempoolAcceptResult::ResultType::VALID) {
-            err_string = result.m_state.ToString();
-            return false;
-        }
-        {
-            LOCK(mempool().cs);
-            mempool().AddUnbroadcastTx(tx->GetHash());
-        }
-        return true;
-    }
-    CFeeRate mempoolMinFee() override { return mempool().GetMinFee(); }
-    CFeeRate relayMinFee() override { return CFeeRate{DEFAULT_MIN_RELAY_TX_FEE}; }
-    CFeeRate relayIncrementalFee() override { return CFeeRate{DEFAULT_INCREMENTAL_RELAY_FEE}; }
-    CFeeRate relayDustFee() override { return CFeeRate{DUST_RELAY_TX_FEE}; }
-    CFeeRate estimateSmartFee(int num_blocks, bool conservative, FeeCalculation* calc) override
-    {
-        if (!fee_estimator()) return {};
-        return fee_estimator()->estimateSmartFee(num_blocks, calc, conservative);
-    }
-    unsigned int estimateMaxBlocks() override
-    {
-        if (!fee_estimator()) return 0;
-        return fee_estimator()->HighestTargetTracked(FeeEstimateHorizon::LONG_HALFLIFE);
-    }
-    void getTransactionAncestry(const Txid& txid, size_t& ancestors, size_t& cluster_count, size_t* ancestorsize, CAmount* ancestorfees) override
-    {
-        ancestors = cluster_count = 0;
-        mempool().GetTransactionAncestry(txid, ancestors, cluster_count, ancestorsize, ancestorfees);
-    }
-    void getPackageLimits(unsigned int& limit_ancestor_count, unsigned int& limit_descendant_count) override
-    {
-        const kernel::MemPoolLimits& limits{mempool().m_opts.limits};
-        limit_ancestor_count = limits.ancestor_count;
-        limit_descendant_count = limits.descendant_count;
-    }
-    util::Result<void> checkChainLimits(const CTransactionRef& tx) override
-    {
-        if (!mempool().CheckPolicyLimits(tx)) {
-            return util::Error{Untranslated("too many unconfirmed transactions in cluster")};
-        }
-        return {};
-    }
-    std::map<COutPoint, CAmount> calculateIndividualBumpFees(const std::vector<COutPoint>& outpoints, const CFeeRate& target_feerate) override
-    {
-        return node::MiniMiner(mempool(), outpoints).CalculateBumpFees(target_feerate);
-    }
-    std::optional<CAmount> calculateCombinedBumpFee(const std::vector<COutPoint>& outpoints, const CFeeRate& target_feerate) override
-    {
-        return node::MiniMiner(mempool(), outpoints).CalculateTotalBumpFees(target_feerate);
-    }
-    bool havePruned() override
-    {
-        LOCK(::cs_main);
-        return chainman().m_blockman.m_have_pruned;
-    }
-    std::optional<int> getPruneHeight() override
-    {
-        // Pruning is not enabled in Lattica yet; there is no prune height to report.
-        return std::nullopt;
-    }
-    bool isReadyToBroadcast() override
-    {
-        // Without a net layer there is no "have peers" check; gate only on IBD.
-        return !chainman().IsInitialBlockDownload();
-    }
-    bool isInitialBlockDownload() override { return chainman().IsInitialBlockDownload(); }
-    bool shutdownRequested() override { return false; } // no shutdown subsystem wired
-    void initMessage(const std::string& message) override { LogInfo("init message: %s", message); }
-    void initWarning(const bilingual_str& message) override { LogWarning("%s", message.original); }
-    void initError(const bilingual_str& message) override { LogError("%s", message.original); }
-    void showProgress(const std::string& /*title*/, int /*progress*/, bool /*resume_possible*/) override {}
-    std::unique_ptr<Handler> handleNotifications(std::shared_ptr<Notifications> notifications) override
-    {
-        auto proxy{std::make_shared<NotificationsProxy>(std::move(notifications))};
-        signals().RegisterSharedValidationInterface(proxy);
-        ValidationSignals& sigs{signals()};
-        return MakeCleanupHandler([&sigs, proxy] { sigs.UnregisterSharedValidationInterface(proxy); });
-    }
-    std::unique_ptr<Handler> handleRpc(const CRPCCommand& command) override
-    {
-        return std::make_unique<RpcHandlerImpl>(command);
-    }
-    common::SettingsValue getSetting(const std::string& name) override
-    {
-        return args().GetSetting(name);
-    }
-    std::vector<common::SettingsValue> getSettingsList(const std::string& name) override
-    {
-        return args().GetSettingsList(name);
-    }
-    common::SettingsValue getRwSetting(const std::string& name) override
-    {
-        common::SettingsValue result;
-        args().LockSettings([&](const common::Settings& settings) {
-            if (const common::SettingsValue* value = common::FindKey(settings.rw_settings, name)) {
-                result = *value;
-            }
-        });
-        return result;
-    }
-    bool updateRwSetting(const std::string& name, const SettingsUpdate& update_settings_func) override
-    {
-        std::optional<SettingsAction> action;
-        args().LockSettings([&](common::Settings& settings) {
-            if (auto* value = common::FindKey(settings.rw_settings, name)) {
-                action = update_settings_func(*value);
-                if (value->isNull()) settings.rw_settings.erase(name);
-            } else {
-                UniValue new_value;
-                action = update_settings_func(new_value);
-                if (!new_value.isNull()) settings.rw_settings[name] = std::move(new_value);
-            }
-        });
-        if (!action) return false;
-        // Now dump value to disk if requested
-        return *action != SettingsAction::WRITE || args().WriteSettingsFile();
-    }
-    bool overwriteRwSetting(const std::string& name, common::SettingsValue value, SettingsAction action) override
-    {
-        return updateRwSetting(name, [&](common::SettingsValue& settings) {
-            settings = std::move(value);
-            return action;
-        });
-    }
-    bool deleteRwSettings(const std::string& name, SettingsAction action) override
-    {
-        return overwriteRwSetting(name, {}, action);
-    }
-    void waitForNotificationsIfTipChanged(const uint256& old_tip) override
-    {
-        if (!old_tip.IsNull()) {
-            LOCK(::cs_main);
-            const CBlockIndex* tip{chainman().ActiveTip()};
-            if (tip && tip->GetBlockHash() == old_tip) return;
-        }
-        waitForNotifications();
-    }
-    void waitForNotifications() override { signals().SyncWithValidationInterfaceQueue(); }
-    void requestMempoolTransactions(Notifications& notifications) override
-    {
-        for (const TxMempoolInfo& info : mempool().infoAll()) {
-            notifications.transactionAddedToMempool(info.tx);
-        }
-    }
-    bool hasAssumedValidChain() override { return false; } // assumeutxo not enabled in Lattica
-
-    node::NodeContext* context() override { return m_node; }
-
-    // A node-backed Chain is created during init before chainman/mempool/signals
-    // exist, so resolve them lazily from the NodeContext; the explicit-pieces ctor
-    // binds them up front instead.
-    ChainstateManager& chainman() const { return m_node ? *Assert(m_node->chainman) : *Assert(m_chainman_explicit); }
-    CTxMemPool& mempool() const { return m_node ? *Assert(m_node->mempool) : *Assert(m_mempool_explicit); }
-    ValidationSignals& signals() const { return m_node ? *Assert(m_node->validation_signals) : *Assert(m_signals_explicit); }
-    CBlockPolicyEstimator* fee_estimator() const { return m_node ? m_node->fee_estimator.get() : m_fee_estimator_explicit; }
-    //! The settings methods are only reachable through the node-backed Chain (the
-    //! wallet's), which always has a NodeContext and thus an ArgsManager.
-    ArgsManager& args() const { return *Assert(Assert(m_node)->args); }
-
-    node::NodeContext* m_node{nullptr};
-    ChainstateManager* m_chainman_explicit{nullptr};
-    CTxMemPool* m_mempool_explicit{nullptr};
-    ValidationSignals* m_signals_explicit{nullptr};
-    CBlockPolicyEstimator* m_fee_estimator_explicit{nullptr};
-};
-
-} // namespace
-
-std::unique_ptr<Chain> MakeChain(ChainstateManager& chainman, CTxMemPool& mempool, ValidationSignals& signals, CBlockPolicyEstimator* fee_estimator)
-{
-    return std::make_unique<ChainImpl>(chainman, mempool, signals, fee_estimator);
-}
-
-std::unique_ptr<Chain> MakeChain(node::NodeContext& node)
-{
-    return std::make_unique<ChainImpl>(node);
-}
-
+std::unique_ptr<Rpc> MakeRpc(node::NodeContext& context) { return std::make_unique<node::RpcImpl>(context); }
 } // namespace interfaces

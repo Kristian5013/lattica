@@ -11,11 +11,14 @@
 #include <util/byte_units.h>
 #include <util/check.h>
 #include <util/fs.h>
+#include <util/obfuscation.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -23,9 +26,9 @@ namespace leveldb {
 class Env;
 } // namespace leveldb
 
-static const size_t DBWRAPPER_PREALLOC_KEY_SIZE = 64;
-static const size_t DBWRAPPER_PREALLOC_VALUE_SIZE = 1024;
-static const size_t DBWRAPPER_MAX_FILE_SIZE{32_MiB};
+inline constexpr size_t DBWRAPPER_PREALLOC_KEY_SIZE = 64;
+inline constexpr size_t DBWRAPPER_PREALLOC_VALUE_SIZE = 1024;
+inline constexpr size_t DBWRAPPER_MAX_FILE_SIZE{32_MiB};
 
 //! User-controlled performance and debug options.
 struct DBOptions {
@@ -38,7 +41,7 @@ struct DBParams {
     //! Location in the filesystem where leveldb data will be stored.
     fs::path path;
     //! Configures various leveldb cache settings.
-    size_t cache_bytes;
+    uint64_t cache_bytes;
     //! If true, use leveldb's memory environment.
     bool memory_only = false;
     //! If true, remove all existing data.
@@ -46,6 +49,8 @@ struct DBParams {
     //! If true, store data obfuscated via simple XOR. If false, XOR with a
     //! zero'd byte array.
     bool obfuscate = false;
+    //! If true, build a LevelDB bloom filter to accelerate point lookups.
+    bool bloom_filter = true;
     //! Passed-through options.
     DBOptions options{};
     //! If non-null, use this as the leveldb::Env instead of the default.
@@ -260,6 +265,9 @@ public:
     //! Perform a blocking full compaction of the underlying LevelDB.
     void CompactFull();
 
+    //! Return a LevelDB property value, if available.
+    std::optional<std::string> GetProperty(const std::string& property) const;
+
     // Get an estimate of LevelDB memory usage (in bytes).
     size_t DynamicMemoryUsage() const;
 
@@ -269,6 +277,11 @@ public:
      * Return true if the database managed by this class contains no entries.
      */
     bool IsEmpty();
+
+    //! Probe an unopened database for a key prefix. Return true if a database at
+    //! path exists and contains at least 1 entry beginning with prefix; missing
+    //! or empty databases return false, and database errors throw dbwrapper_error.
+    static bool HasKeyStartingWith(const fs::path& path, uint8_t prefix);
 
     template<typename K>
     size_t EstimateSize(const K& key_begin, const K& key_end) const

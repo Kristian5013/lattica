@@ -44,72 +44,125 @@ TRACEPOINT_SEMAPHORE(coin_selection, aps_create_tx_internal);
 namespace wallet {
 static constexpr size_t OUTPUT_GROUP_MAX_ENTRIES{100};
 
-// Lattica spends are witness-only P2WPKH with ML-DSA-44 signatures: every input
-// carries a fixed two-item witness stack { signature, pubkey }. The witness signature
-// is the ML-DSA signature followed by the one-byte sighash flag; the pubkey is the
-// scheme's own 1312 bytes, with nothing in front of it. With
-// WITNESS_SCALE_FACTOR == 1 there is no witness discount, so size == weight == vsize.
-// Unlike Bitcoin there is no descriptor inference and no signature grinding (ML-DSA
-// signatures are deterministic and fixed length), so every wallet input has the same
-// signed size; only a coin-control weight override (for an externally supplied input
-// of a different shape) can change it.
-
-/** Serialized size (== weight, since WITNESS_SCALE_FACTOR == 1) of a signed
- *  P2WPKH-ML-DSA input: outpoint(36) + empty scriptSig length(1) + sequence(4)
- *  + witness{ stack item count(2), signature, pubkey }. */
-static int64_t MaxP2WPKHInputWeight()
-{
-    const int64_t sig_size = CPubKey::MLDSA44_SIGNATURE_SIZE + 1; // signature || sighash byte
-    const int64_t pubkey_size = CPubKey::MLDSA44_SIZE;
-    const int64_t base = 36 + 1 + 4;
-    const int64_t witness = GetSizeOfCompactSize(2)
-        + GetSizeOfCompactSize(sig_size) + sig_size
-        + GetSizeOfCompactSize(pubkey_size) + pubkey_size;
-    return base + witness;
+/** Whether the descriptor represents, directly or not, a witness program. */
+static bool IsSegwit(const Descriptor& desc) {
+    if (const auto typ = desc.GetOutputType()) return *typ != OutputType::LEGACY;
+    return false;
 }
 
-/** Signed weight of a single input: a coin-control override if one was supplied,
- *  otherwise the uniform P2WPKH-ML-DSA size. */
-static int64_t SignedInputWeight(const COutPoint& outpoint, const CCoinControl* coin_control)
-{
-    if (coin_control) {
-        if (const auto weight = coin_control->GetInputWeight(outpoint)) return *weight;
+/** Whether to assume ECDSA signatures' will be high-r. */
+static bool UseMaxSig(const std::optional<CTxIn>& txin, const CCoinControl* coin_control) {
+    // Use max sig if watch only inputs were used or if this particular input is an external input
+    // to ensure a sufficient fee is attained for the requested feerate.
+    return coin_control && txin && coin_control->IsExternalSelected(txin->prevout);
+}
+
+/** Get the size of an input (in witness units) once it's signed.
+ *
+ * @param desc The output script descriptor of the coin spent by this input.
+ * @param txin Optionally the txin to estimate the size of. Used to determine the size of ECDSA signatures.
+ * @param coin_control Information about the context to determine the size of ECDSA signatures.
+ * @param tx_is_segwit Whether the transaction has at least a single input spending a segwit coin.
+ * @param can_grind_r Whether the signer will be able to grind the R of the signature.
+ */
+static std::optional<int64_t> MaxInputWeight(const Descriptor& desc, const std::optional<CTxIn>& txin,
+                                             const CCoinControl* coin_control, const bool tx_is_segwit,
+                                             const bool can_grind_r) {
+    if (const auto sat_weight = desc.MaxSatisfactionWeight(!can_grind_r || UseMaxSig(txin, coin_control))) {
+        if (const auto elems_count = desc.MaxSatisfactionElems()) {
+            const bool is_segwit = IsSegwit(desc);
+            // Account for the size of the scriptsig and the number of elements on the witness stack. Note
+            // that if any input in the transaction is spending a witness program, we need to specify the
+            // witness stack size for every input regardless of whether it is segwit itself.
+            // NOTE: this also works in case of mixed scriptsig-and-witness such as in p2sh-wrapped segwit v0
+            // outputs. In this case the size of the scriptsig length will always be one (since the redeemScript
+            // is always a push of the witness program in this case, which is smaller than 253 bytes).
+            const int64_t scriptsig_len = is_segwit ? 1 : GetSizeOfCompactSize(*sat_weight / WITNESS_SCALE_FACTOR);
+            const int64_t witstack_len = is_segwit ? GetSizeOfCompactSize(*elems_count) : (tx_is_segwit ? 1 : 0);
+            // previous txid + previous vout + sequence + scriptsig len + witstack size + scriptsig or witness
+            // NOTE: sat_weight already accounts for the witness discount accordingly.
+            return (32 + 4 + 4 + scriptsig_len) * WITNESS_SCALE_FACTOR + witstack_len + *sat_weight;
+        }
     }
-    return MaxP2WPKHInputWeight();
+
+    return {};
 }
 
 int CalculateMaximumSignedInputSize(const CTxOut& txout, const COutPoint outpoint, const SigningProvider* provider, bool can_grind_r, const CCoinControl* coin_control)
 {
-    // Lattica inputs are uniform P2WPKH-ML-DSA; the solving provider and can_grind_r
-    // are unused here (no descriptor inference, no signature grinding).
-    (void)txout;
-    (void)provider;
-    (void)can_grind_r;
-    return static_cast<int>(GetVirtualTransactionSize(SignedInputWeight(outpoint, coin_control), 0, 0));
+    if (!provider) return -1;
+
+    if (const auto desc = InferDescriptor(txout.scriptPubKey, *provider)) {
+        if (const auto weight = MaxInputWeight(*desc, CTxIn{outpoint}, coin_control, true, can_grind_r)) {
+            return static_cast<int>(GetVirtualTransactionSize(*weight, 0, 0));
+        }
+    }
+
+    return -1;
 }
 
 int CalculateMaximumSignedInputSize(const CTxOut& txout, const CWallet* wallet, const CCoinControl* coin_control)
 {
-    (void)wallet;
-    return CalculateMaximumSignedInputSize(txout, COutPoint(), /*provider=*/nullptr, /*can_grind_r=*/false, coin_control);
+    const std::unique_ptr<SigningProvider> provider = wallet->GetSolvingProvider(txout.scriptPubKey);
+    return CalculateMaximumSignedInputSize(txout, COutPoint(), provider.get(), wallet->CanGrindR(), coin_control);
+}
+
+/** Infer a descriptor for the given output script. */
+static std::unique_ptr<Descriptor> GetDescriptor(const CWallet* wallet, const CCoinControl* coin_control,
+                                                 const CScript script_pubkey)
+{
+    MultiSigningProvider providers;
+    for (const auto spkman: wallet->GetScriptPubKeyMans(script_pubkey)) {
+        providers.AddProvider(spkman->GetSolvingProvider(script_pubkey));
+    }
+    if (coin_control) {
+        providers.AddProvider(std::make_unique<FlatSigningProvider>(coin_control->m_external_provider));
+    }
+    return InferDescriptor(script_pubkey, providers);
+}
+
+/** Infer the maximum size of this input after it will be signed. */
+static std::optional<int64_t> GetSignedTxinWeight(const CWallet* wallet, const CCoinControl* coin_control,
+                                                  const CTxIn& txin, const CTxOut& txo, const bool tx_is_segwit,
+                                                  const bool can_grind_r)
+{
+    // If weight was provided, use that.
+    std::optional<int64_t> weight;
+    if (coin_control && (weight = coin_control->GetInputWeight(txin.prevout))) {
+        return weight.value();
+    }
+
+    // Otherwise, use the maximum satisfaction size provided by the descriptor.
+    std::unique_ptr<Descriptor> desc{GetDescriptor(wallet, coin_control, txo.scriptPubKey)};
+    if (desc) return MaxInputWeight(*desc, {txin}, coin_control, tx_is_segwit, can_grind_r);
+
+    return {};
 }
 
 // txouts needs to be in the order of tx.vin
 TxSize CalculateMaximumSignedTxSize(const CTransaction &tx, const CWallet *wallet, const std::vector<CTxOut>& txouts, const CCoinControl* coin_control)
 {
-    (void)wallet;
     // version + nLockTime + input count + output count
     int64_t weight = (4 + 4 + GetSizeOfCompactSize(tx.vin.size()) + GetSizeOfCompactSize(tx.vout.size())) * WITNESS_SCALE_FACTOR;
-    // Every Lattica input is a witness (P2WPKH-ML-DSA) input, so any non-empty input
-    // set makes this a segwit transaction carrying the 2-byte marker+flag.
-    if (!txouts.empty()) weight += 2;
+    // Whether any input spends a witness program. Necessary to run before the next loop over the
+    // inputs in order to accurately compute the compactSize length for the witness data per input.
+    bool is_segwit = std::any_of(txouts.begin(), txouts.end(), [&](const CTxOut& txo) {
+        std::unique_ptr<Descriptor> desc{GetDescriptor(wallet, coin_control, txo.scriptPubKey)};
+        if (desc) return IsSegwit(*desc);
+        return false;
+    });
+    // Segwit marker and flag
+    if (is_segwit) weight += 2;
 
     // Add the size of the transaction outputs.
     for (const auto& txo : tx.vout) weight += GetSerializeSize(txo) * WITNESS_SCALE_FACTOR;
 
     // Add the size of the transaction inputs as if they were signed.
-    for (uint32_t i = 0; i < tx.vin.size(); i++) {
-        weight += SignedInputWeight(tx.vin[i].prevout, coin_control);
+    for (uint32_t i = 0; i < txouts.size(); i++) {
+        const auto txin_weight = GetSignedTxinWeight(wallet, coin_control, tx.vin[i], txouts[i], is_segwit, wallet->CanGrindR());
+        if (!txin_weight) return TxSize{-1, -1};
+        assert(*txin_weight > -1);
+        weight += *txin_weight;
     }
 
     // It's ok to use 0 as the number of sigops since we never create any pathological transaction.
@@ -124,8 +177,8 @@ TxSize CalculateMaximumSignedTxSize(const CTransaction &tx, const CWallet *walle
         const auto mi = wallet->mapWallet.find(input.prevout.hash);
         // Can not estimate size without knowing the input details
         if (mi != wallet->mapWallet.end()) {
-            assert(input.prevout.n < mi->second.tx->vout.size());
-            txouts.emplace_back(mi->second.tx->vout.at(input.prevout.n));
+            assert(input.prevout.n < mi->second.GetTx()->vout.size());
+            txouts.emplace_back(mi->second.GetTx()->vout.at(input.prevout.n));
         } else if (coin_control) {
             const auto& txout{coin_control->GetExternalOutput(input.prevout)};
             if (!txout) return TxSize{-1, -1};
@@ -192,7 +245,8 @@ void CoinsResult::Add(OutputType type, const COutput& out)
 static OutputType GetOutputType(TxoutType type, bool is_from_p2sh)
 {
     switch (type) {
-        // Lattica has no Taproot (TxoutType::WITNESS_V1_TAPROOT) output type.
+        case TxoutType::WITNESS_V1_TAPROOT:
+            return OutputType::BECH32M;
         case TxoutType::WITNESS_V0_KEYHASH:
         case TxoutType::WITNESS_V0_SCRIPTHASH:
             if (is_from_p2sh) return OutputType::P2SH_SEGWIT;
@@ -226,10 +280,10 @@ util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoin
             }
             const CWalletTx& parent_tx = txo->GetWalletTx();
             if (wallet.GetTxDepthInMainChain(parent_tx) == 0) {
-                if (parent_tx.tx->version == TRUC_VERSION && coin_control.m_version != TRUC_VERSION) {
+                if (parent_tx.GetTx()->version == TRUC_VERSION && coin_control.m_version != TRUC_VERSION) {
                     return util::Error{strprintf(_("Can't spend unconfirmed version 3 pre-selected input with a version %d tx"), coin_control.m_version)};
-                } else if (coin_control.m_version == TRUC_VERSION && parent_tx.tx->version != TRUC_VERSION) {
-                    return util::Error{strprintf(_("Can't spend unconfirmed version %d pre-selected input with a version 3 tx"), parent_tx.tx->version)};
+                } else if (coin_control.m_version == TRUC_VERSION && parent_tx.GetTx()->version != TRUC_VERSION) {
+                    return util::Error{strprintf(_("Can't spend unconfirmed version %d pre-selected input with a version 3 tx"), parent_tx.GetTx()->version)};
                 }
             }
         } else {
@@ -323,7 +377,7 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             // be a 1-block reorg away from the chain where transactions A and C
             // were accepted to another chain where B, B', and C were all
             // accepted.
-            if (nDepth == 0 && wtx.mapValue.contains("replaces_txid")) {
+            if (nDepth == 0 && wtx.m_replaces_txid) {
                 safeTx = false;
             }
 
@@ -335,22 +389,22 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             // intending to replace A', but potentially resulting in a scenario
             // where A, A', and D could all be accepted (instead of just B and
             // D, or just A and A' like the user would want).
-            if (nDepth == 0 && wtx.mapValue.contains("replaced_by_txid")) {
+            if (nDepth == 0 && wtx.m_replaced_by_txid) {
                 safeTx = false;
             }
 
             if (nDepth == 0 && params.check_version_trucness) {
                 if (coinControl->m_version == TRUC_VERSION) {
-                    if (wtx.tx->version != TRUC_VERSION) continue;
+                    if (wtx.GetTx()->version != TRUC_VERSION) continue;
                     // this unconfirmed v3 transaction already has a child
                     if (wtx.truc_child_in_mempool.has_value()) continue;
 
                     // this unconfirmed v3 transaction has a parent: spending would create a third generation
                     size_t ancestors, unused_cluster_count;
-                    wallet.chain().getTransactionAncestry(wtx.tx->GetHash(), ancestors, unused_cluster_count);
+                    wallet.chain().getTransactionAncestry(wtx.GetTx()->GetHash(), ancestors, unused_cluster_count);
                     if (ancestors > 1) continue;
                 } else {
-                    if (wtx.tx->version == TRUC_VERSION) continue;
+                    if (wtx.GetTx()->version == TRUC_VERSION) continue;
                 }
             }
 
@@ -413,9 +467,9 @@ CoinsResult AvailableCoins(const CWallet& wallet,
 
         auto available_output_type = GetOutputType(type, is_from_p2sh);
         auto available_output = COutput(outpoint, output, nDepth, input_bytes, solvable, tx_safe, wtx.GetTxTime(), tx_from_me, feerate);
-        if (wtx.tx->version == TRUC_VERSION && nDepth == 0 && params.check_version_trucness) {
+        if (wtx.GetTx()->version == TRUC_VERSION && nDepth == 0 && params.check_version_trucness) {
             unconfirmed_truc_coins.emplace_back(available_output_type, available_output);
-            auto [it, _] = truc_txid_by_value.try_emplace(wtx.tx->GetHash(), 0);
+            auto [it, _] = truc_txid_by_value.try_emplace(wtx.GetTx()->GetHash(), 0);
             it->second += output.nValue;
         } else {
             result.Add(available_output_type, available_output);
@@ -471,16 +525,16 @@ const CTxOut& FindNonChangeParentOutput(const CWallet& wallet, const COutPoint& 
     AssertLockHeld(wallet.cs_wallet);
     const CWalletTx* wtx{Assert(wallet.GetWalletTx(outpoint.hash))};
 
-    const CTransaction* ptx = wtx->tx.get();
+    const CTransaction* ptx = wtx->GetTx().get();
     int n = outpoint.n;
     while (OutputIsChange(wallet, ptx->vout[n]) && ptx->vin.size() > 0) {
         const COutPoint& prevout = ptx->vin[0].prevout;
         const CWalletTx* it = wallet.GetWalletTx(prevout.hash);
-        if (!it || it->tx->vout.size() <= prevout.n ||
-            !wallet.IsMine(it->tx->vout[prevout.n])) {
+        if (!it || it->GetTx()->vout.size() <= prevout.n ||
+            !wallet.IsMine(it->GetTx()->vout[prevout.n])) {
             break;
         }
-        ptx = it->tx.get();
+        ptx = it->GetTx().get();
         n = prevout.n;
     }
     return ptx->vout[n];
@@ -741,7 +795,8 @@ util::Result<SelectionResult> ChooseSelectionResult(interfaces::Chain& chain, co
             return util::Error{_("Failed to calculate bump fees, because unconfirmed UTXOs depend on an enormous cluster of unconfirmed transactions.")};
         }
         CAmount bump_fee_overestimate = summed_bump_fees - combined_bump_fee.value();
-        if (bump_fee_overestimate) {
+        // Avoid negative discount if mempool changed between the two bump fee snapshots.
+        if (bump_fee_overestimate > 0) {
             result.SetBumpFeeDiscount(bump_fee_overestimate);
         }
         result.RecalculateWaste(coin_selection_params.min_viable_change, coin_selection_params.m_cost_of_change, coin_selection_params.m_change_fee);
@@ -1026,17 +1081,23 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     }
     // Set the long term feerate estimate to the wallet's consolidate feerate
     coin_selection_params.m_long_term_feerate = wallet.m_consolidate_feerate;
-    // Static vsize overhead + outputs vsize. 4 nVersion, 4 nLocktime, 1 input count, 2 segwit
-    // marker+flag. (Core uses 1 for the marker+flag because at WITNESS_SCALE_FACTOR=4 the two
-    // witness bytes round to ~1 vbyte; Lattica's WITNESS_SCALE_FACTOR=1 counts them in full, so
-    // it must be 2 to match CalculateMaximumSignedTxSize, which adds 2 — otherwise the fee loop
-    // under-estimates by one byte and trips the "Fee needed > fee paid" consistency check.)
+    // Static vsize overhead + outputs vsize. 4 nVersion, 4 nLocktime, 1 input
+    // count, 2 witness overhead (marker and flag).
+    //
+    // Bitcoin writes 10 here rather than 11, because its marker and flag weigh
+    // two weight units, which is half a vbyte, which it rounds up to one. There
+    // is no witness discount on this chain -- a vbyte is a byte -- so the two
+    // cost two, and the estimate was short by exactly one byte of every spend.
+    // Coin selection then funded one byte less than the signed transaction
+    // needed and CreateTransactionInternal rejected its own work as a bug.
+    // Over-counting is harmless (a transaction spending no witness program has
+    // no marker or flag, and pays for two bytes it does not use); under-counting
+    // is fatal, which is why this rounds the way it does.
     coin_selection_params.tx_noinputs_size = 11 + GetSizeOfCompactSize(vecSend.size()); // bytes for output count
 
     CAmount recipients_sum = 0;
-    // Lattica derives change on demand (no keypool / ReserveDestination); the change
-    // type is always witness-v0, but TransactionChangeType is consulted for parity.
-    (void)wallet.TransactionChangeType(coin_control.m_change_type ? *coin_control.m_change_type : wallet.m_default_change_type, vecSend);
+    const OutputType change_type = wallet.TransactionChangeType(coin_control.m_change_type ? *coin_control.m_change_type : wallet.m_default_change_type, vecSend);
+    ReserveDestination reservedest(&wallet, change_type);
     unsigned int outputs_to_subtract_fee_from = 0; // The number of outputs which we are subtracting the fee from
     for (const auto& recipient : vecSend) {
         if (IsDust(recipient, wallet.chain().relayDustFee())) {
@@ -1071,7 +1132,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         // Reserve a new key pair from key pool. If it fails, provide a dummy
         // destination in case we don't need change.
         CTxDestination dest;
-        auto op_dest = wallet.GetNewChangeDestination();
+        auto op_dest = reservedest.GetReservedDestination(true);
         if (!op_dest) {
             error = _("Transaction needs a change address, but we can't generate it.") + Untranslated(" ") + util::ErrorString(op_dest);
         } else {
@@ -1100,8 +1161,8 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     coin_selection_params.m_discard_feerate = GetDiscardRate(wallet);
 
     // Get the fee rate to use effective values in coin selection
-    FeeCalculation feeCalc;
-    coin_selection_params.m_effective_feerate = GetMinimumFeeRate(wallet, coin_control, &feeCalc);
+    auto min_fee_rate{GetMinimumFeeRate(wallet, coin_control)};
+    coin_selection_params.m_effective_feerate = min_fee_rate.fee_rate;
     // Do not, ever, assume that it's fine to change the fee rate if the user has explicitly
     // provided one
     if (coin_control.m_feerate && coin_selection_params.m_effective_feerate > *coin_control.m_feerate) {
@@ -1109,7 +1170,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         auto msg{strprintf(_("Fee rate (%s) is lower than the minimum fee rate setting (%s)."),
             coin_control.m_feerate->ToString(feerate_format),
             coin_selection_params.m_effective_feerate.ToString(feerate_format))};
-        if (feeCalc.reason == FeeReason::REQUIRED) {
+        if (min_fee_rate.fee_reason == FeeReason::REQUIRED) {
             msg += strprintf(_("\nConsider modifying %s (%s) or %s (%s)."),
                 "-mintxfee",
                 wallet.m_min_fee.ToString(feerate_format),
@@ -1118,7 +1179,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         }
         return util::Error{msg};
     }
-    if (feeCalc.reason == FeeReason::FALLBACK && !wallet.m_allow_fallback_fee) {
+    if (min_fee_rate.fee_reason == FeeReason::FALLBACK && !wallet.m_allow_fallback_fee) {
         // eventually allow a fallback fee
         return util::Error{strprintf(_("Fee estimation failed. Fallbackfee is disabled. Wait a few blocks or enable %s."), "-fallbackfee")};
     }
@@ -1378,19 +1439,14 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         }
     }
 
-    // Lattica's GetNewChangeDestination already derived and persisted the change key
-    // (there is no keypool to keep/return), so nothing to do before returning success.
+    // Before we return success, we assume any change key will be used to prevent
+    // accidental reuse.
+    reservedest.KeepDestination();
 
     wallet.WalletLogPrintf("Coin Selection: Algorithm:%s, Waste Metric Score:%d\n", GetAlgorithmName(result.GetAlgo()), result.GetWaste());
-    wallet.WalletLogPrintf("Fee Calculation: Fee:%d Bytes:%u Tgt:%d (requested %d) Reason:\"%s\" Decay %.5f: Estimation: (%g - %g) %.2f%% %.1f/(%.1f %d mem %.1f out) Fail: (%g - %g) %.2f%% %.1f/(%.1f %d mem %.1f out)\n",
-              current_fee, nBytes, feeCalc.returnedTarget, feeCalc.desiredTarget, StringForFeeReason(feeCalc.reason), feeCalc.est.decay,
-              feeCalc.est.pass.start, feeCalc.est.pass.end,
-              (feeCalc.est.pass.totalConfirmed + feeCalc.est.pass.inMempool + feeCalc.est.pass.leftMempool) > 0.0 ? 100 * feeCalc.est.pass.withinTarget / (feeCalc.est.pass.totalConfirmed + feeCalc.est.pass.inMempool + feeCalc.est.pass.leftMempool) : 0.0,
-              feeCalc.est.pass.withinTarget, feeCalc.est.pass.totalConfirmed, feeCalc.est.pass.inMempool, feeCalc.est.pass.leftMempool,
-              feeCalc.est.fail.start, feeCalc.est.fail.end,
-              (feeCalc.est.fail.totalConfirmed + feeCalc.est.fail.inMempool + feeCalc.est.fail.leftMempool) > 0.0 ? 100 * feeCalc.est.fail.withinTarget / (feeCalc.est.fail.totalConfirmed + feeCalc.est.fail.inMempool + feeCalc.est.fail.leftMempool) : 0.0,
-              feeCalc.est.fail.withinTarget, feeCalc.est.fail.totalConfirmed, feeCalc.est.fail.inMempool, feeCalc.est.fail.leftMempool);
-    return CreatedTransactionResult(tx, current_fee, change_pos, feeCalc);
+    wallet.WalletLogPrintf("Fee Calculation: Fee:%d Bytes:%u, Source: %s\n",
+                           current_fee, nBytes, StringForFeeReason(min_fee_rate.fee_reason));
+    return CreatedTransactionResult(tx, current_fee, change_pos, min_fee_rate.fee_reason);
 }
 
 util::Result<CreatedTransactionResult> CreateTransaction(

@@ -10,6 +10,7 @@ add_library(lattica_util STATIC EXCLUDE_FROM_ALL
   check.cpp
   exception.cpp
   feefrac.cpp
+  fees.cpp
   fs.cpp
   fs_helpers.cpp
   hasher.cpp

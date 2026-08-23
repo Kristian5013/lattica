@@ -30,6 +30,8 @@ CScript P2PKH() { CScript s; s << OP_DUP << OP_HASH160 << std::vector<unsigned c
 CScript P2WPKH() { CScript s; s << OP_0 << std::vector<unsigned char>(20, 0xcd); return s; }
 CScript P2SH() { CScript s; s << OP_HASH160 << std::vector<unsigned char>(20, 0xef) << OP_EQUAL; return s; }
 CScript NullData() { CScript s; s << OP_RETURN << std::vector<unsigned char>(8, 0x01); return s; }
+//! A witness v2 key-hash program: the same 20-byte hash under a later version.
+CScript PQPKH() { CScript s; s << OP_2 << std::vector<unsigned char>(20, 0xab); return s; }
 
 } // namespace
 
@@ -84,6 +86,22 @@ int main()
         CFeeRate rate(DUST_RELAY_TX_FEE);
         Check("1-sat output is dust", IsDust(CTxOut(1, P2WPKH()), rate));
         Check("1-coin output not dust", !IsDust(CTxOut(COIN, P2WPKH()), rate));
+
+        // A dust rule asks what an output costs to spend, and a witness v2
+        // output costs a lattice signature and its key -- 1612 bytes for the
+        // cheaper of the two schemes, against witness v0's 148. Bitcoin's
+        // figure describes a curve point and would price a v2 output at a ninth
+        // of what redeeming it costs, so an output too small to ever be worth
+        // spending would relay and settle into the UTXO set for good.
+        const CAmount v0_dust = GetDustThreshold(CTxOut(0, P2WPKH()), rate);
+        const CAmount v2_dust = GetDustThreshold(CTxOut(0, PQPKH()), rate);
+        Check("witness v0 keeps Bitcoin's dust threshold", v0_dust == 537);
+        Check("witness v2 is dust up to what a lattice spend costs", v2_dust == 4929);
+        Check("...which is the ninefold the schemes differ by", v2_dust > 9 * v0_dust);
+        Check("an output worth less than its own redemption is dust",
+              IsDust(CTxOut(v2_dust - 1, PQPKH()), rate) && !IsDust(CTxOut(v2_dust, PQPKH()), rate));
+        Check("...and that same amount is not dust on witness v0",
+              !IsDust(CTxOut(v2_dust - 1, P2WPKH()), rate));
     }
 
     // vsize == serialized bytes (WITNESS_SCALE_FACTOR == 1).

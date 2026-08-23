@@ -992,8 +992,6 @@ bool MemPoolAccept::ReplacementChecks(Workspace& ws)
     const Txid& hash = ws.m_hash;
     TxValidationState& state = ws.m_state;
 
-    CFeeRate newFeeRate(ws.m_modified_fees, ws.m_vsize);
-
     CTxMemPool::setEntries all_conflicts;
 
     // Calculate all conflicting entries and enforce Rule #5.
@@ -2040,8 +2038,8 @@ ValidationCache::ValidationCache(const size_t script_execution_cache_bytes, cons
     // We want the nonce to be 64 bytes long to force the hasher to process
     // this chunk, which makes later hash computations more efficient. We
     // just write our 32-byte entropy twice to fill the 64 bytes.
-    m_script_execution_cache_hasher.Write(std::span<const unsigned char>(nonce.begin(), 32));
-    m_script_execution_cache_hasher.Write(std::span<const unsigned char>(nonce.begin(), 32));
+    m_script_execution_cache_hasher.Write(nonce.begin(), 32);
+    m_script_execution_cache_hasher.Write(nonce.begin(), 32);
 
     const auto [num_elems, approx_size_bytes] = m_script_execution_cache.setup_bytes(script_execution_cache_bytes);
     LogInfo("Using %zu MiB out of %zu MiB requested for script execution cache, able to store %zu elements",
@@ -2085,8 +2083,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
     // properly commits to the scriptPubKey in the inputs view of that
     // transaction).
     uint256 hashCacheEntry;
-    SHA3_256 hasher = validation_cache.ScriptExecutionCacheHasher();
-    hasher.Write(std::span<const unsigned char>(UCharCast(tx.GetWitnessHash().begin()), 32)).Write(std::span<const unsigned char>((unsigned char*)&flags, sizeof(flags))).Finalize(std::span<unsigned char>(hashCacheEntry.begin(), 32));
+    CSHA256 hasher = validation_cache.ScriptExecutionCacheHasher();
+    hasher.Write(UCharCast(tx.GetWitnessHash().begin()), 32).Write((unsigned char*)&flags, sizeof(flags)).Finalize(hashCacheEntry.begin());
     AssertLockHeld(cs_main); //TODO: Remove this requirement by making CuckooCache not require external locks
     if (validation_cache.m_script_execution_cache.contains(hashCacheEntry, !cacheFullScriptStore)) {
         return true;
@@ -2260,14 +2258,23 @@ script_verify_flags GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
 {
     const Consensus::Params& consensusparams = chainman.GetConsensus();
 
-    // Lattica activates P2SH and witness (v0) from genesis; there is no
-    // Taproot (option A) and no ECDSA/DER, so no SCRIPT_VERIFY_TAPROOT/DERSIG.
-    // The script_flag_exceptions map is empty for our networks (no historical
-    // consensus-violating blocks to grandfather in) but is honored for parity.
-    script_verify_flags flags{SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS};
+    // BIP16 didn't become active until Apr 1 2012 (on mainnet, and
+    // retroactively applied to testnet)
+    // However, only one historical block violated the P2SH rules (on both
+    // mainnet and testnet).
+    // Similarly, only one historical block violated the TAPROOT rules on
+    // mainnet.
+    // For simplicity, always leave P2SH+WITNESS+TAPROOT on except for the two
+    // violating blocks.
+    script_verify_flags flags{SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT};
     const auto it{consensusparams.script_flag_exceptions.find(*Assert(block_index.phashBlock))};
     if (it != consensusparams.script_flag_exceptions.end()) {
         flags = it->second;
+    }
+
+    // Enforce the DERSIG (BIP66) rule
+    if (DeploymentActiveAt(block_index, chainman, Consensus::DEPLOYMENT_DERSIG)) {
+        flags |= SCRIPT_VERIFY_DERSIG;
     }
 
     // Enforce CHECKLOCKTIMEVERIFY (BIP65)
@@ -2834,7 +2841,7 @@ bool Chainstate::FlushStateToDisk(
 
         if (!m_chainman.m_interrupt && ShouldCompactChainstate(m_chainman.IsInitialBlockDownload())) {
             try {
-                CoinsDB().CompactFull();
+                CoinsDB().CompactFullAsync();
             } catch (const std::exception& e) {
                 LogWarning("Failed to start chainstate compaction (%s)", e.what());
             }
@@ -3077,14 +3084,19 @@ bool Chainstate::ConnectTip(
              Ticks<MillisecondsDouble>(time_5 - time_4),
              Ticks<SecondsDouble>(m_chainman.time_chainstate),
              Ticks<MillisecondsDouble>(m_chainman.time_chainstate) / m_chainman.num_blocks_total);
-    // Remove conflicting transactions from the mempool.;
+    // Remove conflicting transactions from the mempool.
+    std::vector<RemovedMempoolTransactionInfo> txs_removed_for_block;
     if (m_mempool) {
-        m_mempool->removeForBlock(block_to_connect->vtx, pindexNew->nHeight);
+        txs_removed_for_block = m_mempool->removeForBlock(block_to_connect->vtx);
         disconnectpool.removeForBlock(block_to_connect->vtx);
     }
     // Update m_chain & related variables.
     m_chain.SetTip(*pindexNew);
     m_chainman.UpdateIBDStatus();
+    // Not fired while IBD is active. removeForBlock() above still runs.
+    if (m_mempool && m_chainman.m_options.signals && !m_chainman.IsInitialBlockDownload()) {
+        m_chainman.m_options.signals->MempoolTransactionsRemovedForBlock(block_to_connect, std::move(txs_removed_for_block), pindexNew->nHeight);
+    }
     UpdateTip(pindexNew);
 
     const auto time_6{SteadyClock::now()};
@@ -3824,7 +3836,7 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
         }
     } else {
         if (pindexNew->pprev && pindexNew->pprev->IsValid(BLOCK_VALID_TREE)) {
-            m_blockman.m_blocks_unlinked.insert(std::make_pair(pindexNew->pprev, pindexNew));
+            m_blockman.AddUnlinkedBlock(pindexNew);
         }
     }
 }
@@ -3930,6 +3942,8 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
     // redundant with the call in AcceptBlockHeader.
     if (!CheckBlockHeader(block, state, consensusParams, fCheckPOW))
         return false;
+
+    // Signet only: check block solution
 
     // Check the merkle root.
     if (fCheckMerkleRoot && !CheckMerkleRoot(block, state)) {
@@ -4387,7 +4401,14 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     // the block files may be pruned, so we can just call this on one
     // chainstate (particularly if we haven't implemented pruning with
     // background validation yet).
-    ActiveChainstate().FlushStateToDisk(state, FlushStateMode::NONE);
+    //
+    // Flush errors (e.g. low disk space during pruning) are ignored, so that
+    // callers can't mistreat a flush failure as a block validation failure.
+    // The fatal error notification inside FlushStateToDisk still fires,
+    // so the node will shut down on unrecoverable flush errors regardless.
+    // For state a dummy value is used, and the return value is ignored.
+    BlockValidationState flush_state_ignore;
+    (void)ActiveChainstate().FlushStateToDisk(flush_state_ignore, FlushStateMode::NONE);
 
     CheckBlockIndex();
 
@@ -4926,30 +4947,30 @@ bool ChainstateManager::LoadBlockIndex()
     return true;
 }
 
-bool Chainstate::LoadGenesisBlock()
+bool ChainstateManager::LoadGenesisBlock()
 {
     LOCK(cs_main);
 
-    const CChainParams& params{m_chainman.GetParams()};
+    const CBlock& genesis_block{GetParams().GenesisBlock()};
 
     // Check whether we're already initialized by checking for genesis in
-    // m_blockman.m_block_index. Note that we can't use m_chain here, since it is
+    // m_blockman.m_block_index. Note that we can't use a chainstate's m_chain here, since it is
     // set based on the coins db, not the block index db, which is the only
     // thing loaded at this point.
-    if (m_blockman.m_block_index.contains(params.GenesisBlock().GetHash()))
+    if (m_blockman.m_block_index.contains(genesis_block.GetHash())) {
         return true;
+    }
 
     try {
-        const CBlock& block = params.GenesisBlock();
-        FlatFilePos blockPos{m_blockman.WriteBlock(block, 0)};
+        FlatFilePos blockPos{m_blockman.WriteBlock(genesis_block, 0)};
         if (blockPos.IsNull()) {
-            LogError("%s: writing genesis block to disk failed\n", __func__);
+            LogError("Writing genesis block to disk failed");
             return false;
         }
-        CBlockIndex* pindex = m_blockman.AddToBlockIndex(block, m_chainman.m_best_header);
-        m_chainman.ReceivedBlockTransactions(block, pindex, blockPos);
+        CBlockIndex* pindex{m_blockman.AddToBlockIndex(genesis_block, m_best_header)};
+        ReceivedBlockTransactions(genesis_block, pindex, blockPos);
     } catch (const std::runtime_error& e) {
-        LogError("%s: failed to write genesis block: %s\n", __func__, e.what());
+        LogError("Failed to write genesis block: %s", e.what());
         return false;
     }
 
@@ -5350,13 +5371,12 @@ void ChainstateManager::CheckBlockIndex() const
         // Check whether this block is in m_blocks_unlinked.
         auto rangeUnlinked{m_blockman.m_blocks_unlinked.equal_range(pindex->pprev)};
         bool foundInUnlinked = false;
-        while (rangeUnlinked.first != rangeUnlinked.second) {
-            assert(rangeUnlinked.first->first == pindex->pprev);
-            if (rangeUnlinked.first->second == pindex) {
+        for (auto it = rangeUnlinked.first; it != rangeUnlinked.second; ++it) {
+            assert(it->first == pindex->pprev);
+            if (it->second == pindex) {
+                assert(!foundInUnlinked); // No duplicates in m_blocks_unlinked
                 foundInUnlinked = true;
-                break;
             }
-            rangeUnlinked.first++;
         }
         if (pindex->pprev && (pindex->nStatus & BLOCK_HAVE_DATA) && pindexFirstNeverProcessed != nullptr && pindexFirstInvalid == nullptr) {
             // If this block has block data available, some parent was never received, and has no invalid parents, it must be in m_blocks_unlinked.
@@ -5824,7 +5844,7 @@ util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
                     return util::Error{Untranslated(strprintf("Bad snapshot data after deserializing %d coins - bad tx out value",
                               coins_count - coins_left))};
                 }
-                coins_cache.EmplaceCoinInternalDANGER(std::move(outpoint), std::move(coin));
+                coins_cache.EmplaceCoinInternalDANGER(outpoint, std::move(coin));
 
                 --coins_left;
                 ++coins_processed;
@@ -5897,7 +5917,7 @@ util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
 
     // As above, okay to immediately release cs_main here since no other context knows
     // about the snapshot_chainstate.
-    CCoinsViewDB* snapshot_coinsdb = WITH_LOCK(::cs_main, return &snapshot_chainstate.CoinsDB());
+    const CCoinsViewDB& snapshot_coinsdb = WITH_LOCK(::cs_main, return snapshot_chainstate.CoinsDB());
 
     std::optional<CCoinsStats> maybe_stats;
 
@@ -6038,7 +6058,7 @@ SnapshotCompletionResult ChainstateManager::MaybeValidateSnapshot(Chainstate& va
     try {
         validated_cs_stats = ComputeUTXOStats(
             CoinStatsHashType::HASH_SERIALIZED,
-            &validated_coins_db,
+            validated_coins_db,
             m_blockman,
             [&interrupt = m_interrupt] { SnapshotUTXOHashBreakpoint(interrupt); });
     } catch (StopHashingException const&) {
@@ -6245,7 +6265,7 @@ bool ChainstateManager::DeleteChainstate(Chainstate& chainstate)
     }
     std::unique_ptr<Chainstate> prev_chainstate{Assert(RemoveChainstate(chainstate))};
     Chainstate& curr_chainstate{CurrentChainstate()};
-    assert(prev_chainstate->m_mempool->size() == 0);
+    assert(!prev_chainstate->m_mempool || prev_chainstate->m_mempool->size() == 0);
     assert(!curr_chainstate.m_mempool);
     std::swap(curr_chainstate.m_mempool, prev_chainstate->m_mempool);
     return true;

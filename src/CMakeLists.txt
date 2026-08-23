@@ -82,6 +82,7 @@ add_library(lattica_common STATIC EXCLUDE_FROM_ALL
   common/license_info.cpp
   common/messages.cpp
   common/netif.cpp
+  common/run_command.cpp
   common/settings.cpp
   common/signmessage.cpp
   common/system.cpp
@@ -89,6 +90,7 @@ add_library(lattica_common STATIC EXCLUDE_FROM_ALL
   compressor.cpp
   core_io.cpp
   deploymentinfo.cpp
+  external_signer.cpp
   init/common.cpp
   kernel/chainparams.cpp
   key.cpp
@@ -109,7 +111,9 @@ add_library(lattica_common STATIC EXCLUDE_FROM_ALL
   musig.cpp
   scheduler.cpp
   script/descriptor.cpp
+  script/miniscript.cpp
   script/parsing.cpp
+  psbt.cpp
   script/sign.cpp
   script/signingprovider.cpp
   script/solver.cpp
@@ -191,6 +195,7 @@ add_library(lattica_node STATIC EXCLUDE_FROM_ALL
   node/mempool_persist.cpp
   node/mempool_persist_args.cpp
   node/mini_miner.cpp
+  node/psbt.cpp
   node/miner.cpp
   node/mining_args.cpp
   node/peerman_args.cpp
@@ -204,7 +209,9 @@ add_library(lattica_node STATIC EXCLUDE_FROM_ALL
   noui.cpp
   policy/ephemeral_policy.cpp
   policy/fees/block_policy_estimator.cpp
-  policy/fees/block_policy_estimator_args.cpp
+  policy/fees/estimator_args.cpp
+  policy/fees/estimator_man.cpp
+  policy/fees/mempool_estimator.cpp
   policy/packages.cpp
   policy/rbf.cpp
   policy/settings.cpp

@@ -82,6 +82,50 @@ int main()
         Check("regtest genesis passes CheckBlock", ok && state.IsValid());
     }
 
+
+    // ---- Which hash the proof of work is over is consensus, and it is not the
+    // one Bitcoin uses. Here the header hash is hashed once more -- SHA3-256d,
+    // CBlockHeader::GetPoWHash -- and that is what miners grind and what a node
+    // must check. Porting validation.cpp from Core silently put GetHash() back
+    // in five places, which broke nothing at compile time and would have made
+    // the node reject every block ever mined for this chain.
+    //
+    // Grind a header that meets a target under GetHash but not under
+    // GetPoWHash: whichever of the two the code uses, this tells them apart.
+    {
+        const auto rt = CChainParams::RegTest();
+        const Consensus::Params& rc = rt->GetConsensus();
+
+        // A target a little under regtest's powLimit, so that grinding is cheap
+        // and DeriveTarget accepts it. nBits goes into the header, so it has to
+        // be fixed before grinding, not after: changing it changes both hashes.
+        arith_uint256 target = UintToArith256(rc.powLimit) >> 9;
+        const unsigned int nBits = target.GetCompact();
+        target.SetCompact(nBits);
+
+        CBlockHeader h = static_cast<const CBlockHeader&>(rt->GenesisBlock());
+        h.nBits = nBits;
+        bool found = false;
+        for (uint32_t n = 0; n < 4000000 && !found; ++n) {
+            h.nNonce = n;
+            found = UintToArith256(h.GetHash()) <= target && UintToArith256(h.GetPoWHash()) > target;
+        }
+        Check("a header meeting the target under GetHash but not GetPoWHash exists", found);
+        if (found) {
+            const std::vector<CBlockHeader> checked{h};
+            // It only fails if the code hashes twice. Put GetHash() back in
+            // HasValidProofOfWork and this check goes red.
+            Check("HasValidProofOfWork rejects it, so the proof is over GetPoWHash",
+                  !HasValidProofOfWork(checked, rc));
+
+            // ...and the converse: the regtest genesis, mined against
+            // GetPoWHash, is accepted.
+            const std::vector<CBlockHeader> genesis_header{static_cast<const CBlockHeader&>(rt->GenesisBlock())};
+            Check("...while the genesis header, mined against it, is accepted",
+                  HasValidProofOfWork(genesis_header, rc));
+        }
+    }
+
     std::printf("%s\n", g_fail == 0 ? "ALL PASS" : "FAILURES");
     return g_fail == 0 ? 0 : 1;
 }

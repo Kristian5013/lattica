@@ -1,12 +1,15 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
 
+#include <lattica-build-config.h> // IWYU pragma: keep
+
 #include <chainparams.h>
 #include <core_io.h>
 #include <key_io.h>
-#include <outputtype.h>
 #include <rpc/util.h>
 #include <script/script.h>
+#include <script/solver.h>
+#include <util/bip32.h>
 #include <util/translation.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/util.h>
@@ -19,7 +22,7 @@ RPCMethod getnewaddress()
 {
     return RPCMethod{
         "getnewaddress",
-        "Returns a new Lattica address for receiving payments.\n"
+        "Returns a new Bitcoin address for receiving payments.\n"
                 "If 'label' is specified, it is added to the address book \n"
                 "so payments received with the address will be associated with 'label'.\n",
                 {
@@ -27,7 +30,7 @@ RPCMethod getnewaddress()
                     {"address_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -addresstype"}, "The address type to use. Options are " + FormatAllOutputTypes() + "."},
                 },
                 RPCResult{
-                    RPCResult::Type::STR, "address", "The new lattica address"
+                    RPCResult::Type::STR, "address", "The new bitcoin address"
                 },
                 RPCExamples{
                     HelpExampleCli("getnewaddress", "")
@@ -47,15 +50,16 @@ RPCMethod getnewaddress()
     // Parse the label first so we don't generate a key if there's an error
     const std::string label{LabelFromValue(request.params[0])};
 
-    // Lattica produces a single (witness-v0) address type; the address_type
-    // argument is validated for compatibility but does not alter the output.
+    OutputType output_type = pwallet->m_default_address_type;
     if (!request.params[1].isNull()) {
-        if (!ParseOutputType(request.params[1].get_str())) {
+        std::optional<OutputType> parsed = ParseOutputType(request.params[1].get_str());
+        if (!parsed) {
             throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("Unknown address type '%s'", request.params[1].get_str()));
         }
+        output_type = parsed.value();
     }
 
-    auto op_dest = pwallet->GetNewDestination(label);
+    auto op_dest = pwallet->GetNewDestination(output_type, label);
     if (!op_dest) {
         throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, util::ErrorString(op_dest).original);
     }
@@ -69,7 +73,7 @@ RPCMethod getrawchangeaddress()
 {
     return RPCMethod{
         "getrawchangeaddress",
-        "Returns a new Lattica address, for receiving change.\n"
+        "Returns a new Bitcoin address, for receiving change.\n"
                 "This is for use with raw transactions, NOT normal use.\n",
                 {
                     {"address_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -changetype"}, "The address type to use. Options are " + FormatAllOutputTypes() + "."},
@@ -88,17 +92,20 @@ RPCMethod getrawchangeaddress()
 
     LOCK(pwallet->cs_wallet);
 
-    if (!pwallet->CanGetAddresses()) {
+    if (!pwallet->CanGetAddresses(true)) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet has no available keys");
     }
 
+    OutputType output_type = pwallet->m_default_change_type.value_or(pwallet->m_default_address_type);
     if (!request.params[0].isNull()) {
-        if (!ParseOutputType(request.params[0].get_str())) {
+        std::optional<OutputType> parsed = ParseOutputType(request.params[0].get_str());
+        if (!parsed) {
             throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("Unknown address type '%s'", request.params[0].get_str()));
         }
+        output_type = parsed.value();
     }
 
-    auto op_dest = pwallet->GetNewChangeDestination();
+    auto op_dest = pwallet->GetNewChangeDestination(output_type);
     if (!op_dest) {
         throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, util::ErrorString(op_dest).original);
     }
@@ -114,7 +121,7 @@ RPCMethod setlabel()
         "setlabel",
         "Sets the label associated with the given address.\n",
                 {
-                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The lattica address to be associated with a label."},
+                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The bitcoin address to be associated with a label."},
                     {"label", RPCArg::Type::STR, RPCArg::Optional::NO, "The label to assign to the address."},
                 },
                 RPCResult{RPCResult::Type::NONE, "", ""},
@@ -131,7 +138,7 @@ RPCMethod setlabel()
 
     CTxDestination dest = DecodeDestination(request.params[0].get_str(), Params());
     if (!IsValidDestination(dest)) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Lattica address");
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bitcoin address");
     }
 
     const std::string label{LabelFromValue(request.params[1])};
@@ -162,7 +169,7 @@ RPCMethod listaddressgroupings()
                         {
                             {RPCResult::Type::ARR_FIXED, "", "",
                             {
-                                {RPCResult::Type::STR, "address", "The lattica address"},
+                                {RPCResult::Type::STR, "address", "The bitcoin address"},
                                 {RPCResult::Type::STR_AMOUNT, "amount", "The amount in " + CURRENCY_UNIT},
                                 {RPCResult::Type::STR, "label", /*optional=*/true, "The label"},
                             }},
@@ -208,28 +215,273 @@ RPCMethod listaddressgroupings()
     };
 }
 
+RPCMethod keypoolrefill()
+{
+    return RPCMethod{"keypoolrefill",
+                "Refills each descriptor keypool in the wallet up to the specified number of new keys.\n"
+                "By default, descriptor wallets have 4 active ranged descriptors (" + FormatAllOutputTypes() + "), each with " + util::ToString(DEFAULT_KEYPOOL_SIZE) + " entries.\n" +
+        HELP_REQUIRING_PASSPHRASE,
+                {
+                    {"newsize", RPCArg::Type::NUM, RPCArg::DefaultHint{strprintf("%u, or as set by -keypool", DEFAULT_KEYPOOL_SIZE)}, "The new keypool size"},
+                },
+                RPCResult{RPCResult::Type::NONE, "", ""},
+                RPCExamples{
+                    HelpExampleCli("keypoolrefill", "")
+            + HelpExampleRpc("keypoolrefill", "")
+                },
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return UniValue::VNULL;
+
+    LOCK(pwallet->cs_wallet);
+
+    // 0 is interpreted by TopUpKeyPool() as the default keypool size given by -keypool
+    unsigned int kpSize = 0;
+    if (!request.params[0].isNull()) {
+        if (request.params[0].getInt<int>() < 0)
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, expected valid size.");
+        kpSize = (unsigned int)request.params[0].getInt<int>();
+    }
+
+    EnsureWalletIsUnlocked(*pwallet);
+    pwallet->TopUpKeyPool(kpSize);
+
+    if (pwallet->GetKeyPoolSize() < kpSize) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error refreshing keypool.");
+    }
+    pwallet->RefreshAllTXOs();
+
+    return UniValue::VNULL;
+},
+    };
+}
+
+class DescribeWalletAddressVisitor
+{
+public:
+    const SigningProvider * const provider;
+
+    // NOLINTNEXTLINE(misc-no-recursion)
+    void ProcessSubScript(const CScript& subscript, UniValue& obj) const
+    {
+        // Always present: script type and redeemscript
+        std::vector<std::vector<unsigned char>> solutions_data;
+        TxoutType which_type = Solver(subscript, solutions_data);
+        obj.pushKV("script", GetTxnOutputType(which_type));
+        obj.pushKV("hex", HexStr(subscript));
+
+        CTxDestination embedded;
+        if (ExtractDestination(subscript, embedded)) {
+            // Only when the script corresponds to an address.
+            UniValue subobj(UniValue::VOBJ);
+            UniValue detail = DescribeAddress(embedded);
+            subobj.pushKVs(std::move(detail));
+            UniValue wallet_detail = std::visit(*this, embedded);
+            subobj.pushKVs(std::move(wallet_detail));
+            subobj.pushKV("address", EncodeDestination(embedded, Params()));
+            subobj.pushKV("scriptPubKey", HexStr(subscript));
+            // Always report the pubkey at the top level, so that `getnewaddress()['pubkey']` always works.
+            if (subobj.exists("pubkey")) obj.pushKV("pubkey", subobj["pubkey"]);
+            obj.pushKV("embedded", std::move(subobj));
+        } else if (which_type == TxoutType::MULTISIG) {
+            // Also report some information on multisig scripts (which do not have a corresponding address).
+            obj.pushKV("sigsrequired", solutions_data[0][0]);
+            UniValue pubkeys(UniValue::VARR);
+            for (size_t i = 1; i < solutions_data.size() - 1; ++i) {
+                CPubKey key(solutions_data[i].begin(), solutions_data[i].end());
+                pubkeys.push_back(HexStr(key));
+            }
+            obj.pushKV("pubkeys", std::move(pubkeys));
+        }
+    }
+
+    explicit DescribeWalletAddressVisitor(const SigningProvider* _provider) : provider(_provider) {}
+
+    UniValue operator()(const CNoDestination& dest) const { return UniValue(UniValue::VOBJ); }
+    UniValue operator()(const PubKeyDestination& dest) const { return UniValue(UniValue::VOBJ); }
+
+    UniValue operator()(const PKHash& pkhash) const
+    {
+        CKeyID keyID{ToKeyID(pkhash)};
+        UniValue obj(UniValue::VOBJ);
+        CPubKey vchPubKey;
+        if (provider && provider->GetPubKey(keyID, vchPubKey)) {
+            obj.pushKV("pubkey", HexStr(vchPubKey));
+            obj.pushKV("iscompressed", vchPubKey.IsCompressed());
+        }
+        return obj;
+    }
+
+    // NOLINTNEXTLINE(misc-no-recursion)
+    UniValue operator()(const ScriptHash& scripthash) const
+    {
+        UniValue obj(UniValue::VOBJ);
+        CScript subscript;
+        if (provider && provider->GetCScript(ToScriptID(scripthash), subscript)) {
+            ProcessSubScript(subscript, obj);
+        }
+        return obj;
+    }
+
+    UniValue operator()(const WitnessV0KeyHash& id) const
+    {
+        UniValue obj(UniValue::VOBJ);
+        CPubKey pubkey;
+        if (provider && provider->GetPubKey(ToKeyID(id), pubkey)) {
+            obj.pushKV("pubkey", HexStr(pubkey));
+        }
+        return obj;
+    }
+
+    // NOLINTNEXTLINE(misc-no-recursion)
+    UniValue operator()(const WitnessV0ScriptHash& id) const
+    {
+        UniValue obj(UniValue::VOBJ);
+        CScript subscript;
+        CRIPEMD160 hasher;
+        uint160 hash;
+        hasher.Write(id.begin(), 32).Finalize(hash.begin());
+        if (provider && provider->GetCScript(CScriptID(hash), subscript)) {
+            ProcessSubScript(subscript, obj);
+        }
+        return obj;
+    }
+
+    UniValue operator()(const WitnessV2KeyHash& id) const
+    {
+        UniValue obj(UniValue::VOBJ);
+        CPubKey pubkey;
+        if (provider && provider->GetPubKey(ToKeyID(id), pubkey)) {
+            obj.pushKV("pubkey", HexStr(pubkey));
+        }
+        return obj;
+    }
+
+    // NOLINTNEXTLINE(misc-no-recursion)
+    UniValue operator()(const WitnessV2ScriptHash& id) const
+    {
+        UniValue obj(UniValue::VOBJ);
+        CScript subscript;
+        // The witness program is the SHA3-256 of the script and a CScriptID its
+        // RIPEMD160, exactly as for v0 over SHA-256.
+        CRIPEMD160 hasher;
+        uint160 hash;
+        hasher.Write(id.begin(), 32).Finalize(hash.begin());
+        if (provider && provider->GetCScript(CScriptID{hash}, subscript)) {
+            ProcessSubScript(subscript, obj);
+        }
+        return obj;
+    }
+
+    UniValue operator()(const WitnessV1Taproot& id) const { return UniValue(UniValue::VOBJ); }
+    UniValue operator()(const PayToAnchor& id) const { return UniValue(UniValue::VOBJ); }
+    UniValue operator()(const WitnessUnknown& id) const { return UniValue(UniValue::VOBJ); }
+};
+
+static UniValue DescribeWalletAddress(const CWallet& wallet, const CTxDestination& dest)
+{
+    UniValue ret(UniValue::VOBJ);
+    UniValue detail = DescribeAddress(dest);
+    CScript script = GetScriptForDestination(dest);
+    std::unique_ptr<SigningProvider> provider = nullptr;
+    provider = wallet.GetSolvingProvider(script);
+    ret.pushKVs(std::move(detail));
+    ret.pushKVs(std::visit(DescribeWalletAddressVisitor(provider.get()), dest));
+    return ret;
+}
+
+static std::vector<RPCResult> GetAddressInfoBaseFields()
+{
+    return {
+        {RPCResult::Type::STR, "address", /*optional=*/true, "The bitcoin address of the embedded script."},
+        {RPCResult::Type::STR_HEX, "scriptPubKey", /*optional=*/true, "The hex-encoded output script generated by the address."},
+        {RPCResult::Type::BOOL, "isscript", /*optional=*/true, "If the key is a script."},
+        {RPCResult::Type::BOOL, "iswitness", /*optional=*/true, "If the address is a witness address."},
+        {RPCResult::Type::NUM, "witness_version", /*optional=*/true, "The version number of the witness program."},
+        {RPCResult::Type::STR_HEX, "witness_program", /*optional=*/true, "The hex value of the witness program."},
+        {RPCResult::Type::STR, "script", /*optional=*/true,
+            "The output script type. Only if isscript is true and the redeemscript is known. Possible\n"
+            "types: nonstandard, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_keyhash,\n"
+            "witness_v0_scripthash, witness_unknown."},
+        {RPCResult::Type::STR_HEX, "hex", /*optional=*/true, "The redeemscript for the p2sh address."},
+        {RPCResult::Type::ARR, "pubkeys", /*optional=*/true,
+            "Array of pubkeys associated with the known redeemscript (only if script is multisig).",
+            {
+                {RPCResult::Type::STR, "pubkey", ""},
+            }},
+        {RPCResult::Type::NUM, "sigsrequired", /*optional=*/true,
+            "The number of signatures required to spend multisig output (only if script is multisig)."},
+        {RPCResult::Type::STR_HEX, "pubkey", /*optional=*/true,
+            "The hex value of the raw public key for single-key addresses (possibly embedded in P2SH or P2WSH)."},
+        {RPCResult::Type::BOOL, "iscompressed", /*optional=*/true, "If the pubkey is compressed."},
+    };
+}
+
+static std::vector<RPCResult> GetAddressInfoEmbeddedFields(bool include_nested)
+{
+    auto fields = GetAddressInfoBaseFields();
+
+    if (include_nested) {
+        auto nested = GetAddressInfoBaseFields();
+        fields.emplace_back(
+            RPCResult::Type::OBJ,
+            "embedded",
+            /*optional=*/true,
+            "Information about the address embedded in P2SH or P2WSH, if relevant and known.",
+            std::move(nested)
+        );
+    }
+
+    return fields;
+}
+
 RPCMethod getaddressinfo()
 {
     return RPCMethod{
         "getaddressinfo",
-        "Return information about the given lattica address.\n"
+        "Return information about the given bitcoin address.\n"
                 "Some of the information will only be present if the address is in the active wallet.\n",
                 {
-                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The lattica address for which to get information."},
+                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The bitcoin address for which to get information."},
                 },
                 RPCResult{
                     RPCResult::Type::OBJ, "", "",
                     {
-                        {RPCResult::Type::STR, "address", "The lattica address validated."},
+                        {RPCResult::Type::STR, "address", "The bitcoin address validated."},
                         {RPCResult::Type::STR_HEX, "scriptPubKey", "The hex-encoded output script generated by the address."},
                         {RPCResult::Type::BOOL, "ismine", "If the address is yours."},
                         {RPCResult::Type::BOOL, "iswatchonly", "(DEPRECATED) Always false."},
                         {RPCResult::Type::BOOL, "solvable", "If we know how to spend coins sent to this address, ignoring the possible lack of private keys."},
+                        {RPCResult::Type::STR, "desc", /*optional=*/true, "A descriptor for spending coins sent to this address (only when solvable)."},
+                        {RPCResult::Type::STR, "parent_desc", /*optional=*/true, "The descriptor used to derive this address if this is a descriptor wallet"},
                         {RPCResult::Type::BOOL, "isscript", /*optional=*/true, "If the key is a script."},
                         {RPCResult::Type::BOOL, "ischange", "If the address was used for change output."},
-                        {RPCResult::Type::BOOL, "iswitness", /*optional=*/true, "If the address is a witness address."},
+                        {RPCResult::Type::BOOL, "iswitness", "If the address is a witness address."},
                         {RPCResult::Type::NUM, "witness_version", /*optional=*/true, "The version number of the witness program."},
                         {RPCResult::Type::STR_HEX, "witness_program", /*optional=*/true, "The hex value of the witness program."},
+                        {RPCResult::Type::STR, "script", /*optional=*/true, "The output script type. Only if isscript is true and the redeemscript is known. Possible\n"
+                                                                     "types: nonstandard, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_keyhash,\n"
+                            "witness_v0_scripthash, witness_unknown."},
+                        {RPCResult::Type::STR_HEX, "hex", /*optional=*/true, "The redeemscript for the p2sh address."},
+                        {RPCResult::Type::ARR, "pubkeys", /*optional=*/true, "Array of pubkeys associated with the known redeemscript (only if script is multisig).",
+                        {
+                            {RPCResult::Type::STR, "pubkey", ""},
+                        }},
+                        {RPCResult::Type::NUM, "sigsrequired", /*optional=*/true, "The number of signatures required to spend multisig output (only if script is multisig)."},
+                        {RPCResult::Type::STR_HEX, "pubkey", /*optional=*/true, "The hex value of the raw public key for single-key addresses (possibly embedded in P2SH or P2WSH)."},
+                        {RPCResult::Type::OBJ, "embedded", /*optional=*/true,
+                        "Information about the address embedded in P2SH or P2WSH, if relevant and known.",
+                        ElideGroup(
+                            GetAddressInfoEmbeddedFields(/*include_nested=*/true),
+                            "Includes all getaddressinfo output fields for the embedded address, excluding metadata (timestamp, hdkeypath, hdseedid)\n"
+                            "and relation to the wallet (ismine)."
+                        )},
+                        {RPCResult::Type::BOOL, "iscompressed", /*optional=*/true, "If the pubkey is compressed."},
+                        {RPCResult::Type::NUM_TIME, "timestamp", /*optional=*/true, "The creation time of the key, if available, expressed in " + UNIX_EPOCH_TIME + "."},
+                        {RPCResult::Type::STR, "hdkeypath", /*optional=*/true, "The HD keypath, if the key is HD and available."},
+                        {RPCResult::Type::STR_HEX, "hdseedid", /*optional=*/true, "The Hash160 of the HD seed."},
+                        {RPCResult::Type::STR_HEX, "hdmasterfingerprint", /*optional=*/true, "The fingerprint of the master key."},
                         {RPCResult::Type::ARR, "labels", "Array of labels associated with the address. Currently limited to one label but returned\n"
                             "as an array to keep the API stable if multiple labels are enabled in the future.",
                         {
@@ -271,19 +523,50 @@ RPCMethod getaddressinfo()
 
     bool mine = pwallet->IsMine(dest);
     ret.pushKV("ismine", mine);
-    ret.pushKV("iswatchonly", false);
-    // Lattica has no output descriptors or ScriptPubKeyManagers: solvability is
-    // simply whether the wallet can produce a signing provider for the script,
-    // and there is no desc / parent_desc / key-metadata to surface.
-    ret.pushKV("solvable", provider != nullptr);
 
-    // The generic script-shape fields (isscript, iswitness, witness_version,
-    // witness_program, ...) come from DescribeAddress, mirroring Core's
-    // DescribeWalletAddress for the parts that apply to a witness-only wallet.
-    UniValue detail = DescribeAddress(dest);
+    if (provider) {
+        auto inferred = InferDescriptor(scriptPubKey, *provider);
+        bool solvable = inferred->IsSolvable();
+        ret.pushKV("solvable", solvable);
+        if (solvable) {
+            ret.pushKV("desc", inferred->ToString());
+        }
+    } else {
+        ret.pushKV("solvable", false);
+    }
+
+    const auto& spk_mans = pwallet->GetScriptPubKeyMans(scriptPubKey);
+    // In most cases there is only one matching ScriptPubKey manager and we can't resolve ambiguity in a better way
+    ScriptPubKeyMan* spk_man{nullptr};
+    if (spk_mans.size()) spk_man = *spk_mans.begin();
+
+    DescriptorScriptPubKeyMan* desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man);
+    if (desc_spk_man) {
+        std::string desc_str;
+        if (desc_spk_man->GetDescriptorString(desc_str, /*priv=*/false)) {
+            ret.pushKV("parent_desc", desc_str);
+        }
+    }
+
+    ret.pushKV("iswatchonly", false);
+
+    UniValue detail = DescribeWalletAddress(*pwallet, dest);
     ret.pushKVs(std::move(detail));
 
     ret.pushKV("ischange", ScriptIsChange(*pwallet, scriptPubKey));
+
+    if (spk_man) {
+        if (const std::unique_ptr<CKeyMetadata> meta = spk_man->GetMetadata(dest)) {
+            ret.pushKV("timestamp", meta->nCreateTime);
+            if (meta->has_key_origin) {
+                // In legacy wallets hdkeypath has always used an apostrophe for
+                // hardened derivation. Perhaps some external tool depends on that.
+                ret.pushKV("hdkeypath", WriteHDKeypath(meta->key_origin.path, /*apostrophe=*/!desc_spk_man));
+                ret.pushKV("hdseedid", meta->hd_seed_id.GetHex());
+                ret.pushKV("hdmasterfingerprint", HexStr(meta->key_origin.fingerprint));
+            }
+        }
+    }
 
     // Return a `labels` array containing the label associated with the address,
     // equivalent to the `label` field above. Currently only one label can be
@@ -417,4 +700,47 @@ RPCMethod listlabels()
 },
     };
 }
+
+
+#ifdef ENABLE_EXTERNAL_SIGNER
+RPCMethod walletdisplayaddress()
+{
+    return RPCMethod{
+        "walletdisplayaddress",
+        "Display address on an external signer for verification.",
+        {
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "bitcoin address to display"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ,"","",
+            {
+                {RPCResult::Type::STR, "address", "The address as confirmed by the signer"},
+            }
+        },
+        RPCExamples{""},
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+        {
+            std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);
+            if (!wallet) return UniValue::VNULL;
+            CWallet* const pwallet = wallet.get();
+
+            LOCK(pwallet->cs_wallet);
+
+            CTxDestination dest = DecodeDestination(request.params[0].get_str(), Params());
+
+            // Make sure the destination is valid
+            if (!IsValidDestination(dest)) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address");
+            }
+
+            util::Result<void> res = pwallet->DisplayAddress(dest);
+            if (!res) throw JSONRPCError(RPC_MISC_ERROR, util::ErrorString(res).original);
+
+            UniValue result(UniValue::VOBJ);
+            result.pushKV("address", request.params[0].get_str());
+            return result;
+        }
+    };
+}
+#endif // ENABLE_EXTERNAL_SIGNER
 } // namespace wallet

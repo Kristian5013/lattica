@@ -107,6 +107,16 @@ public:
 bool EncryptSecret(const CKeyingMaterial& vMasterKey, const CKeyingMaterial &vchPlaintext, const uint256& nIV, std::vector<unsigned char> &vchCiphertext);
 bool DecryptSecret(const CKeyingMaterial& master_key, std::span<const unsigned char> ciphertext, const uint256& iv, CKeyingMaterial& plaintext);
 bool DecryptKey(const CKeyingMaterial& master_key, std::span<const unsigned char> crypted_secret, const CPubKey& pub_key, CKey& key);
+
+/** Seal and open an extended private key, in the same envelope and under the same
+ *  key as DecryptKey uses for a CKey.
+ *
+ *  Core has no counterpart: a node of its key tree is a scalar, so sealing the
+ *  CKey seals the node. A node here is a 32-byte seed the CKey is expanded out
+ *  of, plus the chain code and the scheme, and all of it has to travel or a
+ *  child cannot be derived. See key.h. */
+bool EncryptExtKey(const CKeyingMaterial& master_key, const CExtKey& extkey, const CPubKey& pub_key, std::vector<unsigned char>& crypted_secret);
+bool DecryptExtKey(const CKeyingMaterial& master_key, std::span<const unsigned char> crypted_secret, const CPubKey& pub_key, CExtKey& extkey);
 } // namespace wallet
 
 #endif // LATTICA_WALLET_CRYPTER_H

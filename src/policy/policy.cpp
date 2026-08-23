@@ -55,9 +55,29 @@ CAmount GetDustThreshold(const CTxOut& txout, const CFeeRate& dustRelayFeeIn)
     // kept to not further reduce the dust level.
     // See discussion in https://github.com/bitcoin/bitcoin/pull/22779 for details.
     if (txout.scriptPubKey.IsWitnessProgram(witnessversion, witnessprogram)) {
-        // sum the sizes of the parts of a transaction input
-        // with 75% segwit discount applied to the script size.
-        nSize += (32 + 4 + 1 + (107 / WITNESS_SCALE_FACTOR) + 4);
+        if (witnessversion >= 2) {
+            // A witness v2 output is redeemed by a lattice signature and the
+            // public key that made it, and there is no witness discount here to
+            // soften that. Bitcoin's 107 bytes of minimum satisfaction describe
+            // a curve point; the cheaper of the two schemes on this chain needs
+            // 1612 bytes for the whole input. Leaving the figure as it stands
+            // would price a witness v2 output at a ninth of what it costs to
+            // spend, which is an invitation to fill the UTXO set with outputs
+            // nobody will ever redeem -- the one thing a dust rule exists to
+            // prevent.
+            //
+            // The hash does not say which of the two schemes made it, so this
+            // takes the cheaper, Falcon-512, and so understates an ML-DSA-44
+            // output rather than overstating a Falcon-512 one: 32 prevout + 4
+            // index + 4 sequence + 1 empty scriptSig + 1 stack item count, then
+            // a 666-byte signature and an 897-byte key with the sighash byte and
+            // their CompactSize prefixes.
+            nSize += 32 + 4 + 4 + 1 + 1 + (3 + 667) + (3 + 897);
+        } else {
+            // sum the sizes of the parts of a transaction input
+            // with 75% segwit discount applied to the script size.
+            nSize += (32 + 4 + 1 + (107 / WITNESS_SCALE_FACTOR) + 4);
+        }
     } else {
         nSize += (32 + 4 + 1 + 107 + 4); // the 148 mentioned above
     }

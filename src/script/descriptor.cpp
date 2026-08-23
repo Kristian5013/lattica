@@ -17,12 +17,13 @@
 //     the scheme's own, which for ML-DSA-44 is 2420, and a fee estimate is wrong
 //     by a factor of thirty if that is missed. Pushes of that size cost more
 //     than one byte to encode, too.
-//   * An extended key expression is written with the xprv and has no public
-//     form. CExtKey::Derive puts the parent's secret node seed in every child's
-//     preimage — for all three schemes, secp256k1 included — so no xpub can
-//     stand in for it and no descriptor holding one may be published.
-//     Descriptor::IsPrivateOnly() reports it, Warnings() says so, and a
-//     watch-only wallet works from the derived-pubkey cache below instead.
+//   * An extended key expression can never expand from its xpub alone.
+//     CExtKey::Derive puts the parent's secret node seed in every child's
+//     preimage — for all three schemes, secp256k1 included — so what Core does
+//     only for a hardened path is what happens here always: expansion needs the
+//     extended private key, or a cache of nodes already derived. The key travels
+//     whole rather than as a CKey, which is what SigningProvider::GetExtKey is
+//     for, and a watch-only wallet works from that cache.
 //
 // Miniscript is not implemented, so wsh() and tr() leaves take only the key and
 // multisig expressions. musig() aggregates but does not derive: BIP328 derives
@@ -383,12 +384,6 @@ public:
 
     /** Whether this PubkeyProvider can always provide a public key without cache or private key arguments */
     virtual bool CanSelfExpand() const = 0;
-
-    /** Whether the string form of this provider necessarily carries a secret.
-     *
-     *  True for an extended key expression: derivation here is hardened at every
-     *  step, so an xpub cannot stand in for the xprv. */
-    virtual bool IsPrivateOnly() const { return false; }
 };
 
 class OriginPubkeyProvider final : public PubkeyProvider
@@ -460,7 +455,6 @@ public:
         return std::make_unique<OriginPubkeyProvider>(m_expr_index, m_origin, m_provider->Clone(), m_apostrophe);
     }
     bool CanSelfExpand() const override { return m_provider->CanSelfExpand(); }
-    bool IsPrivateOnly() const override { return m_provider->IsPrivateOnly(); }
 };
 
 /** An object representing a parsed constant public key in a descriptor. */
@@ -542,69 +536,55 @@ enum class DeriveType {
     HARDENED_RANGED,
 };
 
-/** An object representing a parsed extended key in a descriptor.
+/** An object representing a parsed extended public key in a descriptor.
  *
- *  Core's counterpart holds an xpub and reaches for the private key only when a
- *  path step is hardened. Here every step is hardened, whatever the scheme, so
- *  the provider holds the extended private key itself and there is no public
- *  spelling of the expression; IsPrivateOnly() says so.
+ *  Structurally Core's, and it holds the same thing: the root xpub, a path, and
+ *  what the last step does. What differs is that Core reaches for the private key
+ *  only when a path step is hardened, and here every step is — CExtKey::Derive
+ *  hashes the parent's secret node seed into the child, for all three schemes.
+ *  So IsHardened() is a constant and this always takes what is Core's hardened
+ *  branch: expand from a cache of nodes already derived, or, with the extended
+ *  private key at hand, from that.
  *
- *  Expansion without the secret is still possible, from a cache of nodes already
- *  derived — which is what CacheDerivedExtPubKey holds and what makes a
- *  watch-only wallet work. It is a lookup, not a derivation: positions past the
- *  cached range cannot be reached until the key is available again.
+ *  The extended private key comes from the SigningProvider whole. Core rebuilds
+ *  one from this xpub and a CKey, which it can because a BIP32 node's secret is
+ *  a scalar; a node here is a seed the CKey is expanded out of. See
+ *  SigningProvider::GetExtKey.
  */
-class ExtKeyPubkeyProvider final : public PubkeyProvider
+class BIP32PubkeyProvider final : public PubkeyProvider
 {
-    //! The root of the tree, private key and all.
-    CExtKey m_root_extkey;
+    // Root xpub, path, and final derivation step type being used, if any
+    CExtPubKey m_root_extkey;
     KeyPath m_path;
     DeriveType m_derive;
-    //! Whether ' or h is used in hardened derivation
+    // Whether ' or h is used in harded derivation
     bool m_apostrophe;
 
-    //! Walk m_path down from the root.
-    bool GetDerivedExtKey(CExtKey& out) const
+    bool GetExtKey(const SigningProvider& arg, CExtKey& ret) const
     {
-        if (!m_root_extkey.key.IsValid()) return false;
-        out = m_root_extkey;
+        return arg.GetExtKey(m_root_extkey.pubkey.GetID(), ret);
+    }
+
+    // Derives the last xprv
+    bool GetDerivedExtKey(const SigningProvider& arg, CExtKey& xprv, CExtKey& last_hardened) const
+    {
+        if (!GetExtKey(arg, xprv)) return false;
         for (auto entry : m_path) {
-            if (!out.Derive(out, entry)) return false;
+            if (!xprv.Derive(xprv, entry)) return false;
+            last_hardened = xprv;
         }
         return true;
     }
 
-    //! The final step, if this expression is ranged.
-    bool DeriveAtPos(CExtKey& out, int pos) const
-    {
-        if (!GetDerivedExtKey(out)) return false;
-        if (m_derive == DeriveType::UNHARDENED_RANGED) return out.Derive(out, (uint32_t)pos);
-        if (m_derive == DeriveType::HARDENED_RANGED) return out.Derive(out, ((uint32_t)pos) | BIP32_HARDENED_FLAG);
-        return true;
-    }
-
-    //! Which slot in the cache holds this expression's key at that position.
-    uint32_t CacheIndex(int pos) const { return IsRange() ? (uint32_t)pos : 0; }
-
-    std::string PathSuffix(bool apostrophe) const
-    {
-        std::string ret = FormatHDKeypath(m_path, apostrophe);
-        if (IsRange()) {
-            ret += "/*";
-            if (m_derive == DeriveType::HARDENED_RANGED) ret += apostrophe ? '\'' : 'h';
-        }
-        return ret;
-    }
+    //! Every step of this tree is hardened, whatever the path says and whatever
+    //! the scheme: the parent's secret node seed is in each child's preimage.
+    bool IsHardened() const { return true; }
 
 public:
-    ExtKeyPubkeyProvider(uint32_t exp_index, const CExtKey& extkey, KeyPath path, DeriveType derive, bool apostrophe)
-        : PubkeyProvider(exp_index), m_root_extkey(extkey), m_path(std::move(path)), m_derive(derive), m_apostrophe(apostrophe) {}
-
+    BIP32PubkeyProvider(uint32_t exp_index, const CExtPubKey& extkey, KeyPath path, DeriveType derive, bool apostrophe) : PubkeyProvider(exp_index), m_root_extkey(extkey), m_path(std::move(path)), m_derive(derive), m_apostrophe(apostrophe) {}
     bool IsRange() const override { return m_derive != DeriveType::NON_RANGED; }
-    size_t GetSize() const override { return PubKeySizeForSecretSize(m_root_extkey.secret_size); }
+    size_t GetSize() const override { return m_root_extkey.pubkey.size(); }
     bool IsBIP32() const override { return true; }
-    bool IsPrivateOnly() const override { return true; }
-
     std::optional<CPubKey> GetPubKey(int pos, const SigningProvider& arg, FlatSigningProvider& out, const DescriptorCache* read_cache = nullptr, DescriptorCache* write_cache = nullptr) const override
     {
         KeyOriginInfo info;
@@ -613,49 +593,119 @@ public:
         if (m_derive == DeriveType::UNHARDENED_RANGED) info.path.push_back((uint32_t)pos);
         if (m_derive == DeriveType::HARDENED_RANGED) info.path.push_back(((uint32_t)pos) | BIP32_HARDENED_FLAG);
 
-        CExtPubKey final_extpub;
+        // Derive keys or fetch them from cache
+        CExtPubKey final_extkey = m_root_extkey;
+        CExtPubKey parent_extkey = m_root_extkey;
+        CExtPubKey last_hardened_extkey;
+        bool der = true;
         if (read_cache) {
-            // No derivation is possible from public data alone; either this
-            // position was cached when the key was available, or it is out of
-            // reach.
-            if (!read_cache->GetCachedDerivedExtPubKey(m_expr_index, CacheIndex(pos), final_extpub)) return std::nullopt;
+            // Nothing can be derived from public data here, so the cache is a
+            // lookup and not a starting point: either this position was cached
+            // when the key was available, or it is out of reach.
+            if (!read_cache->GetCachedDerivedExtPubKey(m_expr_index, pos, final_extkey)) return std::nullopt;
         } else {
-            CExtKey extkey;
-            if (!DeriveAtPos(extkey, pos)) return std::nullopt;
-            final_extpub = extkey.Neuter();
-            if (write_cache) write_cache->CacheDerivedExtPubKey(m_expr_index, CacheIndex(pos), final_extpub);
+            CExtKey xprv;
+            CExtKey lh_xprv;
+            if (!GetDerivedExtKey(arg, xprv, lh_xprv)) return std::nullopt;
+            parent_extkey = xprv.Neuter();
+            if (m_derive == DeriveType::UNHARDENED_RANGED) der = xprv.Derive(xprv, pos);
+            if (m_derive == DeriveType::HARDENED_RANGED) der = xprv.Derive(xprv, pos | BIP32_HARDENED_FLAG);
+            final_extkey = xprv.Neuter();
+            if (lh_xprv.key.IsValid()) {
+                last_hardened_extkey = lh_xprv.Neuter();
+            }
         }
-        if (!final_extpub.pubkey.IsValid()) return std::nullopt;
+        if (!der) return std::nullopt;
 
-        out.origins.emplace(final_extpub.pubkey.GetID(), std::make_pair(final_extpub.pubkey, info));
-        out.pubkeys.emplace(final_extpub.pubkey.GetID(), final_extpub.pubkey);
-        return final_extpub.pubkey;
+        out.origins.emplace(final_extkey.pubkey.GetID(), std::make_pair(final_extkey.pubkey, info));
+        out.pubkeys.emplace(final_extkey.pubkey.GetID(), final_extkey.pubkey);
+
+        if (write_cache) {
+            // Cache the node itself. Core caches the parent instead whenever any
+            // step is unhardened, since it can go on deriving from that; here it
+            // could not, so every position is its own entry.
+            write_cache->CacheDerivedExtPubKey(m_expr_index, pos, final_extkey);
+            if (last_hardened_extkey.pubkey.IsValid()) {
+                write_cache->CacheLastHardenedExtPubKey(m_expr_index, last_hardened_extkey);
+            }
+        }
+
+        return final_extkey.pubkey;
     }
-
-    std::string ToString(StringType type=StringType::PUBLIC) const override
+    std::string ToString(StringType type, bool normalized) const
     {
         // If StringType==COMPAT, always use the apostrophe to stay compatible with previous versions
-        const bool use_apostrophe = m_apostrophe || type == StringType::COMPAT;
-        return EncodeExtKey(m_root_extkey, Params()) + PathSuffix(use_apostrophe);
+        const bool use_apostrophe = (!normalized && m_apostrophe) || type == StringType::COMPAT;
+        std::string ret = EncodeExtPubKey(m_root_extkey, Params()) + FormatHDKeypath(m_path, /*apostrophe=*/use_apostrophe);
+        if (IsRange()) {
+            ret += "/*";
+            if (m_derive == DeriveType::HARDENED_RANGED) ret += use_apostrophe ? '\'' : 'h';
+        }
+        return ret;
+    }
+    std::string ToString(StringType type=StringType::PUBLIC) const override
+    {
+        return ToString(type, /*normalized=*/false);
     }
     bool ToPrivateString(const SigningProvider& arg, std::string& out) const override
     {
-        out = ToString(StringType::PUBLIC);
+        CExtKey key;
+        if (!GetExtKey(arg, key)) {
+            out = ToString(StringType::PUBLIC);
+            return false;
+        }
+        out = EncodeExtKey(key, Params()) + FormatHDKeypath(m_path, /*apostrophe=*/m_apostrophe);
+        if (IsRange()) {
+            out += "/*";
+            if (m_derive == DeriveType::HARDENED_RANGED) out += m_apostrophe ? '\'' : 'h';
+        }
         return true;
     }
     bool ToNormalizedString(const SigningProvider& arg, std::string& out, const DescriptorCache* cache) const override
     {
-        // Normalizing means moving the extended key down to the last hardened
-        // step, so that everything above it can be published. Every step here is
-        // hardened, so there is nothing to move and nothing to publish: the
-        // normal form is the expression itself.
-        out = EncodeExtKey(m_root_extkey, Params()) + PathSuffix(/*apostrophe=*/false);
+        // Normalizing puts the xpub at the last hardened step, so that everything
+        // above it can be published without exposing a sibling branch. Every step
+        // here is hardened, so the last one is the last step of the path and the
+        // whole path moves into the origin.
+        if (m_derive == DeriveType::HARDENED_RANGED || m_path.empty()) {
+            out = ToString(StringType::PUBLIC, /*normalized=*/true);
+            return true;
+        }
+
+        KeyOriginInfo origin;
+        origin.path = m_path;
+        origin.fingerprint = m_root_extkey.id_key_fingerprint();
+
+        CExtPubKey xpub;
+        CExtKey lh_xprv;
+        // If we have the cache, just get the parent xpub
+        if (cache != nullptr) {
+            cache->GetCachedLastHardenedExtPubKey(m_expr_index, xpub);
+        }
+        if (!xpub.pubkey.IsValid()) {
+            // Cache miss, or no cache, or need privkey
+            CExtKey xprv;
+            if (!GetDerivedExtKey(arg, xprv, lh_xprv)) return false;
+            xpub = lh_xprv.Neuter();
+        }
+        if (!xpub.pubkey.IsValid()) return false;
+
+        // Build the string
+        std::string origin_str = HexStr(origin.fingerprint) + FormatHDKeypath(origin.path);
+        out = "[" + origin_str + "]" + EncodeExtPubKey(xpub, Params());
+        if (IsRange()) {
+            out += "/*";
+            assert(m_derive == DeriveType::UNHARDENED_RANGED);
+        }
         return true;
     }
     void GetPrivKey(int pos, const SigningProvider& arg, FlatSigningProvider& out) const override
     {
         CExtKey extkey;
-        if (!DeriveAtPos(extkey, pos)) return;
+        CExtKey dummy;
+        if (!GetDerivedExtKey(arg, extkey, dummy)) return;
+        if (m_derive == DeriveType::UNHARDENED_RANGED && !extkey.Derive(extkey, pos)) return;
+        if (m_derive == DeriveType::HARDENED_RANGED && !extkey.Derive(extkey, pos | BIP32_HARDENED_FLAG)) return;
         out.keys.emplace(extkey.key.GetPubKey().GetID(), extkey.key);
     }
     std::optional<CPubKey> GetRootPubKey() const override
@@ -664,15 +714,13 @@ public:
     }
     std::optional<CExtPubKey> GetRootExtPubKey() const override
     {
-        if (!m_root_extkey.key.IsValid()) return std::nullopt;
-        return m_root_extkey.Neuter();
+        return m_root_extkey;
     }
     std::unique_ptr<PubkeyProvider> Clone() const override
     {
-        return std::make_unique<ExtKeyPubkeyProvider>(m_expr_index, m_root_extkey, m_path, m_derive, m_apostrophe);
+        return std::make_unique<BIP32PubkeyProvider>(m_expr_index, m_root_extkey, m_path, m_derive, m_apostrophe);
     }
-    //! The secret is right here, so a position can always be reached.
-    bool CanSelfExpand() const override { return true; }
+    bool CanSelfExpand() const override { return !IsHardened(); }
 };
 
 /** PubkeyProvider for a musig() expression.
@@ -847,13 +895,6 @@ public:
         }
         return true;
     }
-    bool IsPrivateOnly() const override
-    {
-        for (const auto& key : m_participants) {
-            if (key->IsPrivateOnly()) return true;
-        }
-        return false;
-    }
 };
 
 /** Base class for all Descriptor implementations. */
@@ -934,18 +975,6 @@ public:
         }
         for (const auto& arg : m_subdescriptor_args) {
             if (arg->IsRange()) return true;
-        }
-        return false;
-    }
-
-    // NOLINTNEXTLINE(misc-no-recursion)
-    bool IsPrivateOnly() const final
-    {
-        for (const auto& pubkey : m_pubkey_args) {
-            if (pubkey->IsPrivateOnly()) return true;
-        }
-        for (const auto& arg : m_subdescriptor_args) {
-            if (arg->IsPrivateOnly()) return true;
         }
         return false;
     }
@@ -1142,12 +1171,6 @@ public:
     // NOLINTNEXTLINE(misc-no-recursion)
     std::vector<std::string> Warnings() const override {
         std::vector<std::string> all = m_warnings;
-        for (const auto& pubkey : m_pubkey_args) {
-            if (pubkey->IsPrivateOnly()) {
-                all.emplace_back("this descriptor holds an extended private key: derivation is hardened at every step, so it has no public form and its string must not be published");
-                break;
-            }
-        }
         for (const auto& sub : m_subdescriptor_args) {
             auto sub_w = sub->Warnings();
             all.insert(all.end(), sub_w.begin(), sub_w.end());
@@ -2019,18 +2042,13 @@ std::vector<std::unique_ptr<PubkeyProvider>> ParsePubkeyInner(uint32_t& key_exp_
             return ret;
         }
     }
-    // Extended keys are private here: derivation is hardened at every step, so
-    // there is no xpub form to accept.
     CExtKey extkey = DecodeExtKey(str, Params());
-    if (!extkey.key.IsValid()) {
-        if (DecodeExtPubKey(str, Params()).pubkey.IsValid()) {
-            error = strprintf("Extended public key '%s' cannot derive: every step of this key tree is hardened, so a key expression must be written with the extended private key", str);
-            return {};
-        }
+    CExtPubKey extpubkey = DecodeExtPubKey(str, Params());
+    if (!extkey.key.IsValid() && !extpubkey.pubkey.IsValid()) {
         error = strprintf("key '%s' is not valid", str);
         return {};
     }
-    const size_t pk_size = PubKeySizeForSecretSize(extkey.secret_size);
+    const size_t pk_size = extkey.key.IsValid() ? PubKeySizeForSecretSize(extkey.secret_size) : extpubkey.pubkey.size();
     if (!SchemeAllowedInContext(pk_size, ctx)) {
         error = SchemeMismatchError(pk_size, ctx);
         return {};
@@ -2038,8 +2056,17 @@ std::vector<std::unique_ptr<PubkeyProvider>> ParsePubkeyInner(uint32_t& key_exp_
     std::vector<KeyPath> paths;
     DeriveType type = ParseDeriveType(split, apostrophe);
     if (!ParseKeyPath(split, paths, apostrophe, error, /*allow_multipath=*/true)) return {};
+    if (extkey.key.IsValid()) {
+        // The provider keeps the public half and the secret goes to the caller's
+        // signing provider, as in Core -- except that what has to travel is the
+        // whole extended key and not just a CKey, since a node's secret here is
+        // the seed the key is expanded out of.
+        extpubkey = extkey.Neuter();
+        out.extkeys.emplace(extpubkey.pubkey.GetID(), extkey);
+        out.keys.emplace(extpubkey.pubkey.GetID(), extkey.key);
+    }
     for (auto& path : paths) {
-        ret.emplace_back(std::make_unique<ExtKeyPubkeyProvider>(key_exp_index, extkey, std::move(path), type, apostrophe));
+        ret.emplace_back(std::make_unique<BIP32PubkeyProvider>(key_exp_index, extpubkey, std::move(path), type, apostrophe));
     }
     ++key_exp_index;
     return ret;

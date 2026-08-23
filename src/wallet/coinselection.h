@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
+
 #ifndef LATTICA_WALLET_COINSELECTION_H
 #define LATTICA_WALLET_COINSELECTION_H
 
@@ -18,9 +19,9 @@
 
 namespace wallet {
 //! lower bound for randomly-chosen target change amount
-static constexpr CAmount CHANGE_LOWER{50000};
+inline constexpr CAmount CHANGE_LOWER{50'000};
 //! upper bound for randomly-chosen target change amount
-static constexpr CAmount CHANGE_UPPER{1000000};
+inline constexpr CAmount CHANGE_UPPER{1'000'000};
 
 /** A UTXO under consideration for use in funding a new transaction. */
 struct COutput {

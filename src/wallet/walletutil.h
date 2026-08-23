@@ -94,11 +94,6 @@ public:
         id = DescriptorID(*descriptor);
     }
 
-    //! The record holds the descriptor's own string. A key expression here is an
-    //! extended private key -- derivation is hardened at every step, so there is
-    //! no public form of one (see Descriptor::IsPrivateOnly) -- which means this
-    //! record carries key material and belongs with the wallet's other secrets,
-    //! encrypted along with them and never handed out as a public descriptor.
     SERIALIZE_METHODS(WalletDescriptor, obj)
     {
         std::string descriptor_str;
@@ -113,15 +108,12 @@ public:
 
 /** Build the wallet's own descriptor for an output type, over the given tree.
  *
- *  Core takes the master CExtPubKey, because its descriptors expand from an xpub.
- *  This takes the extended private key: the tree is hardened at every step, so a
- *  key expression is written with the xprv (see descriptor.cpp).
- *
- *  The tree must be the one whose scheme `output_type` names -- see
- *  SecretSizeForOutputType -- since a lattice key belongs under witness v2 and a
- *  secp256k1 key does not.
+ *  The master key must be the root of the tree whose scheme `output_type` names
+ *  -- see SecretSizeForOutputType -- since a lattice key belongs under witness v2
+ *  and a secp256k1 key does not. Core has one tree for all four of its types;
+ *  here one seed gives three, and which one this is comes from the key.
  */
-WalletDescriptor GenerateWalletDescriptor(const CExtKey& master_key, const OutputType& output_type, bool internal);
+WalletDescriptor GenerateWalletDescriptor(const CExtPubKey& master_key, const OutputType& output_type, bool internal);
 
 } // namespace wallet
 

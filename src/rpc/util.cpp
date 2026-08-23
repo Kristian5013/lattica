@@ -12,12 +12,14 @@
 #include <outputtype.h>
 #include <pow.h>
 #include <rpc/util.h>
+#include <script/descriptor.h>
 #include <script/interpreter.h>
 #include <script/signingprovider.h>
 #include <script/solver.h>
 #include <tinyformat.h>
 #include <uint256.h>
 #include <univalue.h>
+#include <util/bip32.h>
 #include <util/check.h>
 #include <util/result.h>
 #include <util/strencodings.h>
@@ -219,16 +221,10 @@ CPubKey HexToPubKey(const std::string& hex_in)
     if (!IsHex(hex_in)) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Pubkey \"" + hex_in + "\" must be a hex string");
     }
-    // A public key is whatever length its scheme uses — 33, 897 or 1312 — and
-    // the length is what names the scheme, so any of them is acceptable here and
-    // nothing else is.
-    if (!CPubKey::ValidSize(hex_in.length() / 2)) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
-                           strprintf("Pubkey \"%s\" is not the length of any supported scheme", hex_in));
+    if (hex_in.length() != 66 && hex_in.length() != 130) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Pubkey \"" + hex_in + "\" must have a length of either 33 or 65 bytes");
     }
     CPubKey vchPubKey(ParseHex(hex_in));
-    // IsFullyValid(), not IsValid(): the message promises a cryptographic check,
-    // and for secp256k1 that means the bytes really are a point on the curve.
     if (!vchPubKey.IsFullyValid()) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Pubkey \"" + hex_in + "\" must be cryptographically valid.");
     }
@@ -251,8 +247,17 @@ CTxDestination AddAndGetMultisigDestination(const int required, const std::vecto
 
     script_out = GetScriptForMultisig(required, pubkeys);
 
-    // Lattica keys are ML-DSA with no compressed/uncompressed distinction, so there is no
-    // legacy (uncompressed-key) output type; multisig is witness-only.
+    // Check if any keys are uncompressed. If so, the type is legacy
+    for (const CPubKey& pk : pubkeys) {
+        if (!pk.IsCompressed()) {
+            type = OutputType::LEGACY;
+            break;
+        }
+    }
+
+    if (type == OutputType::LEGACY && script_out.size() > MAX_SCRIPT_ELEMENT_SIZE) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, (strprintf("redeemScript exceeds size limit: %d > %d", script_out.size(), MAX_SCRIPT_ELEMENT_SIZE)));
+    }
 
     // Make the address
     CTxDestination dest = AddAndGetDestinationForScript(keystore, script_out, type);
@@ -410,6 +415,8 @@ RPCErrorCode RPCErrorFromTransactionError(TransactionError terr)
             return RPC_TRANSACTION_REJECTED;
         case TransactionError::ALREADY_IN_UTXO_SET:
             return RPC_VERIFY_ALREADY_IN_UTXO_SET;
+        case TransactionError::PRIVATE_BROADCAST_FULL:
+            return RPC_LIMIT_EXCEEDED;
         default: break;
     }
     return RPC_TRANSACTION_ERROR;
@@ -629,14 +636,16 @@ std::string RPCResults::ToDescriptionString() const
 {
     std::string result;
     for (const auto& r : m_results) {
-        if (r.m_type == RPCResult::Type::ANY) continue; // for testing only
+        Sections sections;
+        r.ToSections(sections);
+        // A result can be empty via HelpElisionSkip
+        if (sections.m_sections.empty()) continue;
+
         if (r.m_cond.empty()) {
             result += "\nResult:\n";
         } else {
             result += "\nResult (" + r.m_cond + "):\n";
         }
-        Sections sections;
-        r.ToSections(sections);
         result += sections.ToString();
     }
     return result;
@@ -1047,7 +1056,8 @@ void RPCResult::ToSections(Sections& sections, const OuterType outer_type, const
 
     switch (m_type) {
     case Type::ANY: {
-        NONFATAL_UNREACHABLE(); // Only for testing
+        sections.PushSection({indent + maybe_key + "xxx" + maybe_separator, Description("any")});
+        return;
     }
     case Type::NONE: {
         sections.PushSection({indent + "null" + maybe_separator, Description("json null")});
@@ -1330,7 +1340,73 @@ static std::pair<int64_t, int64_t> ParseRange(const UniValue& value)
     throw JSONRPCError(RPC_INVALID_PARAMETER, "Range must be specified as end or as [begin,end]");
 }
 
+std::pair<int64_t, int64_t> ParseDescriptorRange(const UniValue& value)
+{
+    int64_t low, high;
+    std::tie(low, high) = ParseRange(value);
+    if (low < 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Range should be greater or equal than 0");
+    }
+    if ((high >> 31) != 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "End of range is too high");
+    }
+    if (high >= low + 1000000) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Range is too large");
+    }
+    return {low, high};
+}
 
+std::vector<CScript> EvalDescriptorStringOrObject(const UniValue& scanobject, FlatSigningProvider& provider, const bool expand_priv)
+{
+    std::string desc_str;
+    std::pair<int64_t, int64_t> range = {0, 1000};
+    if (scanobject.isStr()) {
+        desc_str = scanobject.get_str();
+    } else if (scanobject.isObject()) {
+        const UniValue& desc_uni{scanobject.find_value("desc")};
+        if (desc_uni.isNull()) throw JSONRPCError(RPC_INVALID_PARAMETER, "Descriptor needs to be provided in scan object");
+        desc_str = desc_uni.get_str();
+        const UniValue& range_uni{scanobject.find_value("range")};
+        if (!range_uni.isNull()) {
+            range = ParseDescriptorRange(range_uni);
+        }
+    } else {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Scan object needs to be either a string or an object");
+    }
+
+    std::string error;
+    auto descs = Parse(desc_str, provider, error);
+    if (descs.empty()) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error);
+    }
+    if (!descs.at(0)->IsRange()) {
+        range.first = 0;
+        range.second = 0;
+    }
+    std::vector<CScript> ret;
+    for (int64_t i = range.first; i <= range.second; ++i) {
+        for (const auto& desc : descs) {
+            std::vector<CScript> scripts;
+            if (!desc->Expand(i, provider, scripts, provider)) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("Cannot derive script without private keys: '%s'", desc_str));
+            }
+            if (expand_priv) {
+                desc->ExpandPrivate(/*pos=*/i, provider, /*out=*/provider);
+            }
+            std::move(scripts.begin(), scripts.end(), std::back_inserter(ret));
+        }
+    }
+    return ret;
+}
+
+std::vector<uint32_t> ParsePathBIP32(const std::string& path)
+{
+    std::vector<uint32_t> out;
+    if (!ParseHDKeypath(path, out)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid BIP32 keypath");
+    }
+    return out;
+}
 
 /** Convert a vector of bilingual strings to a UniValue::VARR containing their original untranslated values. */
 [[nodiscard]] static UniValue BilingualStringsToUniValue(const std::vector<bilingual_str>& bilingual_strings)

@@ -1,31 +1,18 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
-//
-// interfaces::Chain — the node/wallet boundary, ported from Bitcoin Core's
-// interfaces/chain.h. The interface lets a client (the wallet) read chain state,
-// receive block/mempool notifications, and submit transactions.
-//
-// Lattica ports a FAITHFUL-BUT-SCOPED surface: every method we keep has Core's
-// exact signature, but the methods that in Core back onto subsystems Lattica has
-// not built are omitted rather than declared-and-faked. Omitted (see the note at
-// the end of the class): the BIP158 block-filter queries, the fee estimator
-// (estimateSmartFee/estimateMaxBlocks), CPFP bump-fee calculation, the settings.json
-// (*RwSetting / getSetting*) family, the RPC plumbing (handleRpc/rpcEnableDeprecated),
-// and context() (no node::NodeContext). MakeChain therefore takes explicit
-// chainstate/mempool/signals references instead of a NodeContext.
 
 #ifndef LATTICA_INTERFACES_CHAIN_H
 #define LATTICA_INTERFACES_CHAIN_H
 
+#include <blockfilter.h>
 #include <common/settings.h>
-#include <consensus/amount.h>
-#include <kernel/chain.h> // IWYU pragma: export  (interfaces::BlockInfo, kernel::ChainstateRole)
+#include <kernel/chain.h> // IWYU pragma: export
 #include <node/types.h>
-#include <policy/feerate.h>
 #include <primitives/transaction.h>
+#include <util/expected.h>
+#include <util/fees.h>
 #include <util/result.h>
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -35,20 +22,18 @@
 #include <string>
 #include <vector>
 
+class ArgsManager;
 class CBlock;
-class CBlockPolicyEstimator;
 class CBlockUndo;
+class CFeeRate;
 class CRPCCommand;
-class ChainstateManager;
 class CScheduler;
-class CTxMemPool;
 class Coin;
-class ValidationSignals;
 class uint256;
 enum class MemPoolRemovalReason;
+enum class RBFTransactionState;
 struct bilingual_str;
 struct CBlockLocator;
-struct FeeCalculation;
 namespace kernel {
 struct ChainstateRole;
 } // namespace kernel
@@ -59,13 +44,7 @@ struct NodeContext;
 namespace interfaces {
 
 class Handler;
-
-//! Result of updateRwSetting: WRITE persists settings.json now, SKIP_WRITE leaves
-//! the in-memory change unwritten.
-enum class SettingsAction { WRITE, SKIP_WRITE };
-
-//! Callback to mutate a persistent rw setting in place; returns whether to write.
-using SettingsUpdate = std::function<std::optional<SettingsAction>(common::SettingsValue&)>;
+class Wallet;
 
 //! Helper for findBlock to selectively return pieces of block data. If block is
 //! found, data will be returned by setting specified output variables. If block
@@ -100,9 +79,41 @@ public:
     mutable bool found = false;
 };
 
+//! The action to be taken after updating a settings value.
+//! WRITE indicates that the updated value must be written to disk,
+//! while SKIP_WRITE indicates that the change will be kept in memory-only
+//! without persisting it.
+enum class SettingsAction {
+    WRITE,
+    SKIP_WRITE
+};
+
+using SettingsUpdate = std::function<std::optional<interfaces::SettingsAction>(common::SettingsValue&)>;
+
 //! Interface giving clients (wallet processes, maybe other analysis tools in
 //! the future) ability to access to the chain state, receive notifications,
-//! and submit transactions.
+//! estimate fees, and submit transactions.
+//!
+//! TODO: Current chain methods are too low level, exposing too much of the
+//! internal workings of the bitcoin node, and not being very convenient to use.
+//! Chain methods should be cleaned up and simplified over time. Examples:
+//!
+//! * The initMessages() and showProgress() methods which the wallet uses to send
+//!   notifications to the GUI should go away when GUI and wallet can directly
+//!   communicate with each other without going through the node
+//!   (https://github.com/bitcoin/bitcoin/pull/15288#discussion_r253321096).
+//!
+//! * The handleRpc, registerRpcs, rpcEnableDeprecated methods and other RPC
+//!   methods can go away if wallets listen for HTTP requests on their own
+//!   ports instead of registering to handle requests on the node HTTP port.
+//!
+//! * Move fee estimation queries to an asynchronous interface and let the
+//!   wallet cache it, fee estimation being driven by node mempool, wallet
+//!   should be the consumer.
+//!
+//! * `guessVerificationProgress` and similar methods can go away if rescan
+//!   logic moves out of the wallet, and the wallet just requests scans from the
+//!   node (https://github.com/bitcoin/bitcoin/issues/11756)
 class Chain
 {
 public:
@@ -124,6 +135,13 @@ public:
     //! which will either be the original block used to create the locator,
     //! or one of its ancestors.
     virtual std::optional<int> findLocatorFork(const CBlockLocator& locator) = 0;
+
+    //! Returns whether a block filter index is available.
+    virtual bool hasBlockFilterIndex(BlockFilterType filter_type) = 0;
+
+    //! Returns whether any of the elements match the block via a BIP 157 block filter
+    //! or std::nullopt if the block filter for this block couldn't be found.
+    virtual std::optional<bool> blockFilterMatchesAny(BlockFilterType filter_type, const uint256& block_hash, const GCSFilter::ElementSet& filter_set) = 0;
 
     //! Return whether node has the block and optionally return block metadata
     //! or contents.
@@ -167,6 +185,9 @@ public:
     //! the height range from min_height to max_height, inclusive.
     virtual bool hasBlocks(const uint256& block_hash, int min_height = 0, std::optional<int> max_height = {}) = 0;
 
+    //! Check if transaction is RBF opt in.
+    virtual RBFTransactionState isRBFOptIn(const CTransaction& tx) = 0;
+
     //! Check if transaction is in mempool.
     virtual bool isInMempool(const Txid& txid) = 0;
 
@@ -187,6 +208,60 @@ public:
                                       node::TxBroadcast broadcast_method,
                                       std::string& err_string) = 0;
 
+    //! Calculate mempool ancestor and cluster counts for the given transaction.
+    virtual void getTransactionAncestry(const Txid& txid, size_t& ancestors, size_t& cluster_count, size_t* ancestorsize = nullptr, CAmount* ancestorfees = nullptr) = 0;
+
+    //! For each outpoint, calculate the fee-bumping cost to spend this outpoint at the specified
+    //  feerate, including bumping its ancestors. For example, if the target feerate is 10sat/vbyte
+    //  and this outpoint refers to a mempool transaction at 3sat/vbyte, the bump fee includes the
+    //  cost to bump the mempool transaction to 10sat/vbyte (i.e. 7 * mempooltx.vsize). If that
+    //  transaction also has, say, an unconfirmed parent with a feerate of 1sat/vbyte, the bump fee
+    //  includes the cost to bump the parent (i.e. 9 * parentmempooltx.vsize).
+    //
+    //  If the outpoint comes from an unconfirmed transaction that is already above the target
+    //  feerate or bumped by its descendant(s) already, it does not need to be bumped. Its bump fee
+    //  is 0. Likewise, if any of the transaction's ancestors are already bumped by a transaction
+    //  in our mempool, they are not included in the transaction's bump fee.
+    //
+    //  Also supported is bump-fee calculation in the case of replacements. If an outpoint
+    //  conflicts with another transaction in the mempool, it is assumed that the goal is to replace
+    //  that transaction. As such, the calculation will exclude the to-be-replaced transaction, but
+    //  will include the fee-bumping cost. If bump fees of descendants of the to-be-replaced
+    //  transaction are requested, the value will be 0. Fee-related RBF rules are not included as
+    //  they are logically distinct.
+    //
+    //  Any outpoints that are otherwise unavailable from the mempool (e.g. UTXOs from confirmed
+    //  transactions or transactions not yet broadcast by the wallet) are given a bump fee of 0.
+    //
+    //  If multiple outpoints come from the same transaction (which would be very rare because
+    //  it means that one transaction has multiple change outputs or paid the same wallet using multiple
+    //  outputs in the same transaction) or have shared ancestry, the bump fees are calculated
+    //  independently, i.e. as if only one of them is spent. This may result in double-fee-bumping. This
+    //  caveat can be rectified per use of the sister-function CalculateCombinedBumpFee(…).
+    virtual std::map<COutPoint, CAmount> calculateIndividualBumpFees(const std::vector<COutPoint>& outpoints, const CFeeRate& target_feerate) = 0;
+
+    //! Calculate the combined bump fee for an input set per the same strategy
+    //  as in CalculateIndividualBumpFees(…).
+    //  Unlike CalculateIndividualBumpFees(…), this does not return individual
+    //  bump fees per outpoint, but a single bump fee for the shared ancestry.
+    //  The combined bump fee may be used to correct overestimation due to
+    //  shared ancestry by multiple UTXOs after coin selection.
+    virtual std::optional<CAmount> calculateCombinedBumpFee(const std::vector<COutPoint>& outpoints, const CFeeRate& target_feerate) = 0;
+
+    //! Get the node's package limits.
+    //! Currently only returns the ancestor and descendant count limits, but could be enhanced to
+    //! return more policy settings.
+    virtual void getPackageLimits(unsigned int& limit_ancestor_count, unsigned int& limit_descendant_count) = 0;
+
+    //! Check if transaction will pass the mempool's chain limits.
+    virtual util::Result<void> checkChainLimits(const CTransactionRef& tx) = 0;
+
+    //! Estimate a fee rate.
+    virtual util::Expected<FeeRateEstimation, FeeRateEstimationError> getFeeRateEstimate(int num_blocks, bool conservative) const = 0;
+
+    //! Fee estimator max target.
+    virtual unsigned int maximumFeeEstimationTargetBlocks() const = 0;
+
     //! Mempool minimum fee.
     virtual CFeeRate mempoolMinFee() = 0;
 
@@ -198,33 +273,6 @@ public:
 
     //! Relay dust fee setting (-dustrelayfee), reflecting lowest rate it's economical to spend.
     virtual CFeeRate relayDustFee() = 0;
-
-    //! Estimate smart fee. Delegates to the node's CBlockPolicyEstimator; returns
-    //! an unset CFeeRate (0) when no estimator is configured, in which case the
-    //! wallet falls back to its own feerate.
-    virtual CFeeRate estimateSmartFee(int num_blocks, bool conservative, FeeCalculation* calc = nullptr) = 0;
-
-    //! Fee estimation further than this many blocks in the future is impossible.
-    virtual unsigned int estimateMaxBlocks() = 0;
-
-    //! Calculate mempool ancestor and cluster counts for the given transaction.
-    virtual void getTransactionAncestry(const Txid& txid, size_t& ancestors, size_t& cluster_count, size_t* ancestorsize = nullptr, CAmount* ancestorfees = nullptr) = 0;
-
-    //! Get the node's package limits.
-    //! Currently only returns the ancestor and descendant count limits, but could be enhanced to
-    //! return more policy settings.
-    virtual void getPackageLimits(unsigned int& limit_ancestor_count, unsigned int& limit_descendant_count) = 0;
-
-    //! Check if transaction will pass the mempool's chain limits.
-    virtual util::Result<void> checkChainLimits(const CTransactionRef& tx) = 0;
-
-    //! For each outpoint, calculate the fee-bumping cost to spend it at the target feerate,
-    //! including bumping its unconfirmed mempool ancestors (CPFP). Outpoints unavailable from
-    //! the mempool get a bump fee of 0. See node::MiniMiner.
-    virtual std::map<COutPoint, CAmount> calculateIndividualBumpFees(const std::vector<COutPoint>& outpoints, const CFeeRate& target_feerate) = 0;
-
-    //! Calculate the combined bump fee for an input set, counting shared ancestry once.
-    virtual std::optional<CAmount> calculateCombinedBumpFee(const std::vector<COutPoint>& outpoints, const CFeeRate& target_feerate) = 0;
 
     //! Check if any block has been pruned.
     virtual bool havePruned() = 0;
@@ -290,9 +338,48 @@ public:
     //! Wait for all pending notifications up to this point to be processed
     virtual void waitForNotifications() = 0;
 
+    //! Register handler for RPC. Command is not copied, so reference
+    //! needs to remain valid until Handler is disconnected.
+    virtual std::unique_ptr<Handler> handleRpc(const CRPCCommand& command) = 0;
+
+    //! Check if deprecated RPC is enabled.
+    virtual bool rpcEnableDeprecated(const std::string& method) = 0;
+
+    //! Get settings value.
+    virtual common::SettingsValue getSetting(const std::string& arg) = 0;
+
+    //! Get list of settings values.
+    virtual std::vector<common::SettingsValue> getSettingsList(const std::string& arg) = 0;
+
+    //! Return <datadir>/settings.json setting value.
+    virtual common::SettingsValue getRwSetting(const std::string& name) = 0;
+
+    //! Updates a setting in <datadir>/settings.json.
+    //! Null can be passed to erase the setting. There is intentionally no
+    //! support for writing null values to settings.json.
+    //! Depending on the action returned by the update function, this will either
+    //! update the setting in memory or write the updated settings to disk.
+    virtual bool updateRwSetting(const std::string& name, const SettingsUpdate& update_function) = 0;
+
+    //! Replace a setting in <datadir>/settings.json with a new value.
+    //! Null can be passed to erase the setting.
+    //! This method provides a simpler alternative to updateRwSetting when
+    //! atomically reading and updating the setting is not required.
+    virtual bool overwriteRwSetting(const std::string& name, common::SettingsValue value, SettingsAction action = SettingsAction::WRITE) = 0;
+
+    //! Delete a given setting in <datadir>/settings.json.
+    //! This method provides a simpler alternative to overwriteRwSetting when
+    //! erasing a setting, for ease of use and readability.
+    virtual bool deleteRwSettings(const std::string& name, SettingsAction action = SettingsAction::WRITE) = 0;
+
     //! Synchronously send transactionAddedToMempool notifications about all
     //! current mempool transactions to the specified handler and return after
-    //! the last one is sent.
+    //! the last one is sent. These notifications aren't coordinated with async
+    //! notifications sent by handleNotifications, so out of date async
+    //! notifications from handleNotifications can arrive during and after
+    //! synchronous notifications from requestMempoolTransactions. Clients need
+    //! to be prepared to handle this by ignoring notifications about unknown
+    //! removed transactions and already added new transactions.
     virtual void requestMempoolTransactions(Notifications& notifications) = 0;
 
     //! Return true if an assumed-valid snapshot is in use. Note that this
@@ -300,42 +387,9 @@ public:
     //! restart.
     virtual bool hasAssumedValidChain() = 0;
 
-    //! Get the node context, if this Chain is backed by one. The wallet-facing MakeChain
-    //! (chainstate + mempool + signal bus, no aggregated NodeContext) returns nullptr; the
-    //! background index/P2P subsystems that need the full node reach it through here once a
-    //! NodeContext-backed Chain is wired by node init.
+    //! Get internal node context. Useful for testing, but not
+    //! accessible across processes.
     virtual node::NodeContext* context() { return nullptr; }
-
-    //! Register handler for RPC. Command is not copied, so reference needs to
-    //! remain valid until Handler is disconnected.
-    virtual std::unique_ptr<Handler> handleRpc(const CRPCCommand& command) = 0;
-
-    //! Return <datadir>/settings.json setting value.
-    virtual common::SettingsValue getSetting(const std::string& arg) = 0;
-
-    //! Return <datadir>/settings.json or -<arg> setting value as a list, parsing
-    //! comma-separated string lists into multiple values where applicable.
-    virtual std::vector<common::SettingsValue> getSettingsList(const std::string& arg) = 0;
-
-    //! Return <datadir>/settings.json read-write setting value.
-    virtual common::SettingsValue getRwSetting(const std::string& name) = 0;
-
-    //! Updates a setting in <datadir>/settings.json. Depending on the action
-    //! returned by the update function, this will either WRITE or SKIP_WRITE.
-    virtual bool updateRwSetting(const std::string& name, const SettingsUpdate& update_settings_func) = 0;
-
-    //! Replace a setting in <datadir>/settings.json with a new value.
-    virtual bool overwriteRwSetting(const std::string& name, common::SettingsValue value, SettingsAction action = SettingsAction::WRITE) = 0;
-
-    //! Delete a given setting in <datadir>/settings.json.
-    virtual bool deleteRwSettings(const std::string& name, SettingsAction action = SettingsAction::WRITE) = 0;
-
-    // --- Methods in Core's interfaces::Chain that Lattica omits, because they ---
-    // --- back onto subsystems not (yet) ported. Each is omitted, not faked:    ---
-    //   hasBlockFilterIndex / blockFilterMatchesAny  -- no BIP158 block filter index
-    //   rpcEnableDeprecated                           -- no RPC server
-    //   isRBFOptIn                                    -- RBF opt-in query, not referenced
-    //                                                    by the spend layer
 };
 
 //! Interface to let node manage chain clients (wallets, or maybe tools for
@@ -367,16 +421,7 @@ public:
     virtual void schedulerMockForward(std::chrono::seconds delta_seconds) = 0;
 };
 
-//! Return implementation of the Chain interface backed by the given chainstate,
-//! mempool and validation-signal bus. (Core's MakeChain takes a node::NodeContext;
-//! Lattica passes the pieces explicitly, as it has no aggregated NodeContext.)
-//! `fee_estimator` is optional: when null, estimateSmartFee returns an unset feerate
-//! and the wallet falls back to its own configured feerate.
-std::unique_ptr<Chain> MakeChain(ChainstateManager& chainman, CTxMemPool& mempool, ValidationSignals& signals, CBlockPolicyEstimator* fee_estimator = nullptr);
-
-//! Return a Chain backed by the full node context. Unlike the explicit-pieces
-//! overload, the resulting Chain answers context() with this NodeContext, which the
-//! index and P2P subsystems wired by node init rely on.
+//! Return implementation of Chain interface.
 std::unique_ptr<Chain> MakeChain(node::NodeContext& node);
 
 } // namespace interfaces

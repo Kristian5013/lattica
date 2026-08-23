@@ -172,6 +172,15 @@ public:
     virtual bool GetPubKey(const CKeyID &address, CPubKey& pubkey) const { return false; }
     virtual bool GetKey(const CKeyID &address, CKey& key) const { return false; }
     virtual bool HaveKey(const CKeyID &address) const { return false; }
+    /** Get the extended private key at the root of a key tree, by the key id of
+     *  the public key at that node.
+     *
+     *  Core has no counterpart, and does not need one: a node of its tree is a
+     *  scalar and a chain code, so a CExtKey can be rebuilt from a CExtPubKey and
+     *  the CKey this provider already carries. A node here is a 32-byte seed and
+     *  a chain code, and the CKey is expanded out of the seed rather than being
+     *  it, so the extended key has to be handed over whole. */
+    virtual bool GetExtKey(const CKeyID& keyid, CExtKey& extkey) const { return false; }
     virtual bool GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const { return false; }
     virtual bool GetTaprootSpendData(const XOnlyPubKey& output_key, TaprootSpendData& spenddata) const { return false; }
     virtual bool GetTaprootBuilder(const XOnlyPubKey& output_key, TaprootBuilder& builder) const { return false; }
@@ -220,6 +229,7 @@ public:
     bool GetCScript(const CScriptID& scriptid, CScript& script) const override;
     bool GetPubKey(const CKeyID& keyid, CPubKey& pubkey) const override;
     bool GetKey(const CKeyID& keyid, CKey& key) const override;
+    bool GetExtKey(const CKeyID& keyid, CExtKey& extkey) const override;
     bool GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const override;
     bool GetTaprootSpendData(const XOnlyPubKey& output_key, TaprootSpendData& spenddata) const override;
     bool GetTaprootBuilder(const XOnlyPubKey& output_key, TaprootBuilder& builder) const override;
@@ -236,6 +246,9 @@ struct FlatSigningProvider final : public SigningProvider
     std::map<CKeyID, CPubKey> pubkeys;
     std::map<CKeyID, std::pair<CPubKey, KeyOriginInfo>> origins;
     std::map<CKeyID, CKey> keys;
+    /** Extended private keys, by the key id of the public key at their node.
+     *  Core has no such map; see SigningProvider::GetExtKey. */
+    std::map<CKeyID, CExtKey> extkeys;
     std::map<XOnlyPubKey, TaprootBuilder> tr_trees; /** Map from output key to Taproot tree (which can then make the TaprootSpendData */
     std::map<CPubKey, std::vector<CPubKey>> aggregate_pubkeys; /** MuSig2 aggregate pubkeys */
     std::map<uint256, MuSig2SecNonce>* musig2_secnonces{nullptr};
@@ -245,6 +258,7 @@ struct FlatSigningProvider final : public SigningProvider
     bool GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const override;
     bool HaveKey(const CKeyID &keyid) const override;
     bool GetKey(const CKeyID& keyid, CKey& key) const override;
+    bool GetExtKey(const CKeyID& keyid, CExtKey& extkey) const override;
     bool GetTaprootSpendData(const XOnlyPubKey& output_key, TaprootSpendData& spenddata) const override;
     bool GetTaprootBuilder(const XOnlyPubKey& output_key, TaprootBuilder& builder) const override;
     std::vector<CPubKey> GetMuSig2ParticipantPubkeys(const CPubKey& pubkey) const override;
@@ -273,9 +287,19 @@ protected:
     /**
      * Map of script id to scripts known by the signing provider.
      *
-     * This map holds P2SH redeemScripts, witness scripts, and the segwit
-     * scriptPubKeys derived from keys, so that the wallet can tell an output it
-     * generated an address for from one it merely happens to hold the key for.
+     * This map originally just held P2SH redeemScripts, and was used by wallet
+     * code to look up script ids referenced in "OP_HASH160 <script id>
+     * OP_EQUAL" P2SH outputs. Later in 605e8473a7d it was extended to hold
+     * P2WSH witnessScripts as well, and used to look up nested scripts
+     * referenced in "OP_0 <script hash>" P2WSH outputs. Later in commits
+     * f4691ab3a9d and 248f3a76a82, it was extended once again to hold segwit
+     * "OP_0 <key or script hash>" scriptPubKeys, in order to give the wallet a
+     * way to distinguish between segwit outputs that it generated addresses for
+     * and wanted to receive payments from, and segwit outputs that it never
+     * generated addresses for, but it could spend just because of having keys.
+     * (Before segwit activation it was also important to not treat segwit
+     * outputs to arbitrary wallet keys as payments, because these could be
+     * spent by anyone without even needing to sign with the keys.)
      *
      * Some of the scripts stored in mapScripts are memory-only and
      * intentionally not saved to disk. Specifically, scripts added by
@@ -283,8 +307,22 @@ protected:
      * future wallet code can have flexibility to be more selective about what
      * transaction outputs it recognizes as payments, instead of having to treat
      * all outputs spending to keys it knows as payments. By contrast,
-     * mapScripts entries added by AddCScript(script) are saved because they are
-     * intentionally used to receive payments.
+     * mapScripts entries added by AddCScript(script),
+     * LearnRelatedScripts(pubkey, type), and LearnAllRelatedScripts(pubkey)
+     * calls are saved because they are all intentionally used to receive
+     * payments.
+     *
+     * The FillableSigningProvider::mapScripts script map should not be confused
+     * with the wallet::LegacyDataSPKM::setWatchOnly script set. The two collections
+     * can hold the same scripts, but they serve different purposes. The
+     * setWatchOnly script set is intended to expand the set of outputs the
+     * wallet considers payments. Every output with a script it contains is
+     * considered to belong to the wallet, regardless of whether the script is
+     * solvable or signable. By contrast, the scripts in mapScripts are only
+     * used for solving, and to restrict which outputs are considered payments
+     * by the wallet. An output with a script in mapScripts, unlike
+     * setWatchOnly, is not automatically considered to belong to the wallet if
+     * it can't be solved and signed for.
      */
     ScriptMap mapScripts GUARDED_BY(cs_KeyStore);
 
@@ -319,6 +357,7 @@ public:
     bool GetPubKey(const CKeyID& keyid, CPubKey& pubkey) const override;
     bool GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const override;
     bool GetKey(const CKeyID& keyid, CKey& key) const override;
+    bool GetExtKey(const CKeyID& keyid, CExtKey& extkey) const override;
     bool GetTaprootSpendData(const XOnlyPubKey& output_key, TaprootSpendData& spenddata) const override;
     bool GetTaprootBuilder(const XOnlyPubKey& output_key, TaprootBuilder& builder) const override;
 };

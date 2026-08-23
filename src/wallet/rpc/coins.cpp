@@ -3,6 +3,7 @@
 
 #include <chainparams.h>
 #include <core_io.h>
+#include <hash.h>
 #include <key_io.h>
 #include <rpc/util.h>
 #include <script/script.h>
@@ -28,7 +29,7 @@ static CAmount GetReceived(const CWallet& wallet, const UniValue& params, bool b
         // Get the address
         CTxDestination dest = DecodeDestination(params[0].get_str(), Params());
         if (!IsValidDestination(dest)) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Lattica address");
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bitcoin address");
         }
         addresses.emplace_back(dest);
     }
@@ -65,7 +66,7 @@ static CAmount GetReceived(const CWallet& wallet, const UniValue& params, bool b
             continue;
         }
 
-        for (const CTxOut& txout : wtx.tx->vout) {
+        for (const CTxOut& txout : wtx.GetTx()->vout) {
             if (output_scripts.contains(txout.scriptPubKey)) {
                 amount += txout.nValue;
             }
@@ -82,7 +83,7 @@ RPCMethod getreceivedbyaddress()
         "getreceivedbyaddress",
         "Returns the total amount received by the given address in transactions with at least minconf confirmations.\n",
                 {
-                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The lattica address for transactions."},
+                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The bitcoin address for transactions."},
                     {"minconf", RPCArg::Type::NUM, RPCArg::Default{1}, "Only include transactions confirmed at least this many times."},
                     {"include_immature_coinbase", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include immature coinbase transactions."},
                 },
@@ -168,7 +169,8 @@ RPCMethod getbalance()
                 "The available balance is what the wallet considers currently spendable, and is\n"
                 "thus affected by options which limit spendability such as -spendzeroconfchange.\n",
                 {
-                    {"dummy", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Remains for backward compatibility. Must be excluded or set to \"*\"."},
+                    {"dummy", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Remains for backward compatibility. Must be excluded or set to \"*\".",
+                        RPCArgOptions{.placeholder = true}},
                     {"minconf", RPCArg::Type::NUM, RPCArg::Default{0}, "Only include transactions confirmed at least this many times."},
                     {"include_watchonly", RPCArg::Type::BOOL, RPCArg::Default{false}, "No longer used"},
                     {"avoid_reuse", RPCArg::Type::BOOL, RPCArg::Default{true}, "(only available if avoid_reuse wallet flag is set) Do not include balance in dirty outputs; addresses are considered dirty if they have previously been used in a transaction."},
@@ -217,7 +219,7 @@ RPCMethod lockunspent()
         "Updates list of temporarily unspendable outputs.\n"
                 "Temporarily lock (unlock=false) or unlock (unlock=true) specified transaction outputs.\n"
                 "If no transaction outputs are specified when unlocking then all current locked transaction outputs are unlocked.\n"
-                "A locked transaction output will not be chosen by automatic coin selection, when spending latticas.\n"
+                "A locked transaction output will not be chosen by automatic coin selection, when spending bitcoins.\n"
                 "Manually selected coins are automatically unlocked.\n"
                 "Locks are stored in memory only, unless persistent=true, in which case they will be written to the\n"
                 "wallet database and loaded on node start. Unwritten (persistent=false) locks are always cleared\n"
@@ -308,7 +310,7 @@ RPCMethod lockunspent()
 
         const CWalletTx& trans = it->second;
 
-        if (outpt.n >= trans.tx->vout.size()) {
+        if (outpt.n >= trans.GetTx()->vout.size()) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, vout index out of bounds");
         }
 
@@ -462,9 +464,9 @@ RPCMethod listunspent()
                 {
                     {"minconf", RPCArg::Type::NUM, RPCArg::Default{1}, "The minimum confirmations to filter"},
                     {"maxconf", RPCArg::Type::NUM, RPCArg::Default{9999999}, "The maximum confirmations to filter"},
-                    {"addresses", RPCArg::Type::ARR, RPCArg::Default{UniValue::VARR}, "The lattica addresses to filter",
+                    {"addresses", RPCArg::Type::ARR, RPCArg::Default{UniValue::VARR}, "The bitcoin addresses to filter",
                         {
-                            {"address", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "lattica address"},
+                            {"address", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "bitcoin address"},
                         },
                     },
                     {"include_unsafe", RPCArg::Type::BOOL, RPCArg::Default{true}, "Include outputs that are not safe to spend\n"
@@ -486,7 +488,7 @@ RPCMethod listunspent()
                         {
                             {RPCResult::Type::STR_HEX, "txid", "the transaction id"},
                             {RPCResult::Type::NUM, "vout", "the vout value"},
-                            {RPCResult::Type::STR, "address", /*optional=*/true, "the lattica address"},
+                            {RPCResult::Type::STR, "address", /*optional=*/true, "the bitcoin address"},
                             {RPCResult::Type::STR, "label", /*optional=*/true, "The associated label, or \"\" for the default label"},
                             {RPCResult::Type::STR, "scriptPubKey", "the output script"},
                             {RPCResult::Type::STR_AMOUNT, "amount", "the transaction output amount in " + CURRENCY_UNIT},
@@ -494,9 +496,15 @@ RPCMethod listunspent()
                             {RPCResult::Type::NUM, "ancestorcount", /*optional=*/true, "The number of in-mempool ancestor transactions, including this one (if transaction is in the mempool)"},
                             {RPCResult::Type::NUM, "ancestorsize", /*optional=*/true, "The virtual transaction size of in-mempool ancestors, including this one (if transaction is in the mempool)"},
                             {RPCResult::Type::STR_AMOUNT, "ancestorfees", /*optional=*/true, "The total fees of in-mempool ancestors (including this one) with fee deltas used for mining priority in " + CURRENCY_ATOM + " (if transaction is in the mempool)"},
+                            {RPCResult::Type::STR_HEX, "redeemScript", /*optional=*/true, "The redeem script if the output script is P2SH"},
+                            {RPCResult::Type::STR, "witnessScript", /*optional=*/true, "witness script if the output script is P2WSH or P2SH-P2WSH"},
                             {RPCResult::Type::BOOL, "spendable", "(DEPRECATED) Always true"},
                             {RPCResult::Type::BOOL, "solvable", "Whether we know how to spend this output, ignoring the lack of keys"},
                             {RPCResult::Type::BOOL, "reused", /*optional=*/true, "(only present if avoid_reuse is set) Whether this output is reused/dirty (sent to an address that was previously spent from)"},
+                            {RPCResult::Type::STR, "desc", /*optional=*/true, "(only when solvable) A descriptor for spending this output"},
+                            {RPCResult::Type::ARR, "parent_descs", /*optional=*/false, "List of parent descriptors for the output script of this coin.", {
+                                {RPCResult::Type::STR, "desc", "The descriptor string."},
+                            }},
                             {RPCResult::Type::BOOL, "safe", "Whether this output is considered safe to spend. Unconfirmed transactions\n"
                                                             "from outside keys and unconfirmed replacement transactions are considered unsafe\n"
                                                             "and are not eligible for spending by fundrawtransaction and sendtoaddress."},
@@ -532,7 +540,7 @@ RPCMethod listunspent()
             const UniValue& input = inputs[idx];
             CTxDestination dest = DecodeDestination(input.get_str(), Params());
             if (!IsValidDestination(dest)) {
-                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, std::string("Invalid Lattica address: ") + input.get_str());
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, std::string("Invalid Bitcoin address: ") + input.get_str());
             }
             if (!destinations.insert(dest).second) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, std::string("Invalid parameter, duplicated address: ") + input.get_str());
@@ -619,8 +627,37 @@ RPCMethod listunspent()
             if (address_book_entry) {
                 entry.pushKV("label", address_book_entry->GetLabel());
             }
-            // Lattica is witness-v0 (P2WPKH) only: there are no P2SH redeemScripts
-            // or P2WSH witnessScripts to surface, and no output descriptors.
+
+            std::unique_ptr<SigningProvider> provider = pwallet->GetSolvingProvider(scriptPubKey);
+            if (provider) {
+                if (scriptPubKey.IsPayToScriptHash()) {
+                    const CScriptID hash = ToScriptID(std::get<ScriptHash>(address));
+                    CScript redeemScript;
+                    if (provider->GetCScript(hash, redeemScript)) {
+                        entry.pushKV("redeemScript", HexStr(redeemScript));
+                        // Now check if the redeemScript is actually a P2WSH script
+                        CTxDestination witness_destination;
+                        if (redeemScript.IsPayToWitnessScriptHash()) {
+                            bool extracted = ExtractDestination(redeemScript, witness_destination);
+                            CHECK_NONFATAL(extracted);
+                            // Also return the witness script
+                            const WitnessV0ScriptHash& whash = std::get<WitnessV0ScriptHash>(witness_destination);
+                            CScriptID id{RIPEMD160(whash)};
+                            CScript witnessScript;
+                            if (provider->GetCScript(id, witnessScript)) {
+                                entry.pushKV("witnessScript", HexStr(witnessScript));
+                            }
+                        }
+                    }
+                } else if (scriptPubKey.IsPayToWitnessScriptHash()) {
+                    const WitnessV0ScriptHash& whash = std::get<WitnessV0ScriptHash>(address);
+                    CScriptID id{RIPEMD160(whash)};
+                    CScript witnessScript;
+                    if (provider->GetCScript(id, witnessScript)) {
+                        entry.pushKV("witnessScript", HexStr(witnessScript));
+                    }
+                }
+            }
         }
 
         entry.pushKV("scriptPubKey", HexStr(scriptPubKey));
@@ -638,6 +675,14 @@ RPCMethod listunspent()
         }
         entry.pushKV("spendable", true); // Any coins we list are always spendable
         entry.pushKV("solvable", out.solvable);
+        if (out.solvable) {
+            std::unique_ptr<SigningProvider> provider = pwallet->GetSolvingProvider(scriptPubKey);
+            if (provider) {
+                auto descriptor = InferDescriptor(scriptPubKey, *provider);
+                entry.pushKV("desc", descriptor->ToString());
+            }
+        }
+        PushParentDescriptors(*pwallet, scriptPubKey, entry);
         if (avoid_reuse) entry.pushKV("reused", reused);
         entry.pushKV("safe", out.safe);
         results.push_back(std::move(entry));

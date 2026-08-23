@@ -443,6 +443,23 @@ bool CExtPubKey::Decode(std::span<const unsigned char> code) {
     return true;
 }
 
+void CExtPubKey::EncodeWithVersion(std::span<unsigned char> code) const
+{
+    assert(code.size() == GetSerializedSizeWithVersion());
+    memcpy(code.data(), version, 4);
+    Encode(code.subspan(4));
+}
+
+bool CExtPubKey::DecodeWithVersion(std::span<const unsigned char> code)
+{
+    if (code.size() <= 4) {
+        pubkey = CPubKey();
+        return false;
+    }
+    memcpy(version, code.data(), 4);
+    return Decode(code.subspan(4));
+}
+
 //! BIP32 public derivation: tweak the point by a hash of the chain code, the
 //! child number and the key. It is BIP328's, and the MuSig2 synthetic xpub is
 //! what it is here for.

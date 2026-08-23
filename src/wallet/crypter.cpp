@@ -148,4 +148,25 @@ bool DecryptKey(const CKeyingMaterial& master_key, const std::span<const unsigne
     key.Set(secret.begin(), secret.end(), pub_key);
     return key.IsValid();
 }
+bool EncryptExtKey(const CKeyingMaterial& master_key, const CExtKey& extkey, const CPubKey& pub_key, std::vector<unsigned char>& crypted_secret)
+{
+    CKeyingMaterial secret(CExtKey::SIZE);
+    extkey.Encode(secret.data());
+    return EncryptSecret(master_key, secret, pub_key.GetHash(), crypted_secret);
+}
+
+bool DecryptExtKey(const CKeyingMaterial& master_key, const std::span<const unsigned char> crypted_secret, const CPubKey& pub_key, CExtKey& extkey)
+{
+    CKeyingMaterial secret;
+    if (!DecryptSecret(master_key, crypted_secret, pub_key.GetHash(), secret)) {
+        return false;
+    }
+    if (secret.size() != CExtKey::SIZE) {
+        return false;
+    }
+    extkey.Decode(secret.data());
+    // Decode leaves the key invalid if the scheme byte pair names no scheme, and
+    // the node must be the one this record was filed under.
+    return extkey.key.IsValid() && extkey.key.GetPubKey() == pub_key;
+}
 } // namespace wallet

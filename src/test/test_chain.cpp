@@ -10,6 +10,7 @@
 //     block 1 delivers a blockConnected with the right height, hash and block data.
 
 #include <interfaces/chain.h>
+#include <node/context.h>
 #include <interfaces/handler.h>
 
 #include <validation.h>
@@ -92,7 +93,9 @@ int main()
 
     // A validation-signal bus with an immediate (synchronous) task runner, wired
     // into the chainstate so block-connected events fire through it.
-    ValidationSignals validation_signals{std::make_unique<util::ImmediateTaskRunner>()};
+    node::NodeContext node_context;
+    node_context.validation_signals = std::make_unique<ValidationSignals>(std::make_unique<util::ImmediateTaskRunner>());
+    ValidationSignals& validation_signals = *node_context.validation_signals;
 
     ChainstateManager::Options chainman_opts{
         .chainparams = *params,
@@ -111,11 +114,13 @@ int main()
             .memory_only = true,
         },
     };
-    ChainstateManager chainman{interrupt, chainman_opts, blockman_opts};
+    node_context.chainman = std::make_unique<ChainstateManager>(interrupt, chainman_opts, blockman_opts);
+    ChainstateManager& chainman = *node_context.chainman;
 
     kernel::MemPoolOptions mpopts;
     bilingual_str mperr;
-    CTxMemPool mempool{mpopts, mperr};
+    node_context.mempool = std::make_unique<CTxMemPool>(mpopts, mperr);
+    CTxMemPool& mempool = *node_context.mempool;
 
     kernel::CacheSizes cache_sizes{1 << 22};
     node::ChainstateLoadOptions load_opts;
@@ -130,8 +135,9 @@ int main()
         Check("activate genesis chain", chainman.ActiveChainstate().ActivateBestChain(state, nullptr));
     }
 
-    // Build the chain adapter under test.
-    std::unique_ptr<interfaces::Chain> chain = interfaces::MakeChain(chainman, mempool, validation_signals);
+    // Build the chain adapter under test. MakeChain takes the NodeContext now,
+    // so assemble one holding the pieces this test built by hand.
+    std::unique_ptr<interfaces::Chain> chain = interfaces::MakeChain(node_context);
 
     const uint256 genesis_hash = params->GetConsensus().hashGenesisBlock;
 

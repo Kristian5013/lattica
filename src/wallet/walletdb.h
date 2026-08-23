@@ -1,120 +1,199 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
-//
-// The wallet's persistence layer, written in the style of Bitcoin Core's
-// wallet/walletdb.h but adapted for Lattica (NOT a verbatim port, because Core's
-// walletdb is full of elliptic-curve / descriptor operations -- per-descriptor and
-// per-key records, CExtPubKey xpub caches, active-ScriptPubKeyMan records, watch-only
-// records -- none of which a post-quantum keystore wallet has). It keeps Core's
-// shape: DBErrors, the DBKeys record-type strings, CHDChain, WalletBatch with its
-// typed Write/Erase helpers, the LoadRecords prefix-cursor load machinery (in the
-// .cpp), and RunWithinTxn.
-//
-// Lattica's wallet is pure-HD and keystore-only, so the only records are: the HD
-// chain (the seed + counter, encrypted when the wallet is), the encryption master
-// keys, transactions, the address book, locked UTXOs, the order counter, the wallet
-// flags, and the version. Private keys are NOT stored per-key -- the whole key tree
-// re-derives from the seed on load.
 
 #ifndef LATTICA_WALLET_WALLETDB_H
 #define LATTICA_WALLET_WALLETDB_H
 
-#include <clientversion.h>
 #include <key.h>
+#include <primitives/transaction.h>
 #include <primitives/transaction_identifier.h>
-#include <serialize.h>
-#include <uint256.h>
-#include <wallet/crypter.h>
+#include <script/sign.h>
 #include <wallet/db.h>
+#include <wallet/walletutil.h>
 
 #include <cstdint>
-#include <functional>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
 class CScript;
+class uint160;
+class uint256;
 struct CBlockLocator;
-struct COutPoint;
 
 namespace wallet {
+class CMasterKey;
 class CWallet;
 class CWalletTx;
+struct WalletContext;
 
-//! Logs information about the wallet database during startup.
+// Logs information about the database, including available engines, features, and other capabilities
 void LogDBInfo();
 
-/** Error statuses for the wallet database, in order of severity (highest wins). */
+/**
+ * Overview of wallet database classes:
+ *
+ * - WalletBatch is an abstract modifier object for the wallet database, and encapsulates a database
+ *   batch update as well as methods to act on the database. It should be agnostic to the database implementation.
+ */
+
+/** Error statuses for the wallet database.
+ * Values are in order of severity. When multiple errors occur, the most severe (highest value) will be returned.
+ */
 enum class DBErrors : int
 {
     LOAD_OK = 0,
     NEED_RESCAN = 1,
+    EXTERNAL_SIGNER_SUPPORT_REQUIRED = 3,
     NONCRITICAL_ERROR = 4,
     TOO_NEW = 5,
+    UNKNOWN_DESCRIPTOR = 6,
     LOAD_FAIL = 7,
+    UNEXPECTED_LEGACY_ENTRY = 8,
+    LEGACY_WALLET = 9,
     CORRUPT = 10,
 };
 
 namespace DBKeys {
+extern const std::string ACENTRY;
+extern const std::string ACTIVEEXTERNALSPK;
+extern const std::string ACTIVEINTERNALSPK;
 extern const std::string BESTBLOCK;
+extern const std::string BESTBLOCK_NOMERKLE;
+extern const std::string CRYPTED_KEY;
+extern const std::string CSCRIPT;
+extern const std::string DEFAULTKEY;
 extern const std::string DESTDATA;
 extern const std::string FLAGS;
 extern const std::string HDCHAIN;
+extern const std::string KEY;
+extern const std::string KEYMETA;
 extern const std::string LOCKED_UTXO;
 extern const std::string MASTER_KEY;
 extern const std::string MINVERSION;
 extern const std::string NAME;
+extern const std::string OLD_KEY;
 extern const std::string ORDERPOSNEXT;
-extern const std::string PUBKEYID;
+extern const std::string POOL;
 extern const std::string PURPOSE;
+extern const std::string SETTINGS;
 extern const std::string TX;
+extern const std::string WTX_VARIANT;
 extern const std::string VERSION;
+extern const std::string WALLETDESCRIPTOR;
+extern const std::string WALLETDESCRIPTORCKEY;
+extern const std::string WALLETDESCRIPTORKEY;
+extern const std::string WALLETDESCRIPTORCXKEY;
+extern const std::string WALLETDESCRIPTORXKEY;
+extern const std::string WATCHMETA;
+extern const std::string WATCHS;
+
+// Keys in this set pertain only to legacy wallets and are removed during migration to descriptors.
+extern const std::unordered_set<std::string> LEGACY_TYPES;
 } // namespace DBKeys
 
-/**
- * The HD chain model: the ML-DSA HD seed and the count of keys handed out. The
- * whole key tree re-derives from the seed, so this single record (plus the
- * encryption master key) is the wallet's entire key material.
- */
+/* simple HD chain data model */
 class CHDChain
 {
 public:
-    uint32_t nExternalChainCounter{0}; //!< number of keys derived so far
-    CKeyID seed_id;                    //!< id (hash) of the HD master public key
-    //! The 32-byte HD seed in the clear. Null when the wallet is encrypted -- then
-    //! the seed lives only in crypted_seed below.
-    uint256 hd_seed;
-    //! The AES-256-CBC encryption of the seed, present iff the wallet is encrypted.
-    std::vector<unsigned char> crypted_seed;
+    uint32_t nExternalChainCounter;
+    uint32_t nInternalChainCounter;
+    CKeyID seed_id; //!< seed hash160
+    int64_t m_next_external_index{0}; // Next index in the keypool to be used. Memory only.
+    int64_t m_next_internal_index{0}; // Next index in the keypool to be used. Memory only.
 
-    static const int VERSION_HD_BASE = 1;
-    static const int CURRENT_VERSION  = VERSION_HD_BASE;
+    static constexpr int VERSION_HD_BASE{1};
+    static constexpr int VERSION_HD_CHAIN_SPLIT{2};
+    static constexpr int CURRENT_VERSION{VERSION_HD_CHAIN_SPLIT};
     int nVersion;
 
     CHDChain() { SetNull(); }
 
     SERIALIZE_METHODS(CHDChain, obj)
     {
-        READWRITE(obj.nVersion, obj.nExternalChainCounter, obj.seed_id, obj.hd_seed, obj.crypted_seed);
+        READWRITE(obj.nVersion, obj.nExternalChainCounter, obj.seed_id);
+        if (obj.nVersion >= VERSION_HD_CHAIN_SPLIT) {
+            READWRITE(obj.nInternalChainCounter);
+        }
     }
 
     void SetNull()
     {
         nVersion = CHDChain::CURRENT_VERSION;
         nExternalChainCounter = 0;
+        nInternalChainCounter = 0;
         seed_id.SetNull();
-        hd_seed.SetNull();
-        crypted_seed.clear();
+    }
+
+    bool operator==(const CHDChain& chain) const
+    {
+        return seed_id == chain.seed_id;
+    }
+    bool operator<(const CHDChain& chain) const
+    {
+        return seed_id < chain.seed_id;
     }
 };
 
-struct DbTxnListener {
+class CKeyMetadata
+{
+public:
+    static constexpr int VERSION_BASIC{1};
+    static constexpr int VERSION_WITH_HDDATA{10};
+    static constexpr int VERSION_WITH_KEY_ORIGIN{12};
+    static constexpr int CURRENT_VERSION{VERSION_WITH_KEY_ORIGIN};
+    int nVersion;
+    int64_t nCreateTime; // 0 means unknown
+    std::string hdKeypath; //optional HD/bip32 keypath. Still used to determine whether a key is a seed. Also kept for backwards compatibility
+    CKeyID hd_seed_id; //id of the HD seed used to derive this key
+    KeyOriginInfo key_origin; // Key origin info with path and fingerprint
+    bool has_key_origin = false; //!< Whether the key_origin is useful
+
+    CKeyMetadata()
+    {
+        SetNull();
+    }
+    explicit CKeyMetadata(int64_t nCreateTime_)
+    {
+        SetNull();
+        nCreateTime = nCreateTime_;
+    }
+
+    SERIALIZE_METHODS(CKeyMetadata, obj)
+    {
+        READWRITE(obj.nVersion, obj.nCreateTime);
+        if (obj.nVersion >= VERSION_WITH_HDDATA) {
+            READWRITE(obj.hdKeypath, obj.hd_seed_id);
+        }
+        if (obj.nVersion >= VERSION_WITH_KEY_ORIGIN)
+        {
+            READWRITE(obj.key_origin);
+            READWRITE(obj.has_key_origin);
+        }
+    }
+
+    void SetNull()
+    {
+        nVersion = CKeyMetadata::CURRENT_VERSION;
+        nCreateTime = 0;
+        hdKeypath.clear();
+        hd_seed_id.SetNull();
+        key_origin.clear();
+        has_key_origin = false;
+    }
+};
+
+struct DbTxnListener
+{
     std::function<void()> on_commit, on_abort;
 };
 
-/**
- * Access to the wallet database. Opens it and provides read/write access; each
- * read/write is its own transaction unless wrapped in TxnBegin()/TxnCommit().
+/** Access to the wallet database.
+ * Opens the database and provides read and write access to it. Each read and write is its own transaction.
+ * Multiple operation transactions can be started using TxnBegin() and committed using TxnCommit()
+ * Otherwise the transaction will be committed when the object goes out of scope.
+ * Optionally (on by default) it will flush to disk on close.
+ * Every 1000 writes will automatically trigger a flush to disk.
  */
 class WalletBatch
 {
@@ -122,17 +201,26 @@ private:
     template <typename K, typename T>
     bool WriteIC(const K& key, const T& value, bool fOverwrite = true)
     {
-        return m_batch->Write(key, value, fOverwrite);
+        if (!m_batch->Write(key, value, fOverwrite)) {
+            return false;
+        }
+        return true;
     }
 
     template <typename K>
     bool EraseIC(const K& key)
     {
-        return m_batch->Erase(key);
+        if (!m_batch->Erase(key)) {
+            return false;
+        }
+        return true;
     }
 
 public:
-    explicit WalletBatch(WalletDatabase& database) : m_batch(database.MakeBatch()) {}
+    explicit WalletBatch(WalletDatabase &database) :
+        m_batch(database.MakeBatch())
+    {
+    }
     WalletBatch(const WalletBatch&) = delete;
     WalletBatch& operator=(const WalletBatch&) = delete;
 
@@ -143,63 +231,102 @@ public:
     bool ErasePurpose(const std::string& strAddress);
 
     bool WriteTx(const CWalletTx& wtx);
-    bool EraseTx(const Txid& hash);
+    bool EraseTx(Txid hash);
+    bool WriteWtxVariant(const Txid& txid, const CTransactionRef& tx);
 
+    bool WriteKeyMetadata(const CKeyMetadata& meta, const CPubKey& pubkey, bool overwrite);
+    bool WriteKey(const CPubKey& vchPubKey, const CPrivKey& vchPrivKey, const CKeyMetadata &keyMeta);
+    bool WriteCryptedKey(const CPubKey& vchPubKey, const std::vector<unsigned char>& vchCryptedSecret, const CKeyMetadata &keyMeta);
     bool WriteMasterKey(unsigned int nID, const CMasterKey& kMasterKey);
     bool EraseMasterKey(unsigned int id);
-    //! Returns true if the wallet stores any encryption master key.
-    bool IsEncrypted();
 
-    //! Write/read the HD chain (the seed + counter, sealed when encrypted).
-    bool WriteHDChain(const CHDChain& chain);
-
-    //! Record a derived key's id (public data), so an encrypted+locked wallet can still
-    //! recognise its own outputs (IsMine) and show a balance without the sealed seed.
-    bool WritePubKeyId(const CKeyID& keyid);
+    bool WriteWatchOnly(const CScript &script, const CKeyMetadata &keymeta);
 
     bool WriteBestBlock(const CBlockLocator& locator);
     bool ReadBestBlock(CBlockLocator& locator);
 
+    // Returns true if wallet stores encryption keys
+    bool IsEncrypted();
+
     bool WriteOrderPosNext(int64_t nOrderPosNext);
-    bool WriteWalletFlags(uint64_t flags);
+
+    bool WriteDescriptorKey(const uint256& desc_id, const CPubKey& pubkey, const CPrivKey& privkey);
+    bool WriteCryptedDescriptorKey(const uint256& desc_id, const CPubKey& pubkey, const std::vector<unsigned char>& secret);
+    bool WriteDescriptorExtKey(const uint256& desc_id, const CPubKey& pubkey, const CExtKey& extkey);
+    bool WriteCryptedDescriptorExtKey(const uint256& desc_id, const CPubKey& pubkey, const std::vector<unsigned char>& secret);
+    bool WriteDescriptor(const uint256& desc_id, const WalletDescriptor& descriptor);
+    bool WriteDescriptorDerivedCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index, uint32_t der_index);
+    bool WriteDescriptorParentCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index);
+    bool WriteDescriptorLastHardenedCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index);
+    bool WriteDescriptorCacheItems(const uint256& desc_id, const DescriptorCache& cache);
 
     bool WriteLockedUTXO(const COutPoint& output);
     bool EraseLockedUTXO(const COutPoint& output);
 
-    //! DESTDATA address-metadata. The caller passes a pre-encoded address string
-    //! (Lattica has no global Params() to encode a CTxDestination here).
-    bool WriteAddressPreviouslySpent(const std::string& address, bool previously_spent);
-    bool WriteAddressReceiveRequest(const std::string& address, const std::string& id, const std::string& receive_request);
-    bool EraseAddressReceiveRequest(const std::string& address, const std::string& id);
+    bool WriteAddressPreviouslySpent(const CTxDestination& dest, bool previously_spent);
+    bool WriteAddressReceiveRequest(const CTxDestination& dest, const std::string& id, const std::string& receive_request);
+    bool EraseAddressReceiveRequest(const CTxDestination& dest, const std::string& id);
+    bool EraseAddressData(const CTxDestination& dest);
 
-    bool WriteVersion(int version);
-    bool WriteMinVersion(int version);
+    bool WriteActiveScriptPubKeyMan(uint8_t type, const uint256& id, bool internal);
+    bool EraseActiveScriptPubKeyMan(uint8_t type, bool internal);
 
-    //! Delete records of the given types.
-    bool EraseRecords(const std::unordered_set<std::string>& types);
-
-    //! Reconstruct the wallet from its stored records.
     DBErrors LoadWallet(CWallet* pwallet);
 
+    /**
+     * Write the given `client_version` to m_batch, indicating the last version
+     * of client software to load this wallet.
+     *
+     * @param[in]   client_version  `CLIENT_VERSION` outside of test code.
+     * @return      A bool indicating whether or not the write succeeded.
+     */
+    bool WriteVersion(int client_version) { return m_batch->Write(DBKeys::VERSION, client_version); }
+
+    //! Delete records of the given types
+    bool EraseRecords(const std::unordered_set<std::string>& types);
+
+    bool WriteWalletFlags(uint64_t flags);
+    //! Begin a new transaction
     bool TxnBegin();
+    //! Commit current transaction
     bool TxnCommit();
+    //! Abort current transaction
     bool TxnAbort();
     bool HasActiveTxn() { return m_batch->HasActiveTxn(); }
 
-    //! Register callbacks fired on the current db txn's commit/abort.
+    //! Registers db txn callback functions
     void RegisterTxnListener(const DbTxnListener& l);
 
 private:
     std::unique_ptr<DatabaseBatch> m_batch;
+
+    // External functions listening to the current db txn outcome.
+    // Listeners are cleared at the end of the transaction.
     std::vector<DbTxnListener> m_txn_listeners;
 };
 
 /**
- * Run the provided function within a database transaction: writes commit
- * atomically on success, roll back if it returns false or throws.
+ * Executes the provided function 'func' within a database transaction context.
+ *
+ * This function ensures that all db modifications performed within 'func()' are
+ * atomically committed to the db at the end of the process. And, in case of a
+ * failure during execution, all performed changes are rolled back.
+ *
+ * @param database The db connection instance to perform the transaction on.
+ * @param process_desc A description of the process being executed, used for logging purposes in the event of a failure.
+ * @param func The function to be executed within the db txn context. It returns a boolean indicating whether to commit or roll back the txn.
+ * @return true if the db txn executed successfully, false otherwise.
  */
 bool RunWithinTxn(WalletDatabase& database, std::string_view process_desc, const std::function<bool(WalletBatch&)>& func);
 
+bool LoadKey(CWallet* pwallet, DataStream& ssKey, DataStream& ssValue, std::string& strErr);
+bool LoadCryptedKey(CWallet* pwallet, DataStream& ssKey, DataStream& ssValue, std::string& strErr);
+bool LoadEncryptionKey(CWallet* pwallet, DataStream& ssKey, DataStream& ssValue, std::string& strErr);
+bool LoadHDChain(CWallet* pwallet, DataStream& ssValue, std::string& strErr);
+
+//! Returns true if there are any DBKeys::LEGACY_TYPES record in the wallet db
+bool HasLegacyRecords(CWallet& wallet);
+bool HasLegacyRecords(CWallet& wallet, DatabaseBatch& batch);
 } // namespace wallet
 
 #endif // LATTICA_WALLET_WALLETDB_H

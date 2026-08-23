@@ -1,20 +1,13 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
-//
-// Coin control: a parameter/override container for transaction creation, ported in
-// the style of Bitcoin Core's wallet/coincontrol.h. It is pure configuration with no
-// cryptography, so it is almost verbatim. Lattica adaptation: FeeEstimateMode comes
-// from util/fees.h (no block policy estimator). m_external_provider (a FlatSigningProvider
-// carrying pubkeys/scripts to size externally-supplied inputs) is kept as in Core.
 
 #ifndef LATTICA_WALLET_COINCONTROL_H
 #define LATTICA_WALLET_COINCONTROL_H
 
-#include <addresstype.h>
 #include <outputtype.h>
 #include <policy/feerate.h>
 #include <primitives/transaction.h>
-#include <script/script.h>
+#include <script/keyorigin.h>
 #include <script/signingprovider.h>
 #include <util/fees.h>
 
@@ -22,16 +15,15 @@
 #include <map>
 #include <optional>
 #include <set>
-#include <vector>
 
 namespace wallet {
-const int DEFAULT_MIN_DEPTH = 0;
-const int DEFAULT_MAX_DEPTH = 9999999;
+inline constexpr int DEFAULT_MIN_DEPTH = 0;
+inline constexpr int DEFAULT_MAX_DEPTH = 9'999'999;
 
-const uint32_t DEFAULT_WALLET_TX_VERSION = CTransaction::CURRENT_VERSION;
+inline constexpr int DEFAULT_WALLET_TX_VERSION = CTransaction::CURRENT_VERSION;
 
 //! Default for -avoidpartialspends
-static constexpr bool DEFAULT_AVOIDPARTIALSPENDS = false;
+inline constexpr bool DEFAULT_AVOIDPARTIALSPENDS = false;
 
 class PreselectedInput
 {
@@ -110,7 +102,7 @@ public:
     bool m_avoid_partial_spends = DEFAULT_AVOIDPARTIALSPENDS;
     //! Forbids inclusion of dirty (previously used) addresses
     bool m_avoid_address_reuse = false;
-    //! Fee estimation mode to control arguments to estimateSmartFee
+    //! Fee estimation mode.
     FeeEstimateMode m_fee_mode = FeeEstimateMode::UNSET;
     //! Minimum chain depth value for coin availability
     int m_min_depth = DEFAULT_MIN_DEPTH;
@@ -127,28 +119,46 @@ public:
 
     CCoinControl();
 
-    /** Returns true if there are pre-selected inputs. */
+    /**
+     * Returns true if there are pre-selected inputs.
+     */
     bool HasSelected() const;
-    /** Returns true if the given output is pre-selected. */
+    /**
+     * Returns true if the given output is pre-selected.
+     */
     bool IsSelected(const COutPoint& outpoint) const;
-    /** Returns true if the given output is selected as an external input. */
+    /**
+     * Returns true if the given output is selected as an external input.
+     */
     bool IsExternalSelected(const COutPoint& outpoint) const;
-    /** Returns the external output for the given outpoint if it exists. */
+    /**
+     * Returns the external output for the given outpoint if it exists.
+     */
     std::optional<CTxOut> GetExternalOutput(const COutPoint& outpoint) const;
     /**
      * Lock-in the given output for spending.
      * The output will be included in the transaction even if it's not the most optimal choice.
      */
     PreselectedInput& Select(const COutPoint& outpoint);
-    /** Unselects the given output. */
+    /**
+     * Unselects the given output.
+     */
     void UnSelect(const COutPoint& outpoint);
-    /** Unselects all outputs. */
+    /**
+     * Unselects all outputs.
+     */
     void UnSelectAll();
-    /** List the selected inputs. */
+    /**
+     * List the selected inputs.
+     */
     std::vector<COutPoint> ListSelected() const;
-    /** Set an input's weight. */
+    /**
+     * Set an input's weight.
+     */
     void SetInputWeight(const COutPoint& outpoint, int64_t weight);
-    /** Returns the input weight. */
+    /**
+     * Returns the input weight.
+     */
     std::optional<int64_t> GetInputWeight(const COutPoint& outpoint) const;
     /** Retrieve the sequence for an input */
     std::optional<uint32_t> GetSequence(const COutPoint& outpoint) const;

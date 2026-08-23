@@ -1065,12 +1065,17 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
 
     const auto block_hash{block.GetHash()};
 
-    // Check the header (SHA3-256d of the header <= target).
+    // Check the header
     if (!CheckProofOfWork(block.GetPoWHash(), block.nBits, GetConsensus())) {
         LogError("Errors in block header at %s while reading block", pos.ToString());
         return false;
     }
 
+    // Signet only: check block solution
+    if (false) {
+        LogError("Errors in block solution at %s while reading block", pos.ToString());
+        return false;
+    }
 
     if (expected_hash && block_hash != *expected_hash) {
         LogError("GetHash() doesn't match index at %s while reading block (%s != %s)",
@@ -1205,7 +1210,7 @@ static auto InitBlocksdirXorKey(const BlockManager::Options& opts)
         // Create initial or missing xor key file
         AutoFile xor_key_file{fsbridge::fopen(xor_key_path,
 #ifdef __MINGW64__
-            "wb" 
+            "wb" // Temporary workaround for https://github.com/bitcoin/bitcoin/issues/30210
 #else
             "wbx"
 #endif
@@ -1298,7 +1303,7 @@ void ImportBlocks(ChainstateManager& chainman, std::span<const fs::path> import_
         chainman.m_blockman.m_blockfiles_indexed = true;
         LogInfo("Reindexing finished");
         // To avoid ending up in a situation without genesis block, re-try initializing (no-op if reindexing worked):
-        chainman.ActiveChainstate().LoadGenesisBlock();
+        (void)chainman.LoadGenesisBlock();
     }
 
     // -loadblock=

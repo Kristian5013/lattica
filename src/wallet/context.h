@@ -1,11 +1,5 @@
 // Copyright (c) 2026 Kristian Pilatovich
 // See COPYING for license.
-//
-// Ported verbatim from Bitcoin Core's wallet/context.h. WalletContext is just a
-// holder of shared-state pointers; its members ArgsManager/CScheduler/
-// interfaces::Wallet are forward-declared raw pointers, so this header compiles
-// even though Lattica hasn't built those subsystems yet -- the fields are simply
-// left null until they exist, exactly as Core intends ("future shared state").
 
 #ifndef LATTICA_WALLET_CONTEXT_H
 #define LATTICA_WALLET_CONTEXT_H

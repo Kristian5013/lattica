@@ -20,6 +20,18 @@ class COutPoint;
 class SigningProvider;
 
 /**
+ * Sign a transaction with the given keystore and previous transactions
+ *
+ * @param  mtx           The transaction to-be-signed
+ * @param  keystore      Temporary keystore containing signing keys
+ * @param  coins         Map of unspent outputs
+ * @param  hashType      The signature hash type
+ * @param result         JSON object where signed transaction results accumulate
+ */
+void SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, const std::map<COutPoint, Coin>& coins, const UniValue& hashType, UniValue& result);
+void SignTransactionResultToJSON(CMutableTransaction& mtx, bool complete, const std::map<COutPoint, Coin>& coins, const std::map<int, bilingual_str>& input_errors, UniValue& result);
+
+/**
   * Parse a prevtxs UniValue array and get the map of coins from it
   *
   * @param  prevTxsUnival Array of previous txns outputs that tx depends on but may not yet be in the block chain

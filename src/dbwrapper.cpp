@@ -135,12 +135,12 @@ static void SetMaxOpenFiles(leveldb::Options *options) {
              options->max_open_files, default_open_files);
 }
 
-static leveldb::Options GetOptions(size_t nCacheSize)
+static leveldb::Options GetOptions(size_t nCacheSize, bool bloom_filter)
 {
     leveldb::Options options;
     options.block_cache = leveldb::NewLRUCache(nCacheSize / 2);
     options.write_buffer_size = nCacheSize / 4; // up to two write buffers may be held in memory simultaneously
-    options.filter_policy = leveldb::NewBloomFilterPolicy(10);
+    options.filter_policy = bloom_filter ? leveldb::NewBloomFilterPolicy(10) : nullptr;
     options.compression = leveldb::kNoCompression;
     options.info_log = new CBitcoinLevelDBLogger();
     if (leveldb::kMajorVersion > 1 || (leveldb::kMajorVersion == 1 && leveldb::kMinorVersion >= 16)) {
@@ -150,6 +150,30 @@ static leveldb::Options GetOptions(size_t nCacheSize)
     }
     SetMaxOpenFiles(&options);
     return options;
+}
+
+bool CDBWrapper::HasKeyStartingWith(const fs::path& path, uint8_t prefix)
+{
+    if (!fs::exists(path / "CURRENT")) return false;
+
+    CBitcoinLevelDBLogger logger;
+    leveldb::Options options;
+    options.paranoid_checks = true;
+    // Avoid creating or rotating LevelDB's LOG files during this probe.
+    options.info_log = &logger;
+
+    leveldb::DB* raw_db;
+    HandleError(leveldb::DB::Open(options, fs::PathToString(path), &raw_db));
+    const std::unique_ptr<leveldb::DB> db{raw_db};
+
+    leveldb::ReadOptions iteroptions;
+    iteroptions.verify_checksums = true;
+    iteroptions.fill_cache = false;
+    const std::unique_ptr<leveldb::Iterator> it{db->NewIterator(iteroptions)};
+    const leveldb::Slice prefix_slice{reinterpret_cast<const char*>(&prefix), sizeof(prefix)};
+    it->Seek(prefix_slice);
+    HandleError(it->status());
+    return it->Valid() && it->key().starts_with(prefix_slice);
 }
 
 struct CDBBatch::WriteBatchImpl {
@@ -224,7 +248,7 @@ CDBWrapper::CDBWrapper(const DBParams& params)
     DBContext().iteroptions.verify_checksums = true;
     DBContext().iteroptions.fill_cache = false;
     DBContext().syncoptions.sync = true;
-    DBContext().options = GetOptions(params.cache_bytes);
+    DBContext().options = GetOptions(params.cache_bytes, params.bloom_filter);
     DBContext().options.create_if_missing = true;
     DBContext().options.max_file_size = params.max_file_size;
     assert(!(params.testing_env && params.memory_only));
@@ -300,13 +324,18 @@ void CDBWrapper::WriteBatch(CDBBatch& batch, bool fSync)
     }
 }
 
+std::optional<std::string> CDBWrapper::GetProperty(const std::string& property) const
+{
+    if (std::string value; DBContext().pdb->GetProperty(property, &value)) return value;
+    return std::nullopt;
+}
+
 void CDBWrapper::CompactFull() { DBContext().pdb->CompactRange(nullptr, nullptr); }
 
 size_t CDBWrapper::DynamicMemoryUsage() const
 {
-    std::string memory;
     std::optional<size_t> parsed;
-    if (!DBContext().pdb->GetProperty("leveldb.approximate-memory-usage", &memory) || !(parsed = ToIntegral<size_t>(memory))) {
+    if (auto memory{GetProperty("leveldb.approximate-memory-usage")}; !memory || !(parsed = ToIntegral<size_t>(*memory))) {
         LogDebug(BCLog::LEVELDB, "Failed to get approximate-memory-usage property\n");
         return 0;
     }

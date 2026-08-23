@@ -96,16 +96,10 @@ public:
  * Descriptors may be ranged, which occurs when the public keys inside are
  * specified in the form of HD chains (xpubs).
  *
- * Descriptors usually represent public information - public keys and scripts -
+ * Descriptors always represent public information - public keys and scripts -
  * but in cases where private keys need to be conveyed along with a descriptor,
  * they can be included inside by changing public keys to private keys (WIF
- * format).
- *
- * An extended key expression is the exception, and it is written with the xprv:
- * derivation here puts the parent's secret node seed in every child's preimage,
- * so there is no xpub that could stand in its place. IsPrivateOnly() reports
- * such a descriptor, and nothing may print its ToString() where a public one is
- * expected.
+ * format), and changing xpubs by xprvs.
  *
  * Reference documentation about the descriptor language can be found in
  * doc/descriptors.md.
@@ -122,14 +116,6 @@ struct Descriptor {
 
     /** Convert the descriptor back to a string, undoing parsing. */
     virtual std::string ToString(bool compat_format=false) const = 0;
-
-    /** Whether that string necessarily carries private key material.
-     *
-     *  True for a descriptor holding an extended key expression, which has no
-     *  public form: see the note above. A caller that means to publish or export
-     *  a descriptor must refuse one of these rather than print it.
-     */
-    virtual bool IsPrivateOnly() const = 0;
 
     /** Whether this descriptor will return at most one scriptPubKey or multiple (aka is or is not combo) */
     virtual bool IsSingleType() const = 0;

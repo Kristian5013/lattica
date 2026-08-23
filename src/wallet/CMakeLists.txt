@@ -9,11 +9,14 @@ add_library(lattica_wallet STATIC EXCLUDE_FROM_ALL
   crypter.cpp
   db.cpp
   dump.cpp
+  external_signer_scriptpubkeyman.cpp
+  export.cpp
   feebumper.cpp
   fees.cpp
   interfaces.cpp
   load.cpp
   receive.cpp
+  scriptpubkeyman.cpp
   rpc/addresses.cpp
   rpc/backup.cpp
   rpc/coins.cpp

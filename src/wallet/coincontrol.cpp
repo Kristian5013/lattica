@@ -3,13 +3,12 @@
 
 #include <wallet/coincontrol.h>
 
-#include <cassert>
+#include <common/args.h>
 
 namespace wallet {
 CCoinControl::CCoinControl()
 {
-    // Core reads -avoidpartialspends from gArgs here; Lattica has no ArgsManager, so
-    // m_avoid_partial_spends keeps its DEFAULT_AVOIDPARTIALSPENDS header default.
+    m_avoid_partial_spends = gArgs.GetBoolArg("-avoidpartialspends", DEFAULT_AVOIDPARTIALSPENDS);
 }
 
 bool CCoinControl::HasSelected() const
