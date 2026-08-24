@@ -54,6 +54,37 @@ option(ENABLE_GUI "Build the Qt GUI (lattica-qt)" OFF)
 # notification interface (always on — provided natively by msys2).
 option(ENABLE_WALLET "Enable wallet functionality" ON)
 option(WITH_ZMQ "Build the ZMQ notification interface" ON)
+# The fuzz binary (src/test/fuzz). Off by default and clang-only: libFuzzer
+# ships with clang and has no GCC counterpart.
+#
+# The flags go here rather than on the target because the point is to reach what
+# the target only calls into: coverage feedback and the address sanitizer have
+# to be compiled into lattica_node and into the vendored PQClean C, which is the
+# fifteen thousand lines a peer's bytes actually run through. Instrumenting the
+# three files of the harness would fuzz a wall.
+#
+# This is therefore a whole build directory of its own -- an instrumented binary
+# is slower and is not the one anyone should run a node with:
+#
+#   cmake -B build-fuzz -DBUILD_FUZZ_BINARY=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+#   cmake --build build-fuzz --target fuzz
+#   FUZZ=pubkey ./build-fuzz/src/test/fuzz/fuzz
+option(BUILD_FUZZ_BINARY "Build the fuzz binary (clang only)" OFF)
+if(BUILD_FUZZ_BINARY)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "BUILD_FUZZ_BINARY needs clang: libFuzzer has no GCC counterpart. "
+                            "Re-run with -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++")
+    endif()
+    # clang's -Wshadow reaches further than GCC's: it also flags a local that
+    # shadows a field or a structured binding, which three files inherited from
+    # Bitcoin Core do. -Wshadow is ours, added beyond Core's set, so the fix is
+    # not to edit Core's sources for it -- it is demoted to a warning here and
+    # nowhere else, and every other -Werror still bites.
+    set(FUZZ_SANITIZERS "-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer -Wno-error=shadow")
+    string(APPEND CMAKE_C_FLAGS " ${FUZZ_SANITIZERS}")
+    string(APPEND CMAKE_CXX_FLAGS " ${FUZZ_SANITIZERS}")
+    string(APPEND CMAKE_EXE_LINKER_FLAGS " -fsanitize=address,undefined")
+endif()
 
 # ---------------------------------------------------------------------------
 # Build configuration header — generated from cmake/lattica-build-config.h.in

@@ -39,6 +39,7 @@ Development
 The repo's [root README](/README.md) contains relevant information on the development process and automated testing.
 
 - [Developer Notes](developer-notes.md)
+- [Fuzzing](fuzzing.md)
 - [Productivity Notes](productivity.md)
 - [Translation Process](translation_process.md)
 - [Translation Strings Policy](translation_strings_policy.md)

@@ -358,6 +358,9 @@ endif()
 # Bitcoin Core's src/{test/util,test,bench} layout.
 add_subdirectory(test/util)
 add_subdirectory(test)
+if(BUILD_FUZZ_BINARY)
+  add_subdirectory(test/fuzz)
+endif()
 add_subdirectory(bench)
 
 # tools/mine_genesis — offline genesis miner (built on demand). Lattica-specific

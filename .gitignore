@@ -1,5 +1,6 @@
 # Build trees
 /build/
+/build-fuzz/
 build/
 
 # CMake artifacts
@@ -29,3 +30,6 @@ __pycache__/
 
 # vendored research repo, has its own history
 cas-sha256/
+
+# Fuzzing corpora: cheap to regenerate, and they grow without bound.
+/test/fuzz/corpus/

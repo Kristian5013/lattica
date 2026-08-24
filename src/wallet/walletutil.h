@@ -17,7 +17,7 @@
 #include <vector>
 
 class ArgsManager;
-class CExtKey;
+struct CExtKey;
 enum class OutputType;
 
 namespace wallet {
