@@ -89,16 +89,26 @@ public:
             m_sigs_weight += weight;
             m_sigs_count++;
             break;
+        case SigVersion::WITNESS_V2:
+            // Counted as nothing, deliberately. What this class measures is how
+            // much larger a transaction could become when signed again -- an
+            // ECDSA signature is DER and comes out at 71 or 72 bytes depending
+            // on the R that was drawn, so a bump has to budget for the longest.
+            // A Falcon-512 or ML-DSA-44 signature has exactly one size. There is
+            // nothing to grind and nothing to budget, so a witness v2 signature
+            // contributes neither weight nor count and the difference below
+            // stays the difference for the curve signatures alone.
+            break;
         case SigVersion::TAPROOT:
         case SigVersion::TAPSCRIPT:
             assert(false);
-        }
+        } // no default case, so the compiler can warn about missing cases
     }
 
     int64_t GetWeightDiffToMax() const
     {
         // Note: the witness scaling factor is already accounted for because the count is multiplied by it.
-        return (/* max signature size=*/ 72 * m_sigs_count) - m_sigs_weight;
+        return (/* max signature size=*/ CPubKey::SECP256K1_SIGNATURE_SIZE * m_sigs_count) - m_sigs_weight;
     }
 };
 

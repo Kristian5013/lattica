@@ -23,7 +23,6 @@ enum class PSBTError {
     UNSUPPORTED,
     INCOMPLETE,
     INVALID_TX,
-    OK,
 };
 /**
  * Instructions for how a PSBT should be signed or filled with information.

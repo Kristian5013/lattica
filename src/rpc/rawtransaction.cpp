@@ -502,6 +502,11 @@ static RPCMethod decodescript()
         case TxoutType::PUBKEYHASH:
         case TxoutType::WITNESS_V0_KEYHASH:
         case TxoutType::WITNESS_V0_SCRIPTHASH:
+        // A witness v2 program wraps exactly as a v0 one does: VerifyScript
+        // reaches VerifyWitnessProgram through P2SH without looking at the
+        // version, and GetKeyForDestination unwraps that form to find the key.
+        case TxoutType::WITNESS_V2_KEYHASH:
+        case TxoutType::WITNESS_V2_SCRIPTHASH:
             // Can be wrapped if the checks below pass
             break;
         case TxoutType::NULL_DATA:
@@ -551,6 +556,8 @@ static RPCMethod decodescript()
             case TxoutType::WITNESS_V0_KEYHASH:
             case TxoutType::WITNESS_V0_SCRIPTHASH:
             case TxoutType::WITNESS_V1_TAPROOT:
+            case TxoutType::WITNESS_V2_KEYHASH:
+            case TxoutType::WITNESS_V2_SCRIPTHASH:
             case TxoutType::ANCHOR:
                 // Should not be wrapped
                 return false;

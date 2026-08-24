@@ -199,9 +199,19 @@ try_append_cxx_flags("-Wunreachable-code" TARGET warn_interface SKIP_LINK)
 try_append_cxx_flags("-Wdocumentation" TARGET warn_interface SKIP_LINK)
 try_append_cxx_flags("-Wself-assign" TARGET warn_interface SKIP_LINK)
 try_append_cxx_flags("-Wundef" TARGET warn_interface SKIP_LINK)
-# Lattica keeps these two beyond Core's set — they caught real bugs during the port.
+# Lattica keeps these beyond Core's set — they caught real bugs during the port.
 try_append_cxx_flags("-Wpedantic" TARGET warn_interface SKIP_LINK)
 try_append_cxx_flags("-Wshadow" TARGET warn_interface SKIP_LINK)
+# An unhandled enumerator is an error, not a warning.
+#
+# Core writes "no default case, so the compiler can warn about missing cases"
+# above these switches, and means it: the absence of a default is the mechanism
+# that finds every site an enumerator has to be added to. That mechanism only
+# works if someone reads the warning. Two output types and one signature version
+# were added to this tree, and decodescript missed both -- it answered every
+# post-quantum script with "Internal bug detected: Unreachable code reached",
+# through three builds that said so in passing and were not read.
+try_append_cxx_flags("-Werror=switch" TARGET warn_interface SKIP_LINK)
 # Disable the noisy subset -Wextra turns on that fires on intentional patterns in
 # the verbatim Core sources (e.g. the no-op lock-assert helpers in sync.h when
 # DEBUG_LOCKORDER is off). Must follow -Wextra. Mirrors Bitcoin Core's warn_interface.
