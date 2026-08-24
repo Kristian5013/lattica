@@ -347,6 +347,16 @@ bool CPubKey::RecoverCompact(const uint256 &hash, const std::vector<unsigned cha
         return false;
     int recid = (vchSig[0] - 27) & 3;
     bool fComp = ((vchSig[0] - 27) & 4) != 0;
+    // The header byte also says whether the signer used an uncompressed key,
+    // and this chain has no uncompressed form: ValidSize admits 33, 897 and
+    // 1312, so a 65-byte serialization could not become a CPubKey even if it
+    // were produced. Bitcoin gives the buffer below its own SIZE, which is the
+    // uncompressed 65; SIZE here is ML-DSA-44's 1312 and the buffer is the
+    // curve's 33, so asking libsecp256k1 for the uncompressed form asks it to
+    // write 65 bytes into 33 -- which it answers by calling its illegal-argument
+    // callback, and that aborts the process. A recovery that names no key this
+    // chain can hold is refused before it can do that.
+    if (!fComp) return false;
     secp256k1_pubkey pubkey;
     secp256k1_ecdsa_recoverable_signature sig;
     if (!secp256k1_ecdsa_recoverable_signature_parse_compact(secp256k1_context_static, &sig, &vchSig[1], recid)) {
